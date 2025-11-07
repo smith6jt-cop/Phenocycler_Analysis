@@ -1,17 +1,24 @@
 #!/bin/bash
 #SBATCH --job-name=phenocycler_pipeline
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=your_email@ufl.edu
+#SBATCH --mail-user=your_email@ufl.edu  # UPDATE: Use your UFL email
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128gb
 #SBATCH --time=96:00:00
 #SBATCH --output=logs/pipeline_%j.out
 #SBATCH --error=logs/pipeline_%j.err
-#SBATCH --qos=your_qos
-#SBATCH --account=your_account
+#SBATCH --qos=your_qos        # UPDATE: Find with 'sacctmgr show assoc user=$USER'
+#SBATCH --account=your_account  # UPDATE: Find with 'sacctmgr show assoc user=$USER'
 
 # Full Phenocycler Analysis Pipeline
+
+# Configurable timeouts (in seconds)
+TIMEOUT_PREPROCESS=86400   # 24 hours
+TIMEOUT_PHENOTYPE=86400    # 24 hours
+TIMEOUT_SPATIAL=172800     # 48 hours
+TIMEOUT_GROUPCOMP=43200    # 12 hours
+TIMEOUT_TISSUE=86400       # 24 hours
 
 echo "=========================================="
 echo "Phenocycler Analysis Pipeline - Full Run"
@@ -39,6 +46,7 @@ run_notebook() {
     echo ""
     echo "=========================================="
     echo "Running: $notebook"
+    echo "Timeout: $timeout seconds"
     echo "Started at: $(date)"
     echo "=========================================="
     
@@ -57,11 +65,11 @@ run_notebook() {
 }
 
 # Run pipeline sequentially
-run_notebook "01_preprocessing.ipynb" 86400 || exit 1
-run_notebook "02_phenotyping.ipynb" 86400 || exit 1
-run_notebook "03_spatial_analysis.ipynb" 172800 || exit 1
-run_notebook "04_group_comparisons.ipynb" 43200 || exit 1
-run_notebook "05_tissue_comparisons.ipynb" 86400 || exit 1
+run_notebook "01_preprocessing.ipynb" $TIMEOUT_PREPROCESS || exit 1
+run_notebook "02_phenotyping.ipynb" $TIMEOUT_PHENOTYPE || exit 1
+run_notebook "03_spatial_analysis.ipynb" $TIMEOUT_SPATIAL || exit 1
+run_notebook "04_group_comparisons.ipynb" $TIMEOUT_GROUPCOMP || exit 1
+run_notebook "05_tissue_comparisons.ipynb" $TIMEOUT_TISSUE || exit 1
 
 echo ""
 echo "=========================================="

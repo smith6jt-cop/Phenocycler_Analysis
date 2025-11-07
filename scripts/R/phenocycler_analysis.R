@@ -1,6 +1,7 @@
 # Phenocycler Analysis R Functions
 # R integration for advanced statistical analysis and visualization
 
+# Load required libraries
 library(Seurat)
 library(ggplot2)
 library(dplyr)
@@ -12,10 +13,13 @@ library(patchwork)
 #' @param h5ad_path Path to h5ad file
 #' @return Seurat object
 load_phenocycler_h5ad <- function(h5ad_path) {
-  library(anndata)
+  # Check if anndata is available
+  if (!requireNamespace("anndata", quietly = TRUE)) {
+    stop("Package 'anndata' is required. Install with: install.packages('anndata')")
+  }
   
   # Read AnnData
-  adata <- read_h5ad(h5ad_path)
+  adata <- anndata::read_h5ad(h5ad_path)
   
   # Convert to Seurat
   counts <- t(adata$X)

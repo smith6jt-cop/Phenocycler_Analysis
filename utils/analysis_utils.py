@@ -29,6 +29,28 @@ def load_qptiff_data(
     """
     Load Phenocycler data from qptiff file.
     
+    NOTE: This function requires custom implementation for your specific qptiff format.
+    We recommend using QuPath to export cell measurements as CSV instead.
+    
+    To implement qptiff loading:
+    1. Load multi-channel TIFF with tifffile
+    2. Perform cell segmentation (e.g., with cellpose, stardist, or QuPath)
+    3. Extract mean fluorescence intensity (MFI) per channel per cell
+    4. Extract cell centroid coordinates
+    5. Create AnnData object with expression matrix and spatial coords
+    
+    Example implementation:
+        from cellpose import models
+        # Segment cells
+        model = models.Cellpose(model_type='cyto')
+        masks, flows, styles = model.eval(images[0])  # Use DAPI/nuclear channel
+        
+        # Extract intensities per cell per channel
+        from skimage.measure import regionprops_table
+        for channel_idx, channel_name in enumerate(channel_names):
+            props = regionprops_table(masks, images[channel_idx], 
+                                     properties=['mean_intensity', 'centroid'])
+    
     Parameters
     ----------
     qptiff_path : str or Path
@@ -54,16 +76,16 @@ def load_qptiff_data(
         if tif.pages[0].description:
             print(f"Image metadata: {tif.pages[0].description[:100]}...")
     
-    # Note: qptiff loading requires specific implementation based on format
-    # This is a placeholder that should be customized
-    print("Warning: qptiff loading needs to be customized for your specific data format")
-    print("Please implement cell segmentation and intensity extraction")
-    
-    # Create placeholder AnnData
-    # In practice, you would extract cell-level data here
     raise NotImplementedError(
-        "qptiff loading requires custom implementation. "
-        "Please use QuPath to export CSV files or implement cell segmentation."
+        "qptiff loading requires custom cell segmentation implementation.\n\n"
+        "RECOMMENDED APPROACH: Use QuPath to export cell measurements as CSV:\n"
+        "  1. Open qptiff in QuPath (https://qupath.github.io/)\n"
+        "  2. Run: Analyze → Cell detection → Cell detection\n"
+        "  3. Measure: Measure → Show detection measurements\n"
+        "  4. Export: File → Export → Export as CSV\n"
+        "  5. Use load_qupath_csv() to load the exported data\n\n"
+        "ALTERNATIVE: Implement custom segmentation (see docstring for example)\n"
+        "For help, see DATA_README.md section 'Converting qptiff to CSV'"
     )
 
 

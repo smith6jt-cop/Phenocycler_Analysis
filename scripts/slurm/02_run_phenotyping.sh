@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=phenocycler_phenotype
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=your_email@ufl.edu
+#SBATCH --mail-user=your_email@ufl.edu  # UPDATE: Use your UFL email
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64gb
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/phenotype_%j.out
 #SBATCH --error=logs/phenotype_%j.err
-#SBATCH --qos=your_qos
-#SBATCH --account=your_account
+#SBATCH --qos=your_qos        # UPDATE: Find with 'sacctmgr show assoc user=$USER'
+#SBATCH --account=your_account  # UPDATE: Find with 'sacctmgr show assoc user=$USER'
 
 echo "Job started at: $(date)"
 echo "Job ID: $SLURM_JOB_ID"
