@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""
+Step 2 — scalable pixel-level REDSEA (lateral spillover correction).
+
+Faithful port of ``scripts/senior/redsea_full.py`` (Islet-Explorer-Senior).  It
+reimplements the REDSEA math (Bai et al. 2021, *Front. Immunol.*) scalably — the
+reference ``redseapy`` does not scale (dense cellNum² matrix, whole-image reads,
+pure-python pixel loops):
+
+    data[i,ch]     = whole-cell SUM of channel ch over cell i's pixels   (np.bincount)
+    edge[i,ch]     = SUM over cell i's boundary band (1-px inner rim)     (np.bincount)
+    contact[i,j]   = # 8-connected pixel adjacencies between cells i,j    (sparse COO)
+    F              = row_normalize(contact)          F[i,j]=contact[i,j]/rowsum_i
+    corrected_sum  = clip( data + comp_mode*edge - alpha*(F @ edge), 0 )
+    corrected_mean = corrected_sum / cell_area_px
+
+Defaults are preserved exactly: ``comp_mode=0`` (subtract-only), ``alpha=1.0``,
+``edge_radius=0`` (the 1-px cell rim), ``gap_bridge=1``.  Mask source is per-cell
+GeoJSON exported from QuPath; the qptiff is read one channel at a time.
+
+Additions vs. upstream:
+  * config-driven paths (no hardcoded ``/home/smith6jt/...``);
+  * per-donor multiprocessing (``--jobs`` / ``n_jobs``) — every donor is
+    independent, so this scales near-linearly and is the primary speed-up;
+  * an optional CuPy backend (``--gpu`` / ``use_gpu``) for the per-channel
+    ``bincount`` accumulation and the sparse ``F @ edge`` matmul.  GPU is meant
+    for ``n_jobs=1`` (one donor on the device at a time); combine GPU with a
+    SLURM array for cohort-scale parallelism instead of a local process pool.
+
+    python -m phenocycler.redsea --donor 6539            # smoke test (smallest)
+    python -m phenocycler.redsea --all --jobs 4          # 4 donors in parallel
+    python -m phenocycler.redsea --all --gpu             # CuPy accumulation/matmul
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import glob
+import json
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import tifffile
+from skimage.draw import polygon as draw_polygon
+from skimage.segmentation import find_boundaries
+from skimage.morphology import binary_dilation, diamond
+
+from .config import PipelineConfig, load_config
+from .gpu import get_backend
+from .parallel import map_donors
+
+# qptiff channel name -> parquet column name (matches upstream SANITIZE)
+SANITIZE = lambda s: re.sub(r"[ /\-]", "_", s)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+@dataclass
+class RedseaParams:
+    """The per-run REDSEA knobs (picklable; carried into worker processes)."""
+    downsample: float = 1.0
+    edge_radius: int = 0
+    comp_mode: int = 0
+    alpha: float = 1.0
+    gap_bridge: int = 1
+    keep_mask: bool = False
+    save_intermediates: bool = False
+    use_gpu: bool = False
+    gpu_device: int = 0
+
+    @classmethod
+    def from_config(cls, cfg: PipelineConfig, **overrides) -> "RedseaParams":
+        p = cls(
+            downsample=cfg.redsea_downsample,
+            edge_radius=cfg.redsea_edge_radius,
+            comp_mode=cfg.redsea_comp_mode,
+            alpha=cfg.redsea_alpha,
+            gap_bridge=cfg.redsea_gap_bridge,
+            use_gpu=cfg.use_gpu,
+            gpu_device=cfg.gpu_device,
+        )
+        for k, v in overrides.items():
+            setattr(p, k, v)
+        return p
+
+
+# --------------------------------------------------------------------------- discovery
+def donor_image(cfg: PipelineConfig, donor: str) -> str:
+    """The QuPath image string for this donor (from the cells parquet)."""
+    f = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
+    if not f:
+        raise SystemExit(f"[err] no {cfg.cells_dir}/donor_id={donor}")
+    return str(pd.read_parquet(f[0], columns=["image"]).image.iloc[0])
+
+
+def resolve_paths(cfg: PipelineConfig, donor: str):
+    img = donor_image(cfg, donor)
+    tag = re.sub(r"[^A-Za-z0-9._-]", "_", img)          # matches the Groovy sanitization
+    geojson = cfg.geojson_dir / f"cells__{tag}.geojson"
+    qptiff = cfg.images_dir / img.split(" - ")[0].strip()  # '...qptiff - resolution #1' -> '...qptiff'
+    if not geojson.exists():
+        raise SystemExit(f"[err] missing geojson: {geojson}\n      run export_cells_geojson.groovy for {img}")
+    if not qptiff.exists():
+        raise SystemExit(f"[err] missing qptiff: {qptiff}")
+    return img, geojson, qptiff
+
+
+# --------------------------------------------------------------------------- qptiff
+def qptiff_channels(qptiff: Path, level: int):
+    """Return (tiff, level_pages, channel_names, (H,W), pixel_size_um)."""
+    tf = tifffile.TiffFile(str(qptiff))
+    series = tf.series[0]
+    lv = series.levels[level]
+    pages = lv.pages
+    names = []
+    for pg in pages:
+        d = pg.description or ""
+        m = re.search(r"<Biomarker>([^<]+)</Biomarker>", d) or re.search(r"<Name>([^<]+)</Name>", d)
+        names.append(m.group(1).strip() if m else f"ch{len(names)}")
+    H, W = lv.shape[-2], lv.shape[-1]
+    px_um = None
+    try:
+        p0 = series.levels[0].pages[0]
+        xr = p0.tags["XResolution"].value
+        unit = p0.tags["ResolutionUnit"].value  # 3==cm, 2==inch
+        ppu = xr[0] / xr[1]
+        per_cm = ppu if int(unit) == 3 else ppu / 2.54
+        px_um = 1e4 / per_cm * (2 ** level)
+    except Exception:
+        pass
+    return tf, pages, names, (H, W), px_um
+
+
+def read_channel(pages, ch, dtype=np.float32):
+    """One full-res channel as a 2D array (float32 keeps bincount weights light)."""
+    return np.asarray(pages[ch].asarray(), dtype=dtype)
+
+
+# --------------------------------------------------------------------------- rasterize
+def rasterize_mask(geojson: Path, shape, downsample: float):
+    """Rasterize per-cell polygons into an int32 instance mask. label = feature_index+1.
+    Returns (mask, object_ids[list]) where object_ids[label-1] is the cell's UUID."""
+    log(f"  [raster] loading {geojson.name} ...")
+    feats = json.load(open(geojson))["features"]
+    n = len(feats)
+    mask = np.zeros(shape, dtype=np.int32)
+    oids = [None] * n
+    s = 1.0 / downsample
+    n_holes = 0
+    t0 = time.time()
+    for i, ft in enumerate(feats):
+        oids[i] = ft.get("id")
+        label = i + 1
+        g = ft["geometry"]
+        gtype = g["type"]
+        polys = g["coordinates"] if gtype == "MultiPolygon" else [g["coordinates"]]
+        for poly in polys:                       # poly = [exterior, hole1, ...]
+            ext = np.asarray(poly[0], dtype=np.float64)
+            if ext.shape[0] < 3:
+                continue
+            cc = ext[:, 0] * s                    # x -> col
+            rr = ext[:, 1] * s                    # y -> row
+            pr, pc = draw_polygon(rr, cc, shape=shape)
+            mask[pr, pc] = label
+            for hole in poly[1:]:                 # carve interior rings back to background
+                h = np.asarray(hole, dtype=np.float64)
+                if h.shape[0] < 3:
+                    continue
+                n_holes += 1
+                hr, hc = draw_polygon(h[:, 1] * s, h[:, 0] * s, shape=shape)
+                mask[hr, hc] = 0
+        if (i + 1) % 100000 == 0:
+            log(f"  [raster] {i+1:,}/{n:,} ({(time.time()-t0):.0f}s)")
+    log(f"  [raster] {n:,} cells, {n_holes} holes carved, {time.time()-t0:.0f}s")
+    return mask, oids
+
+
+# --------------------------------------------------------------------------- contact matrix
+def contact_matrix(mask: np.ndarray, n: int):
+    """8-connected cell-cell adjacency counts as a symmetric sparse CSR (NxN)."""
+    H, W = mask.shape
+    keys = []
+    for dy, dx in [(0, 1), (1, 0), (1, 1), (1, -1)]:   # 4 vectors cover all 8 neighbours
+        if dx >= 0:
+            a = mask[: H - dy, : W - dx]
+            b = mask[dy:, dx:]
+        else:
+            a = mask[: H - dy, -dx:]
+            b = mask[dy:, : W + dx]
+        v = (a > 0) & (b > 0) & (a != b)
+        if not v.any():
+            continue
+        aa = a[v].astype(np.int64)
+        bb = b[v].astype(np.int64)
+        lo = np.minimum(aa, bb)
+        hi = np.maximum(aa, bb)
+        keys.append(lo * (np.int64(n) + 1) + hi)
+    if not keys:
+        return sp.csr_matrix((n, n), dtype=np.float64)
+    keys = np.concatenate(keys)
+    uk, cnt = np.unique(keys, return_counts=True)
+    lo = (uk // (n + 1)).astype(np.int64)
+    hi = (uk % (n + 1)).astype(np.int64)
+    M = sp.coo_matrix((cnt.astype(np.float64), (lo - 1, hi - 1)), shape=(n, n)).tocsr()
+    M = M + M.T                                    # symmetric
+    return M
+
+
+def contact_matrix_gapbridge(mask, n, grow):
+    """Like contact_matrix, but first fills thin (<=grow px) background gaps between cells
+    with the nearest cell label, so neighbours separated by a 1-2 px gap still count as
+    contacting. The grown mask is used ONLY for the contact graph; sums/edge use the original."""
+    if grow <= 0:
+        return contact_matrix(mask, n)
+    from scipy.ndimage import distance_transform_edt
+    bg = mask == 0
+    dist, idx = distance_transform_edt(bg, return_distances=True, return_indices=True)
+    grown = mask[tuple(idx)]
+    grown[bg & (dist > grow + 0.5)] = 0            # only bridge gaps within `grow` px
+    M = contact_matrix(grown, n)
+    del grown, idx, dist
+    return M
+
+
+# --------------------------------------------------------------------------- compensate
+def compensate(data, edge, sizes, M, comp_mode, alpha, backend=None):
+    """REDSEA compensation. corrected_sum = data + comp_mode*edge - alpha*(F @ edge), clamp>=0.
+      comp_mode=1 : subtract + reinforce (redseapy default)
+      comp_mode=0 : subtract only (remove incoming neighbour spillover; no reinforce)
+    F is row-normalized contact (F[i,j]=contact[i,j]/rowsum_i); isolated cells -> F row 0
+    (passthrough). Returns (corrected_mean[N,C], clamp_frac[C], n_isolated).
+
+    ``backend`` (optional): a :class:`phenocycler.gpu.Backend`; when on GPU the sparse
+    ``F @ edge`` matmul runs on the device.  ``backend=None`` is the exact CPU path."""
+    if backend is not None and backend.on_gpu:  # pragma: no cover - GPU only
+        xp = backend.xp
+        d = xp.asarray(data)
+        e = xp.asarray(edge)
+        s = xp.asarray(sizes)
+        Mg = backend.csr_from_scipy(M)
+        rowsum = xp.asarray(np.asarray(M.sum(1)).ravel())
+        inv = xp.zeros_like(rowsum)
+        nz = rowsum > 0
+        inv[nz] = 1.0 / rowsum[nz]
+        F = backend.diags(inv) @ Mg
+        corrected_sum = d + comp_mode * e - alpha * (F @ e)
+        xp.clip(corrected_sum, 0, None, out=corrected_sum)
+        corrected = corrected_sum / s[:, None]
+        corrected = backend.asnumpy(corrected)
+        sizes_np = np.asarray(sizes)
+        corrected[sizes_np == 0, :] = np.nan
+        clamp_frac = backend.asnumpy((corrected_sum == 0).mean(axis=0))
+        return corrected, clamp_frac, int(backend.asnumpy((~nz).sum()))
+
+    rowsum = np.asarray(M.sum(1)).ravel()
+    inv = np.zeros_like(rowsum)
+    nz = rowsum > 0
+    inv[nz] = 1.0 / rowsum[nz]
+    F = sp.diags(inv) @ M                            # rows sum to 1 (recipient form)
+    corrected_sum = data + comp_mode * edge - alpha * (F @ edge)
+    np.clip(corrected_sum, 0, None, out=corrected_sum)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corrected = corrected_sum / sizes[:, None]
+    corrected[sizes == 0, :] = np.nan
+    clamp_frac = (corrected_sum == 0).mean(axis=0)
+    return corrected, clamp_frac, int((~nz).sum())
+
+
+# --------------------------------------------------------------------------- intermediates / io
+def save_intermediates(cfg: PipelineConfig, donor, oids, cols, data, edge, sizes, M):
+    cfg.inter_dir.mkdir(parents=True, exist_ok=True)
+    p = cfg.inter_dir / f"{donor}.npz"
+    M = M.tocsr()
+    np.savez_compressed(p, oids=np.array(oids, dtype=object), cols=np.array(cols),
+                        data=data.astype(np.float32), edge=edge.astype(np.float32),
+                        sizes=sizes, m_data=M.data, m_indices=M.indices, m_indptr=M.indptr,
+                        m_shape=np.array(M.shape))
+    log(f"[{donor}] saved intermediates -> {p}")
+
+
+def load_intermediates(cfg: PipelineConfig, donor):
+    z = np.load(cfg.inter_dir / f"{donor}.npz", allow_pickle=True)
+    M = sp.csr_matrix((z["m_data"], z["m_indices"], z["m_indptr"]), shape=tuple(z["m_shape"]))
+    return (list(z["oids"]), list(z["cols"]), z["data"].astype(np.float64),
+            z["edge"].astype(np.float64), z["sizes"].astype(np.float64), M)
+
+
+def write_corrected(cfg: PipelineConfig, donor, oids, cols, corrected, sizes):
+    out = pd.DataFrame({"object_id": oids, "donor_id": donor, "cell_area_px": sizes})
+    for k, c in enumerate(cols):
+        out[c] = corrected[:, k]
+    out_dir = cfg.cells_redsea_dir / f"donor_id={donor}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(out_dir / "data_0.parquet", index=False)
+    log(f"[{donor}] wrote {out_dir/'data_0.parquet'} ({len(out):,} rows)")
+
+
+# --------------------------------------------------------------------------- per donor
+def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
+    t_all = time.time()
+    backend = get_backend(params.use_gpu, params.gpu_device)
+    img, geojson, qptiff = resolve_paths(cfg, donor)
+    level = int(round(np.log2(params.downsample)))
+    if 2 ** level != int(params.downsample):
+        raise SystemExit(f"[err] --downsample must be a power of 2 (got {params.downsample})")
+    log(f"[{donor}] image={img}")
+
+    tf, pages, ch_names, (H, W), px_um = qptiff_channels(qptiff, level)
+    cols = [SANITIZE(c) for c in ch_names]
+    log(f"[{donor}] level={level} dims={H}x{W} channels={len(cols)} px_um={px_um} "
+        f"gpu={backend.on_gpu}")
+
+    # 1) rasterize instance mask
+    mask, oids = rasterize_mask(geojson, (H, W), params.downsample)
+    n = len(oids)
+    sizes = np.bincount(mask.ravel(), minlength=n + 1)[1:].astype(np.float64)  # cell area in px
+    n_empty = int((sizes == 0).sum())
+    log(f"[{donor}] rasterized {n:,} cells | {n_empty} with 0 px | total fg px={int(sizes.sum()):,}")
+
+    # 2) boundary band (within edge_radius px of a different label), 8-connected
+    t0 = time.time()
+    inner = find_boundaries(mask, mode="inner", connectivity=2, background=0)
+    band = binary_dilation(inner, diamond(params.edge_radius)) & (mask > 0)
+    band_idx = np.flatnonzero(band.ravel())
+    mask_flat = mask.ravel()
+    mask_band = mask_flat[band_idx]
+    log(f"[{donor}] boundary band: {band_idx.size:,} px "
+        f"({100*band_idx.size/mask.size:.1f}% of image), {time.time()-t0:.0f}s")
+    del inner, band
+
+    # 3) per-channel whole-cell sums + boundary sums (streamed one channel at a time)
+    nch = len(cols)
+    data = np.zeros((n, nch), dtype=np.float64)
+    edge = np.zeros((n, nch), dtype=np.float64)
+    t0 = time.time()
+    if backend.on_gpu:  # pragma: no cover - GPU only
+        mask_flat_g = backend.asarray(mask_flat)
+        mask_band_g = backend.asarray(mask_band)
+        band_idx_g = backend.asarray(band_idx)
+    for k in range(nch):
+        ch = read_channel(pages, k).ravel()
+        if backend.on_gpu:  # pragma: no cover - GPU only
+            chg = backend.asarray(ch)
+            data[:, k] = backend.asnumpy(backend.bincount(mask_flat_g, weights=chg, minlength=n + 1))[1:]
+            edge[:, k] = backend.asnumpy(
+                backend.bincount(mask_band_g, weights=chg[band_idx_g], minlength=n + 1))[1:]
+        else:
+            data[:, k] = np.bincount(mask_flat, weights=ch, minlength=n + 1)[1:]
+            edge[:, k] = np.bincount(mask_band, weights=ch[band_idx], minlength=n + 1)[1:]
+        del ch
+        if (k + 1) % 10 == 0 or k == nch - 1:
+            log(f"[{donor}] channels {k+1}/{nch} ({time.time()-t0:.0f}s)")
+    tf.close()
+
+    # 4) contact matrix (gap-bridged: cells here are not gapless)
+    t0 = time.time()
+    M = contact_matrix_gapbridge(mask, n, params.gap_bridge)
+    log(f"[{donor}] contact matrix (gap_bridge={params.gap_bridge}): {M.nnz:,} contacts, "
+        f"{time.time()-t0:.0f}s")
+    if params.save_intermediates:
+        save_intermediates(cfg, donor, oids, cols, data, edge, sizes, M)
+
+    # 5) compensate
+    corrected, clamp_frac, n_isolated = compensate(
+        data, edge, sizes, M, params.comp_mode, params.alpha, backend)
+    log(f"[{donor}] compensate(mode={params.comp_mode}, alpha={params.alpha}): "
+        f"{n_isolated} isolated cells")
+
+    # alignment sanity vs the existing parquet (correlation of UNcorrected mean)
+    uncorr = np.where(sizes[:, None] > 0, data / np.where(sizes[:, None] == 0, 1, sizes[:, None]), np.nan)
+    try:
+        alignment_check(cfg, donor, oids, cols, uncorr, sizes, px_um)
+    except Exception as e:  # non-fatal sanity check
+        log(f"[{donor}] alignment check skipped: {e}")
+
+    # 6) write corrected parquet (one row per object_id)
+    write_corrected(cfg, donor, oids, cols, corrected, sizes)
+
+    if params.keep_mask:
+        cfg.mask_dir.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(cfg.mask_dir / f"{donor}.tif", mask, compression="zlib")
+        log(f"[{donor}] persisted mask -> {cfg.mask_dir/f'{donor}.tif'}")
+    del mask
+
+    log(f"[{donor}] DONE in {time.time()-t_all:.0f}s | top-clamped: " +
+        ", ".join(f"{cols[i]}={clamp_frac[i]*100:.1f}%" for i in np.argsort(clamp_frac)[-5:][::-1]))
+    return donor
+
+
+def alignment_check(cfg, donor, oids, cols, uncorr_mean, sizes, px_um):
+    """Correlate my UNcorrected full-res mean against the existing QuPath parquet means."""
+    f = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))[0]
+    probe = [c for c in ["DAPI", "INS", "Pan_Cytokeratin", "CD3e", "Vimentin", "CD31"] if c in cols]
+    ref = pd.read_parquet(f, columns=["object_id", "cell_area"] + probe)
+    mine = pd.DataFrame({"object_id": oids, "_area_px": sizes})
+    for c in probe:
+        mine[c + "_mine"] = uncorr_mean[:, cols.index(c)]
+    j = ref.merge(mine, on="object_id", how="inner")
+    log(f"[{donor}] alignment vs parquet ({len(j):,}/{len(ref):,} matched on object_id):")
+    for c in probe:
+        a = j[c].to_numpy(np.float64)
+        b = j[c + "_mine"].to_numpy(np.float64)
+        ok = np.isfinite(a) & np.isfinite(b)
+        r = np.corrcoef(a[ok], b[ok])[0, 1] if ok.sum() > 10 else np.nan
+        ratio = np.nanmedian(b[ok] / np.where(a[ok] == 0, np.nan, a[ok]))
+        log(f"    {c:16s} pearson_r={r:.3f}  median(mine/parquet)={ratio:.3f}")
+
+
+def recompensate_from_intermediates(donor: str, cfg: PipelineConfig, params: RedseaParams):
+    """Reload cached intermediates and just (re)compensate + write (fast alpha sweeps)."""
+    backend = get_backend(params.use_gpu, params.gpu_device)
+    oids, cols, data, edge, sizes, M = load_intermediates(cfg, donor)
+    if params.gap_bridge > 0 and (cfg.mask_dir / f"{donor}.tif").exists():
+        mask = tifffile.imread(cfg.mask_dir / f"{donor}.tif")
+        M = contact_matrix_gapbridge(mask, len(oids), params.gap_bridge)
+        del mask
+        log(f"[{donor}] recomputed gap-bridged contacts: {M.nnz:,}")
+    corrected, clamp_frac, n_iso = compensate(
+        data, edge, sizes, M, params.comp_mode, params.alpha, backend)
+    log(f"[{donor}] recompensate(mode={params.comp_mode}, alpha={params.alpha}): {n_iso} isolated")
+    write_corrected(cfg, donor, oids, cols, corrected, sizes)
+    return donor
+
+
+# --------------------------------------------------------------------------- driver
+def run_redsea(cfg: PipelineConfig, donors: list[str], params: RedseaParams,
+               *, from_intermediates: bool = False, n_jobs: int = 1) -> list:
+    """Run REDSEA over a list of donors, optionally across processes."""
+    worker = recompensate_from_intermediates if from_intermediates else process_donor
+    fn = functools.partial(_safe_worker, worker=worker, cfg=cfg, params=params)
+    return map_donors(fn, donors, n_jobs=n_jobs, ordered=True, on_error="log")
+
+
+def _safe_worker(donor, worker, cfg, params):
+    """Top-level wrapper so SystemExit (a skipped donor) doesn't kill the pool."""
+    try:
+        return worker(donor, cfg, params)
+    except SystemExit as e:
+        log(f"[{donor}] SKIP: {e}")
+        return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", type=Path, default=None)
+    ap.add_argument("--donor", default=None)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--jobs", type=int, default=None, help="per-donor process pool size")
+    ap.add_argument("--gpu", action="store_true", help="use the CuPy backend (n_jobs=1 recommended)")
+    ap.add_argument("--downsample", type=float, default=None, help="power of 2; 1=full res")
+    ap.add_argument("--edge-radius", type=int, default=None,
+                    help="boundary band dilation radius (px); 0 = the 1-px cell rim")
+    ap.add_argument("--comp-mode", type=int, default=None, choices=[0, 1],
+                    help="0=subtract only (default); 1=subtract+reinforce")
+    ap.add_argument("--alpha", type=float, default=None, help="spillover subtraction strength")
+    ap.add_argument("--gap-bridge", type=int, default=None,
+                    help="bridge background gaps <= N px in the contact graph (0 disables)")
+    ap.add_argument("--keep-mask", action="store_true", help="persist the int32 instance mask")
+    ap.add_argument("--save-intermediates", action="store_true",
+                    help="dump data/edge/sizes/contact for fast --from-intermediates re-runs")
+    ap.add_argument("--from-intermediates", action="store_true",
+                    help="skip raster+channels; reload saved intermediates and just (re)compensate")
+    a = ap.parse_args(argv)
+
+    cfg = load_config(a.config)
+    if a.jobs is not None:
+        cfg.n_jobs = a.jobs
+    if a.gpu:
+        cfg.use_gpu = True
+
+    over = {}
+    for k, src in [("downsample", a.downsample), ("edge_radius", a.edge_radius),
+                   ("comp_mode", a.comp_mode), ("alpha", a.alpha), ("gap_bridge", a.gap_bridge)]:
+        if src is not None:
+            over[k] = src
+    params = RedseaParams.from_config(cfg, keep_mask=a.keep_mask,
+                                      save_intermediates=a.save_intermediates, **over)
+
+    if a.all:
+        donors = cfg.discover_donors()
+    elif a.donor:
+        donors = [a.donor]
+    else:
+        raise SystemExit("specify --donor <id> or --all")
+
+    # GPU + a local process pool would contend on one device; force serial with GPU.
+    n_jobs = cfg.n_jobs
+    if params.use_gpu and n_jobs != 1:
+        log("[warn] --gpu with --jobs>1 would contend on one device; forcing jobs=1 "
+            "(use a SLURM array for GPU cohort parallelism)")
+        n_jobs = 1
+
+    run_redsea(cfg, donors, params, from_intermediates=a.from_intermediates, n_jobs=n_jobs)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

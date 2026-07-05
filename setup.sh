@@ -1,116 +1,60 @@
 #!/bin/bash
-# Quick Start Script for Phenocycler Analysis Pipeline
-# This script helps you get started with the Phenocycler analysis pipeline
-
-set -e  # Exit on error
+# Quick-start setup for the Phenocycler_Analysis pipeline
+# (raw data -> broad lineage via REDSEA + RESTORE).
+set -e
 
 echo "=========================================="
-echo "Phenocycler Analysis Pipeline - Quick Start"
+echo "Phenocycler_Analysis — setup"
 echo "=========================================="
-echo ""
 
-# Check if conda is available
+# 1) Vendored RESTORE (git submodule at external/RESTORE)
+echo "[1/4] Fetching the vendored RESTORE submodule ..."
+git submodule update --init --recursive
+
+# 2) Conda environment
 if ! command -v conda &> /dev/null; then
-    echo "ERROR: conda is not installed or not in PATH"
-    echo "Please install Miniconda or Anaconda first"
-    echo "Visit: https://docs.conda.io/en/latest/miniconda.html"
-    exit 1
+  echo "ERROR: conda not found. Install Miniconda/Anaconda first:"
+  echo "  https://docs.conda.io/en/latest/miniconda.html"
+  exit 1
 fi
-
-echo "Step 1: Creating conda environment..."
-echo "This may take several minutes..."
+echo "[2/4] Creating conda env 'phenocycler_analysis' ..."
 if conda env list | grep -q "^phenocycler_analysis "; then
-    echo "Environment 'phenocycler_analysis' already exists."
-    read -p "Do you want to recreate it? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        conda env remove -n phenocycler_analysis -y
-        conda env create -f environment.yml
-    fi
+  echo "  env already exists (skipping; 'conda env update -f environment.yml' to refresh)"
 else
-    conda env create -f environment.yml
+  conda env create -f environment.yml
 fi
 
-echo ""
-echo "Step 2: Activating environment..."
-source $(conda info --base)/etc/profile.d/conda.sh
+# 3) Verify the pipeline + vendored RESTORE import
+echo "[3/4] Verifying installation ..."
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate phenocycler_analysis
-
-echo ""
-echo "Step 3: Verifying installation..."
-python << 'PYEOF'
-import sys
-print(f"Python version: {sys.version}")
-
+python - <<'PY'
+import phenocycler
+from phenocycler import load_config
+cfg = load_config()
+print("  phenocycler", phenocycler.__version__)
+for m in ("cells_parquet", "redsea", "restore", "lineage", "qupath_export", "pipeline"):
+    __import__(f"phenocycler.{m}")
+print("  all pipeline modules import OK")
+import sys; sys.path.insert(0, str(cfg.restore_vendor))
 try:
-    import scanpy as sc
-    print(f"✓ scanpy: {sc.__version__}")
-except ImportError as e:
-    print(f"✗ scanpy: {e}")
+    from RESTORE import Normalization  # noqa
+    print("  vendored RESTORE import OK")
+except Exception as e:
+    print(f"  NOTE: RESTORE import needs 'spams' (pip install spams-bin): {e}")
+PY
 
-try:
-    import squidpy as sq
-    print(f"✓ squidpy: {sq.__version__}")
-except ImportError as e:
-    print(f"✗ squidpy: {e}")
-
-try:
-    import scvi
-    print(f"✓ scvi-tools: {scvi.__version__}")
-except ImportError as e:
-    print(f"✗ scvi-tools: {e}")
-
-try:
-    import numpy as np
-    print(f"✓ numpy: {np.__version__}")
-except ImportError as e:
-    print(f"✗ numpy: {e}")
-
-try:
-    import pandas as pd
-    print(f"✓ pandas: {pd.__version__}")
-except ImportError as e:
-    print(f"✗ pandas: {e}")
-
-try:
-    import tifffile
-    print(f"✓ tifffile: {tifffile.__version__}")
-except ImportError as e:
-    print(f"✗ tifffile: {e}")
-
-print("\nAll core packages loaded successfully!")
-PYEOF
-
-echo ""
-echo "Step 4: Creating directory structure..."
-mkdir -p data/raw
-mkdir -p data/processed
-mkdir -p data/exports
-mkdir -p figures
-mkdir -p logs
-mkdir -p notebooks
-mkdir -p scripts/R
-mkdir -p scripts/slurm
-mkdir -p utils
+# 4) Create the data directory skeleton
+echo "[4/4] Creating data directories ..."
+mkdir -p data/raw data/redsea_scratch/geojson logs
 
 echo ""
 echo "=========================================="
-echo "Setup Complete!"
-echo "=========================================="
-echo ""
-echo "Next steps:"
-echo "1. Place your Phenocycler qptiff or CSV files in: data/raw/"
-echo "2. Activate the environment:"
-echo "   conda activate phenocycler_analysis"
-echo "3. Launch Jupyter Lab:"
-echo "   jupyter lab"
-echo "4. Open and run: notebooks/01_preprocessing.ipynb"
-echo ""
-echo "For HiPerGator users:"
-echo "1. Edit SLURM scripts in scripts/slurm/"
-echo "2. Update email, QOS, and account settings"
-echo "3. Submit jobs:"
-echo "   sbatch scripts/slurm/01_run_preprocessing.sh"
-echo ""
-echo "For help, see README.md and DATA_README.md"
+echo "Setup complete."
+echo "  1. Edit config.ini [paths] to point at your qptiff images, Cellmeasurements.csv,"
+echo "     and donor metadata (see DATA_README.md)."
+echo "  2. conda activate phenocycler_analysis"
+echo "  3. Run the pipeline:  python -m phenocycler.pipeline --status"
+echo "     or open notebooks/00_run_full_pipeline.ipynb"
+echo "  4. Run the tests:     pytest tests/"
 echo "=========================================="
