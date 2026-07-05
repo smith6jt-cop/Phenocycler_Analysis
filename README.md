@@ -1,466 +1,171 @@
-# Phenocycler Spatial Proteomics Analysis Pipeline
+# Phenocycler / CODEX Analysis — REDSEA → RESTORE → Broad Lineage
 
-A comprehensive, jupyter-notebook-based analysis pipeline for Phenocycler spatial proteomics data. Optimized for HiPerGator HPC cluster and includes scvi-tools, scanpy, squidpy, and R integration.
+A notebook- and Python-based pipeline for **Phenocycler (CODEX) spatial-proteomics**
+analysis, from raw imaging output through **broad lineage classification**. It is a
+faithful, optimized port of the "Senior phenotyping pipeline" from
+[Islet-Explorer-Senior](https://github.com/smith6jt-cop/Islet-Explorer-Senior),
+restructured into a reusable, testable package with per-donor parallelism and an
+optional GPU backend.
 
-## Table of Contents
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Workflow](#workflow)
-- [HiPerGator Usage](#hipergator-usage)
-- [Directory Structure](#directory-structure)
-- [Notebooks](#notebooks)
-- [Scripts](#scripts)
-- [Citation](#citation)
+The pipeline corrects two dominant artifacts of dense multiplexed tissue imaging —
+**lateral marker spillover** (REDSEA) and **per-image intensity / autofluorescence
+drift** (RESTORE) — and then assigns every cell to one of six mutually-exclusive
+lineages with **zero "Unassigned"** cells.
 
-## Features
+```
+ raw .qptiff  ─┐
+               ├─(QuPath segmentation, prerequisite)─┐
+ GeoJSON ──────┘                                     │
+                                                     ▼
+ Cellmeasurements.csv ──▶ [1] cells_parquet (DuckDB) ──▶ data/cells/
+                                                     │
+ qptiff + GeoJSON ─────────▶ [2] REDSEA spillover ───▶ data/cells_redsea/
+                                                     │
+                            [3] RESTORE normalize ───▶ data/restore_gated_redsea/
+                                (SSC, per-image)      │
+                            [4] broad lineage ────────▶ data/phenotype/broad/   (6 lineages, 0 Unassigned)
+                                                     │
+                            [5] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
+```
 
-### Analysis Capabilities
-- ✅ **Preprocessing**: QC, filtering, normalization from qptiff or CSV files (QuPath export)
-- ✅ **Phenotyping**: Cell type annotation with marker proteins and scVI
-- ✅ **Spatial Analysis**: Neighborhood enrichment, cell-cell interactions, spatial statistics
-- ✅ **Group Comparisons**: Differential expression and composition analysis
-- ✅ **Tissue Comparisons**: Multi-sample integration and comparison
+## Scope
 
-### Technologies
-- **Python**: scanpy, squidpy, scvi-tools, tifffile
-- **R**: Seurat, ggplot2, rpy2 integration
-- **HPC**: SLURM scripts for HiPerGator
-- **Visualization**: matplotlib, seaborn, plotly, napari
+**In scope (this repo):** raw QuPath outputs → cells parquet → REDSEA → RESTORE →
+broad lineage → optional QuPath re-import for visual QC.
+
+**Out of scope / downstream:** image processing before segmentation (illumination
+correction, stitching, registration, autofluorescence removal — use
+[KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)), scVI embedding, trajectory /
+pseudotime, islet aggregation, spatial neighborhood analysis, per-lineage
+subclustering, and the interactive R Shiny app.
+
+## What REDSEA and RESTORE do
+
+- **REDSEA** (Bai et al., *Front. Immunol.* 2021) removes signal that bleeds across
+  shared cell boundaries. `phenocycler/redsea.py` is a scalable pixel-level
+  reimplementation (the reference `redseapy` does not scale): per donor it rasterizes
+  the QuPath GeoJSON to an int32 mask, sums each qptiff channel per cell and per 1-px
+  boundary band with `np.bincount`, builds an 8-connected sparse contact graph, and
+  applies `corrected = clip(data − α·(F @ edge))` (subtract-only, α=1, 1-px band by
+  default).
+- **RESTORE** (Chang et al., *Commun. Biol.* 2020) normalizes per-image intensity using
+  mutually-exclusive reference markers. `phenocycler/restore.py` drives the **vendored**
+  RESTORE (`external/RESTORE`, git submodule) headlessly, fitting KMeans/GMM/**SSC**
+  per image × marker pair (SSC is the default), with a robust cohort-median guard on
+  degenerate thresholds. Pan-Cytokeratin is the universal negative reference (except
+  `CD3e ← CD163`).
+- **Broad lineage** assigns each cell by a strict hierarchy — Endocrine → Immune →
+  Endothelial → structural argmax (Epithelial / Fibroblast / Muscle) → Epithelial
+  default — producing six lineages and no "Unassigned" bucket.
 
 ## Installation
 
-### 1. Clone Repository
-
 ```bash
-git clone https://github.com/smith6jt-cop/Phenocycler_Analysis.git
+git clone --recurse-submodules https://github.com/smith6jt-cop/Phenocycler_Analysis.git
 cd Phenocycler_Analysis
-```
-
-### 2. Create Conda Environment
-
-```bash
-conda env create -f environment.yml
+bash setup.sh          # inits the RESTORE submodule, creates the conda env, verifies imports
 conda activate phenocycler_analysis
+pip install spams-bin  # SSC model for RESTORE (if not already pulled by environment.yml)
 ```
 
-This creates an environment with all required packages including:
-- Python 3.10
-- scanpy, squidpy, scvi-tools
-- R and Seurat
-- Jupyter Lab
-- All dependencies
+If you cloned without `--recurse-submodules`: `git submodule update --init --recursive`.
 
-### 3. Verify Installation
+## Quick start
+
+1. Edit `config.ini` `[paths]` to point at your raw `.qptiff` images, the QuPath
+   `Cellmeasurements.csv`, and the donor-metadata workbook (see `DATA_README.md`).
+2. Export per-cell GeoJSON from QuPath (`scripts/groovy/export_cells_geojson.groovy`).
+3. Run the whole pipeline (idempotent — skips completed steps):
 
 ```bash
-python -c "import scanpy as sc; import squidpy as sq; import scvi; print('All packages loaded successfully!')"
+python -m phenocycler.pipeline            # cells → redsea → restore → lineage → qupath
+python -m phenocycler.pipeline --status   # just show what exists
 ```
 
-## Quick Start
+Or run steps individually / interactively via the notebooks:
 
-### 1. Prepare Your Data
-
-Place your Phenocycler data in the `data/raw/` directory:
-
-**Option 1: qptiff files**
-```bash
-data/raw/
-├── phenocycler_sample_01.qptiff
-├── phenocycler_sample_02.qptiff
-└── ...
+```
+notebooks/00_prerequisites_qupath.ipynb   # upstream + GeoJSON export
+notebooks/01_build_cells_parquet.ipynb
+notebooks/02_redsea_spillover.ipynb
+notebooks/03_restore_normalize.ipynb
+notebooks/04_broad_lineage.ipynb
+notebooks/05_qupath_export.ipynb
+notebooks/00_run_full_pipeline.ipynb      # thin orchestrator
 ```
 
-**Option 2: CSV files from QuPath**
-```bash
-data/raw/
-├── sample_01_expression.csv
-├── sample_01_metadata.csv
-├── sample_01_coordinates.csv
-└── ...
-```
+Every step is also a module CLI, e.g. `python -m phenocycler.redsea --all --jobs 4`.
 
-### 2. Run Analysis Locally
+## Performance & acceleration
 
-```bash
-# Activate environment
-conda activate phenocycler_analysis
+Upstream, only the DuckDB build and scVI were parallel; REDSEA, RESTORE and lineage
+ran strictly serially. **Every stage is per-donor embarrassingly parallel**, which is
+the primary optimization here.
 
-# Launch Jupyter Lab
-jupyter lab
+| Step | Engine | Parallelism | GPU |
+|------|--------|-------------|-----|
+| 1. cells_parquet | DuckDB (out-of-core) | multithreaded (`[compute] duckdb_threads`) | n/a (I/O bound) |
+| 2. REDSEA | NumPy + SciPy-sparse | per-donor pool (`--jobs`) **or** SLURM array (one donor/task) | optional CuPy (`--gpu`): `bincount` + sparse `F@edge` |
+| 3. RESTORE | vendored RESTORE (SSC) | per-donor apply pool (`--jobs`); subsample cap keeps SSC tractable | — |
+| 4. broad lineage | vectorized NumPy | per-donor pool (`--jobs`) | — |
+| 5. QuPath export | pandas | serial (I/O-light) | — |
 
-# Open and run notebooks in order:
-# 01_preprocessing.ipynb
-# 02_phenotyping.ipynb
-# 03_spatial_analysis.ipynb
-# ...
-```
-
-### 3. Run on HiPerGator
+Set `[compute] n_jobs` in `config.ini` (or `--jobs N`) for the process pools, and
+`use_gpu = true` (+ `pip install cupy-cuda12x`) for the REDSEA CuPy path. For
+cohort-scale HPC runs use the SLURM chain:
 
 ```bash
-# Submit individual jobs
-sbatch scripts/slurm/01_run_preprocessing.sh
-
-# Or run complete pipeline
-sbatch scripts/slurm/run_full_pipeline.sh
+bash scripts/slurm/run_full_pipeline.sh 15   # 15 donors: cells → redsea[array 0-14] → restore → lineage
 ```
 
-## Workflow
-
-The analysis pipeline consists of 5 sequential notebooks:
+## Repository structure
 
 ```
-Raw qptiff/CSV files
-     ↓
-[01_preprocessing.ipynb]
-     ↓
-Filtered & normalized data
-     ↓
-[02_phenotyping.ipynb]
-     ↓
-Annotated cell types
-     ↓
-[03_spatial_analysis.ipynb]
-     ↓
-Spatial metrics & interactions
-     ↓
-[04_group_comparisons.ipynb]
-     ↓
-Differential expression
-     ↓
-[05_tissue_comparisons.ipynb]
-     ↓
-Final integrated dataset
+phenocycler/            installable package
+  config.py             config.ini loader + derived paths (no hardcoded paths)
+  cells_parquet.py      Step 1 — DuckDB CSV -> partitioned parquet
+  redsea.py             Step 2 — pixel REDSEA (+ parallel driver + CuPy backend)
+  restore.py            Step 3 — RESTORE driver (headless stubs, robust LUT, parallel apply)
+  lineage.py            Step 4 — deterministic broad-lineage hierarchy
+  qupath_export.py      Step 5 — per-image UUID-keyed CSVs for QuPath
+  pipeline.py           idempotent orchestrator + status table
+  parallel.py           per-donor process pool
+  gpu.py                optional CuPy/RAPIDS backend with CPU fallback
+external/RESTORE/       vendored RESTORE (git submodule, commit 38df59b)
+notebooks/              thin step notebooks + orchestrator
+scripts/groovy/         QuPath export/import Groovy scripts
+scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
+tests/                  pytest: REDSEA math, RESTORE guard, lineage invariants
+config.ini              paths + tunables
 ```
 
-## HiPerGator Usage
-
-### Setup on HiPerGator
-
-1. **Load conda module**:
-```bash
-module load conda
-```
-
-2. **Create environment**:
-```bash
-conda env create -f environment.yml
-```
-
-3. **Update SLURM scripts**:
-
-Edit the following in each SLURM script:
-- `--mail-user`: Your UFL email
-- `--qos`: Your QOS allocation
-- `--account`: Your account/group
-
-### Submit Jobs
-
-**Individual notebooks**:
-```bash
-# Create logs directory
-mkdir -p logs
-
-# Submit jobs
-sbatch scripts/slurm/01_run_preprocessing.sh
-sbatch scripts/slurm/02_run_phenotyping.sh
-sbatch scripts/slurm/03_run_spatial_analysis.sh
-```
-
-**Full pipeline**:
-```bash
-sbatch scripts/slurm/run_full_pipeline.sh
-```
-
-### Monitor Jobs
+## Testing
 
 ```bash
-# Check job status
-squeue -u $USER
-
-# Check job output
-tail -f logs/preprocess_JOBID.out
-
-# Cancel job
-scancel JOBID
+pytest tests/            # REDSEA compensation, contact matrix, rasterize; RESTORE robust
+                         # guard; lineage hierarchy (zero Unassigned); config; parallel
 ```
 
-### Resource Requirements
+The tests need no imaging data (they use synthetic masks/frames) and run in ~2 s.
 
-| Step | CPUs | Memory | Time | Notes |
-|------|------|--------|------|-------|
-| Preprocessing | 8 | 64GB | 24h | Data loading and QC |
-| Phenotyping | 8 | 64GB | 24h | Includes scVI training |
-| Spatial Analysis | 16 | 128GB | 48h | Computationally intensive |
-| Full Pipeline | 16 | 128GB | 96h | All steps sequentially |
+## Prerequisites (upstream of this repo)
 
-## Directory Structure
+1. **Image processing** — [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)
+   (illumination correction → stitching → deconvolution → EDF → registration →
+   autofluorescence removal).
+2. **Segmentation** — QuPath cell detection, then export the per-cell measurement CSV
+   and full-resolution GeoJSON (`scripts/groovy/export_cells_geojson.groovy`).
 
-```
-Phenocycler_Analysis/
-├── README.md                          # This file
-├── environment.yml                    # Conda environment
-├── notebooks/                         # Analysis notebooks
-│   ├── 01_preprocessing.ipynb
-│   ├── 02_phenotyping.ipynb
-│   ├── 03_spatial_analysis.ipynb
-│   ├── 04_group_comparisons.ipynb
-│   └── 05_tissue_comparisons.ipynb
-├── scripts/
-│   ├── R/                            # R analysis scripts
-│   │   └── phenocycler_analysis.R
-│   └── slurm/                        # HiPerGator SLURM scripts
-│       ├── 01_run_preprocessing.sh
-│       ├── 02_run_phenotyping.sh
-│       ├── 03_run_spatial_analysis.sh
-│       └── run_full_pipeline.sh
-├── utils/                            # Utility functions
-│   └── analysis_utils.py
-├── data/
-│   ├── raw/                          # Raw qptiff/CSV files (not tracked)
-│   ├── processed/                    # Processed data (not tracked)
-│   └── exports/                      # Exported results (not tracked)
-└── figures/                          # Generated figures (not tracked)
-    ├── 01_preprocessing/
-    ├── 02_phenotyping/
-    ├── 03_spatial_analysis/
-    ├── 04_group_comparisons/
-    └── 05_tissue_comparisons/
-```
+## Citations
 
-## Notebooks
-
-### 01_preprocessing.ipynb
-- Load Phenocycler data from qptiff or CSV files (QuPath export)
-- Quality control metrics
-- Cell and marker filtering
-- Normalization and transformation
-- Dimensionality reduction (PCA, UMAP)
-- Initial clustering
-
-**Input**: Raw qptiff files or CSV files from QuPath  
-**Output**: `*_preprocessed.h5ad`
-
-### 02_phenotyping.ipynb
-- Marker protein analysis
-- Cell type scoring
-- Automated annotation
-- scVI-based clustering
-- Manual curation support
-- Final cell type assignment
-
-**Input**: `*_preprocessed.h5ad`  
-**Output**: `*_annotated.h5ad`
-
-### 03_spatial_analysis.ipynb
-- Spatial neighborhood graph
-- Neighborhood enrichment
-- Co-occurrence analysis
-- Spatial autocorrelation (Moran's I)
-- Spatial domains
-- Ligand-receptor interactions
-- Ripley's statistics
-
-**Input**: `*_annotated.h5ad`  
-**Output**: `*_spatial_analysis.h5ad`
-
-### 04_group_comparisons.ipynb
-- Cell type composition analysis
-- Differential expression between groups
-- Cell type-specific DE
-- Volcano plots
-- Statistical testing
-
-**Input**: `*_spatial_analysis.h5ad`  
-**Output**: DE results, composition tables
-
-### 05_tissue_comparisons.ipynb
-- Multi-tissue integration
-- Batch correction with scVI
-- Cross-tissue differential expression
-- Tissue-specific spatial patterns
-- Comparative analysis
-
-**Input**: Multiple `*_annotated.h5ad` files  
-**Output**: `integrated_tissues.h5ad`
-
-## Scripts
-
-### R Integration (`scripts/R/phenocycler_analysis.R`)
-
-Advanced statistical analysis and visualization:
-
-```r
-source("scripts/R/phenocycler_analysis.R")
-
-# Load data
-seurat_obj <- load_phenocycler_h5ad("data/processed/sample_annotated.h5ad")
-
-# Differential expression
-de_results <- run_de_analysis(seurat_obj, "condition", "Treatment", "Control")
-
-# Visualizations
-plot_volcano(de_results)
-plot_spatial_features(seurat_obj, c("CD3", "CD8"))
-plot_composition(seurat_obj, "celltype", "condition")
-```
-
-### SLURM Scripts
-
-All SLURM scripts support:
-- Email notifications
-- Resource allocation
-- Error logging
-- Automatic output organization
-
-Modify these variables in each script:
-```bash
-#SBATCH --mail-user=your_email@ufl.edu
-#SBATCH --qos=your_qos
-#SBATCH --account=your_account
-```
-
-## Utility Functions
-
-The `utils/analysis_utils.py` module provides reusable functions:
-
-```python
-from utils.analysis_utils import *
-
-# Load data from qptiff
-adata = load_qptiff_data(qptiff_path, "sample_01")
-
-# Load data from QuPath CSV
-adata = load_qupath_csv(csv_dir, "sample_01")
-
-# Calculate QC metrics
-adata = calculate_qc_metrics(adata)
-
-# Filter
-adata = filter_cells_and_markers(adata)
-
-# Normalize and identify highly variable proteins
-adata = normalize_and_hvg(adata)
-
-# Run standard workflow
-adata = run_standard_workflow(adata)
-
-# Export results
-export_to_csv(adata, output_dir, "sample_01")
-```
-
-## Customization
-
-### Cell Type Markers
-
-Edit marker proteins in `02_phenotyping.ipynb`:
-
-```python
-marker_proteins = {
-    'T cells': ['CD3', 'CD8', 'CD4'],
-    'B cells': ['CD19', 'CD20'],
-    'Macrophages': ['CD68', 'CD163'],
-    'Epithelial': ['PanCK', 'EpCAM'],
-    # Add your tissue-specific markers
-}
-```
-
-### QC Thresholds
-
-Adjust in `01_preprocessing.ipynb`:
-
-```python
-MIN_MARKERS = 5
-MIN_CELLS = 3
-MAX_BACKGROUND = 0.2
-MIN_INTENSITY = 10
-```
-
-### Spatial Parameters
-
-Modify in `03_spatial_analysis.ipynb`:
-
-```python
-# Spatial neighbors
-sq.gr.spatial_neighbors(adata, n_neighs=10)
-
-# Spatial domains
-n_domains = 5
-```
-
-## Troubleshooting
-
-### Common Issues
-
-**1. Memory errors on HiPerGator**
-```bash
-# Increase memory allocation
-#SBATCH --mem=256gb
-```
-
-**2. SLURM job fails immediately**
-```bash
-# Check account and QOS
-sacctmgr show assoc user=$USER
-```
-
-**3. Conda environment issues**
-```bash
-# Remove and recreate
-conda env remove -n phenocycler_analysis
-conda env create -f environment.yml
-```
-
-**4. Module not found errors**
-```bash
-# Verify environment is activated
-conda activate phenocycler_analysis
-which python
-```
-
-## Best Practices
-
-1. **Start with small test dataset** to verify pipeline
-2. **Save intermediate results** after each major step
-3. **Use version control** for custom modifications
-4. **Document parameters** used for reproducibility
-5. **Keep raw data separate** from processed outputs
-6. **Regular backups** of analysis results
-
-## Data Organization
-
-Recommended file naming:
-```
-<project>_<tissue>_<condition>_<replicate>_<step>.h5ad
-
-Examples:
-study1_liver_control_rep1_preprocessed.h5ad
-study1_liver_treatment_rep1_annotated.h5ad
-```
-
-## Citation
-
-If you use this pipeline, please cite:
-
-- **Scanpy**: Wolf et al., Genome Biology (2018)
-- **Squidpy**: Palla et al., Nature Methods (2022)
-- **scvi-tools**: Lopez et al., Nature Methods (2018)
-- **Seurat**: Hao et al., Cell (2021)
-
-## Support
-
-For questions and issues:
-- Open an issue on GitHub
-- Check HiPerGator documentation: https://help.rc.ufl.edu/
-- Scanpy tutorials: https://scanpy-tutorials.readthedocs.io/
-
-## License
-
-This pipeline is provided as-is for research purposes.
+- **REDSEA** — Bai, Y. et al. *Adjacent Cell Marker Lateral Spillover Compensation and
+  Reinforcement for Multiplexed Images.* Front. Immunol. 12:652631 (2021).
+- **RESTORE** — Chang, Y.H. et al. *RESTORE: Robust intEnSiTy nORmalization mEthod for
+  multiplexed imaging.* Commun. Biol. 3:111 (2020).
+- **KINTSUGI** — Smith, J.A. et al. *Protocol for processing and analyzing multiplexed
+  images...* STAR Protocols 6:103976 (2025).
 
 ## Acknowledgments
 
-- University of Florida Research Computing
-- HiPerGator HPC cluster
-- Scanpy, Squidpy, and scvi-tools development teams
+University of Florida Research Computing (HiPerGator). Pipeline logic ported from
+`smith6jt-cop/Islet-Explorer-Senior`; RESTORE vendored from `smith6jt-cop/RESTORE`.
