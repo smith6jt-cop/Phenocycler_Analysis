@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phenocycler-analysis"
+version = "0.3.0"
+description = "Phenocycler / CODEX phenotyping pipeline: REDSEA -> RESTORE -> hormone floor -> 8-class broad lineage"
+readme = "README.md"
+requires-python = ">=3.10"
+# Deps are intentionally UNPINNED: this package is installed editable into an existing
+# analysis env (e.g. Islet-Explorer-Senior's `scvi-env`, Python 3.13 / numpy 2.2) and must
+# not fight that env's resolved versions. Pinned reference versions live in environment.yml.
+# The SSC RESTORE model additionally needs `spams` (install `spams-bin`), left out here so pip
+# does not try to build it.
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "scikit-image",
+    "scikit-learn",
+    "matplotlib",
+    "statsmodels",
+    "tifffile",
+    "imagecodecs",
+    "duckdb",
+    "openpyxl",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+test = ["pytest"]
+
+[project.scripts]
+phenocycler = "phenocycler.pipeline:main"
+
+[tool.setuptools]
+packages = ["phenocycler"]

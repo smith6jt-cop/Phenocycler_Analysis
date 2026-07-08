@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-Orchestrator — run the full raw-data → broad-lineage pipeline end to end.
+Orchestrator — run the full raw-data → 8-class broad-lineage pipeline end to end.
 
-Mirrors ``notebooks/senior_phenotyping_redsea_restore.ipynb`` (idempotent
-``run_step`` + a final status table), but in-process against the ``phenocycler``
-package rather than shelling out to loose scripts.  Each step is skipped when its
-outputs already exist unless ``force=True``.
+Idempotent ``run_step`` (skips a stage when its outputs already exist unless
+``force=True``) + a final status table, in-process against the ``phenocycler``
+package.  Stage order (the two starred stages are the corrections the upstream
+notebook / earlier port OMITTED):
+
+    cells → redsea → restore → restore_extra* → hormone_floor* → lineage → qupath → figures
+
+``hormone_floor`` (rewrites {INS,GCG,SST}_pos = _norm ≥ K) MUST run before
+``lineage`` or the false-endocrine over-calling returns; ``restore_extra`` gates
+B3TUBB/CD99/MPO for the Neural/Endocrine-CD99/Neutrophil classes.
 
     python -m phenocycler.pipeline                       # run every missing step
-    python -m phenocycler.pipeline --only redsea restore
+    python -m phenocycler.pipeline --only hormone_floor lineage figures
     python -m phenocycler.pipeline --force               # re-run everything
     python -m phenocycler.pipeline --status              # just print the status table
 """
@@ -22,31 +28,60 @@ from pathlib import Path
 from .config import PipelineConfig, load_config
 
 
-# step name -> (output pattern under data_dir, human label)
+# step name -> (output pattern under data_dir, human label) for the status table
 STAGES = [
     ("cells", "cells/donor_id=*", "Raw cells (DuckDB)"),
     ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
-    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated"),
-    ("lineage", "phenotype/broad/donor_id=*", "Broad lineage"),
+    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (10 markers)"),
+    ("restore_extra", "restore_gated_redsea_extra/donor_id=*", "RESTORE gated (extra 3)"),
+    ("hormone_floor", "restore_gated_redsea/donor_id=*", "Hormone floor (K=5)"),
+    ("lineage", "phenotype/broad/donor_id=*", "Broad lineage (8-class)"),
     ("qupath", "phenotype/qupath_class/pheno_class_*.csv", "QuPath CSVs"),
+    ("figures", "phenotype/celltype_marker_dotplot.png", "Identity QC figures"),
 ]
+
+ORDER = ["cells", "redsea", "restore", "restore_extra", "hormone_floor",
+         "lineage", "qupath", "figures"]
 
 
 def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
     return len(glob.glob(str(cfg.data_dir / pattern)))
 
 
-def run_step(cfg: PipelineConfig, name: str, func, pattern: str, force: bool) -> None:
-    n = _has_outputs(cfg, pattern)
-    if n and not force:
-        print(f"[SKIP] {name}: {n} outputs already at {cfg.data_dir/pattern}")
-        return
+def _lineage_is_8class(cfg: PipelineConfig) -> bool:
+    """True only if the broad-lineage partitions exist AND carry the 8-class score columns.
+
+    A stale 6-class ``broad/`` therefore counts as 'not done', so the lineage step re-runs.
+    """
+    files = sorted(glob.glob(str(cfg.broad_dir / "donor_id=*" / "*.parquet")))
+    if not files:
+        return False
+    try:
+        import pyarrow.parquet as pq
+        cols = set(pq.ParquetFile(files[0]).schema.names)
+    except Exception:
+        return False
+    return {"score_Neural", "score_Neutrophil"}.issubset(cols)
+
+
+def _run_step(cfg, name, func, pattern, checker, force) -> None:
+    if not force:
+        if checker is not None:
+            if checker(cfg):
+                print(f"[SKIP] {name}: already complete")
+                return
+        elif pattern is not None:
+            n = _has_outputs(cfg, pattern)
+            if n:
+                print(f"[SKIP] {name}: {n} outputs already at {cfg.data_dir/pattern}")
+                return
     print(f"\n=== {name} ===")
     func()
 
 
 def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
-    from . import cells_parquet, redsea, restore, lineage, qupath_export
+    from . import (cells_parquet, redsea, restore, hormone_floor, lineage,
+                   qupath_export, figures)
 
     def _cells():
         cells_parquet.build_cells_parquet(cfg)
@@ -58,43 +93,67 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
     def _restore():
         restore.run_restore(cfg)
 
+    def _restore_extra():
+        restore.run_restore_extra(cfg)
+
+    def _hormone_floor():
+        # floor from the pre-hormone-floor backup when present (reproducible from a clean RESTORE);
+        # otherwise floor restore_gated_redsea in place (idempotent — _norm is untouched).
+        src = (cfg.restore_gated_prefloor_dir
+               if cfg.restore_gated_prefloor_dir.exists() else cfg.restore_gated_dir)
+        hormone_floor.run_hormone_floor(cfg, gated_dir=src, out_dir=cfg.restore_gated_dir)
+
     def _lineage():
         lineage.run_lineage(cfg)
 
     def _qupath():
         qupath_export.export_qupath_classes(cfg)
 
-    funcs = {"cells": (_cells, "cells/donor_id=*"),
-             "redsea": (_redsea, "cells_redsea/donor_id=*"),
-             "restore": (_restore, "restore_gated_redsea/donor_id=*"),
-             "lineage": (_lineage, "phenotype/broad/donor_id=*"),
-             "qupath": (_qupath, "phenotype/qupath_class/pheno_class_*.csv")}
-    order = ["cells", "redsea", "restore", "lineage", "qupath"]
-    selected = only or order
-    for name in order:
+    def _figures():
+        figures.run_figures(cfg)
+
+    # (func, existence-pattern, column-checker). hormone_floor is idempotent -> never skipped on
+    # existence (pattern None, checker None) so it always re-applies when selected.
+    steps = {
+        "cells": (_cells, "cells/donor_id=*", None),
+        "redsea": (_redsea, "cells_redsea/donor_id=*", None),
+        "restore": (_restore, "restore_gated_redsea/donor_id=*", None),
+        "restore_extra": (_restore_extra, "restore_gated_redsea_extra/donor_id=*", None),
+        "hormone_floor": (_hormone_floor, None, None),
+        "lineage": (_lineage, "phenotype/broad/donor_id=*", _lineage_is_8class),
+        "qupath": (_qupath, "phenotype/qupath_class/pheno_class_*.csv", None),
+        "figures": (_figures, "phenotype/celltype_marker_dotplot.png", None),
+    }
+    selected = only or ORDER
+    for name in ORDER:
         if name not in selected:
             continue
-        fn, pat = funcs[name]
-        run_step(cfg, name, fn, pat, force)
+        fn, pat, checker = steps[name]
+        _run_step(cfg, name, fn, pat, checker, force)
     print_status(cfg)
 
 
 def print_status(cfg: PipelineConfig) -> None:
-    print("\n" + "=" * 52)
-    print(f"{'stage':<22}{'outputs':>10}   status")
-    print("-" * 52)
-    for _, pattern, label in STAGES:
+    print("\n" + "=" * 60)
+    print(f"{'stage':<30}{'outputs':>10}   status")
+    print("-" * 60)
+    for name, pattern, label in STAGES:
         n = _has_outputs(cfg, pattern)
-        print(f"{label:<22}{n:>10}   {'OK' if n else 'MISSING'}")
-    print("=" * 52)
+        if name == "lineage":
+            state = "OK (8-class)" if _lineage_is_8class(cfg) else ("STALE (6-class)" if n else "MISSING")
+        elif name == "hormone_floor":
+            state = "OK" if n else "MISSING"   # in-place; presence of restore_gated is the proxy
+        else:
+            state = "OK" if n else "MISSING"
+        print(f"{label:<30}{n:>10}   {state}")
+    print("=" * 60)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=None)
-    ap.add_argument("--only", nargs="*", default=None,
-                    choices=["cells", "redsea", "restore", "lineage", "qupath"])
+    ap.add_argument("--only", nargs="*", default=None, choices=ORDER)
     ap.add_argument("--jobs", type=int, default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--status", action="store_true", help="print status and exit")

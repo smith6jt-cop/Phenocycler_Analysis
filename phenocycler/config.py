@@ -5,7 +5,7 @@ Everything that was a hardcoded absolute path or a magic constant in the
 upstream ``scripts/senior/*.py`` scripts lives here instead, resolved from
 ``config.ini`` (see the repo root) with environment-variable and keyword
 overrides.  The scientific defaults (REDSEA subtract-only / α=1 / 1-px band,
-RESTORE SSC model + robust guard, the 6 broad lineages) are preserved exactly;
+RESTORE SSC model + robust guard, the 8 broad lineages) are preserved exactly;
 this module only makes the *paths* and *compute knobs* configurable.
 
 Resolution order for every value: explicit keyword override  >  environment
@@ -24,15 +24,20 @@ from typing import Optional
 # Scientific constants (faithful to Islet-Explorer-Senior; not usually tuned)
 # --------------------------------------------------------------------------- #
 
-# Broad-lineage gating markers -> the six mutually-exclusive lineages
-# (scripts/senior/assign_broad_lineage.py).
+# Broad-lineage gating markers -> the eight mutually-exclusive lineages
+# (scripts/senior/assign_broad_lineage.py).  CD99 (bright-only) is an Endocrine
+# gate; Neural (B3TUBB) and Neutrophil (MPO) are carved out of the structural /
+# immune background.  CD99/B3TUBB/MPO are gated in a SEPARATE RESTORE pass
+# (EXTRA_MARKER_PAIRS) and merged by object_id at assignment time.
 LINEAGES: dict[str, list[str]] = {
     "Epithelial": ["Pan_Cytokeratin"],
     "Fibroblast": ["Vimentin"],
     "Immune": ["CD3e", "CD20", "CD163"],
-    "Endocrine": ["INS", "GCG", "SST"],
+    "Endocrine": ["INS", "GCG", "SST", "CD99"],
     "Endothelial": ["CD31"],
     "Muscle": ["SMA"],
+    "Neural": ["B3TUBB"],
+    "Neutrophil": ["MPO"],
 }
 # Structural background is resolved by argmax of these three `_norm` scores.
 STRUCT_LINEAGES: list[str] = ["Epithelial", "Fibroblast", "Muscle"]
@@ -40,6 +45,13 @@ STRUCT_LINEAGES: list[str] = ["Epithelial", "Fibroblast", "Muscle"]
 LINEAGE_COLORS: dict[str, str] = {
     "Epithelial": "#4477AA", "Fibroblast": "#EE6677", "Immune": "#228833",
     "Endocrine": "#CCBB44", "Endothelial": "#66CCEE", "Muscle": "#AA3377",
+    "Neural": "#B5838D", "Neutrophil": "#E69F00",   # dusty rose / Okabe-Ito orange (CVD-safe)
+}
+# unique 3-char codes for the terse per-donor progress line (Endocrine/Endothelial
+# and Neural/Neutrophil would otherwise both collide under a naive name[:3]).
+LINEAGE_ABBR: dict[str, str] = {
+    "Epithelial": "Epi", "Fibroblast": "Fib", "Immune": "Imm", "Endocrine": "Enc",
+    "Endothelial": "Eth", "Muscle": "Mus", "Neural": "Nrl", "Neutrophil": "Neu",
 }
 STATUS_ORDER: list[str] = ["ND", "AAB", "T1D"]
 
@@ -58,6 +70,21 @@ DEFAULT_MARKER_PAIRS: list[list[str]] = [
     ["CD20", "Pan_Cytokeratin"],
     ["CD163", "Pan_Cytokeratin"],
 ]
+
+# Extra RESTORE pass (run separately with --no-robust --no-ref-qc so the validated
+# 10-pair gates in restore_gated_redsea stay byte-identical).  These three markers
+# (Endocrine-CD99 / Neural-B3TUBB / Neutrophil-MPO) are gated against Pan_Cytokeratin
+# into restore_gated_redsea_extra and merged into the lineage call by object_id.
+EXTRA_MARKER_PAIRS: list[list[str]] = [
+    ["CD99", "Pan_Cytokeratin"],
+    ["B3TUBB", "Pan_Cytokeratin"],
+    ["MPO", "Pan_Cytokeratin"],
+]
+EXTRA_MARKERS: list[str] = [p[0] for p in EXTRA_MARKER_PAIRS]   # CD99, B3TUBB, MPO
+
+# {INS,GCG,SST}_pos are floored to _norm >= hormone_min_norm by the hormone_floor
+# stage (scripts/senior/apply_hormone_floor.py) before lineage assignment.
+HORMONE_MARKERS: list[str] = ["INS", "GCG", "SST"]
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INI = _REPO_ROOT / "config.ini"
@@ -92,6 +119,10 @@ class PipelineConfig:
     restore_robust_factor: float = 3.0
     restore_min_cell_area: float = 5.0
     restore_seed: int = 0
+
+    # -- lineage (assign_broad_lineage.py + apply_hormone_floor.py + marker_taxonomy.py) --
+    hormone_min_norm: float = 5.0    # K: {INS,GCG,SST}_pos := _norm >= K (false-endocrine floor)
+    cd99_bright: float = 3.0         # CD99_pos := CD99_norm >= this (bright-only Endocrine gate)
 
     # -- compute -------------------------------------------------------------
     n_jobs: int = 1                  # per-donor process pool size (1 == serial)
@@ -136,8 +167,29 @@ class PipelineConfig:
         return self.data_dir / "restore_gated_redsea"
 
     @property
+    def restore_gated_prefloor_dir(self) -> Path:
+        # pre-hormone-floor backup; the hormone_floor stage reads this and (re)writes restore_gated_dir
+        return self.data_dir / "restore_gated_redsea.pre_hormonefloor"
+
+    @property
+    def restore_redsea_extra_dir(self) -> Path:
+        return self.data_dir / "restore_redsea_extra"
+
+    @property
+    def restore_gated_extra_dir(self) -> Path:
+        return self.data_dir / "restore_gated_redsea_extra"
+
+    @property
     def restore_thresholds_csv(self) -> Path:
         return self.data_dir / "restore_thresholds_redsea.csv"
+
+    @property
+    def restore_thresholds_extra_csv(self) -> Path:
+        return self.data_dir / "restore_thresholds_extra.csv"
+
+    @property
+    def redsea_reassess_dir(self) -> Path:
+        return self.data_dir / "redsea_reassess"
 
     @property
     def phenotype_dir(self) -> Path:
@@ -194,6 +246,10 @@ _INI_SCHEMA = {
         "min_cell_area": ("restore_min_cell_area", float),
         "seed": ("restore_seed", int),
     },
+    "lineage": {
+        "hormone_min_norm": ("hormone_min_norm", float),
+        "cd99_bright": ("cd99_bright", float),
+    },
     "compute": {
         "n_jobs": ("n_jobs", int),
         "duckdb_threads": ("duckdb_threads", int),
@@ -211,6 +267,7 @@ _ENV_OVERRIDES = {
     "restore_vendor": ("PHENOCYCLER_RESTORE_VENDOR", Path),
     "n_jobs": ("PHENOCYCLER_JOBS", int),
     "use_gpu": ("PHENOCYCLER_USE_GPU", lambda s: str(s).lower() in ("1", "true", "yes", "on")),
+    "hormone_min_norm": ("PHENOCYCLER_HORMONE_MIN_NORM", float),
 }
 
 

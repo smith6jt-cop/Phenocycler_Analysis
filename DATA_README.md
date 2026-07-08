@@ -39,22 +39,30 @@ data/
 ├── cells_redsea/donor_id=<id>/data_0.parquet     # Step 2: REDSEA spillover-corrected means
 ├── restore_redsea/                               # Step 3: threshs.pkl, positive_fractions.csv, qc/
 ├── restore_thresholds_redsea.csv                 # Step 3: per-image KMeans/GMM/SSC thresholds (chosen flag)
-├── restore_gated_redsea/donor_id=<id>/data_0.parquet   # Step 3: {m}_pos, {m}_norm, {m}_log2r
+├── restore_gated_redsea/donor_id=<id>/data_0.parquet         # Step 3: {m}_pos/_norm/_log2r (10 markers)
+├── restore_gated_redsea_extra/donor_id=<id>/data_0.parquet   # Step 3 (extra): CD99/B3TUBB/MPO _pos/_norm
+├── restore_gated_redsea.pre_hormonefloor/                    # Step 4: pre-floor backup (rollback point)
 ├── phenotype/
-│   ├── broad/donor_id=<id>/data_0.parquet        # Step 4: broad_lineage, assign_margin, epi_default, scores
-│   ├── broad_lineage_composition.png             # Step 4: composition + disease-trend figure
-│   └── qupath_class/pheno_class_<id>.csv         # Step 5: object_id, broad_lineage, image (for QuPath)
+│   ├── broad/donor_id=<id>/data_0.parquet        # Step 5: broad_lineage, assign_margin, epi_default, score_* (8)
+│   ├── broad_lineage_composition.png             # Step 5: composition + disease-trend figure
+│   ├── celltype_marker_dotplot.png / _heatmap.png# Step 7: identity QC figures
+│   └── qupath_class/pheno_class_<id>.csv         # Step 6: object_id, broad_lineage, image (for QuPath)
+├── redsea_reassess/                              # read-only acceptance-yardstick CSVs + figures
 └── redsea_scratch/
     ├── geojson/cells__<image>.geojson            # QuPath boundaries (input to REDSEA)
     ├── masks/<id>.tif                            # int32 instance masks (--keep-mask)
     └── intermediates/<id>.npz                    # data/edge/sizes/contact (--save-intermediates)
 ```
 
-### The 10 broad-lineage gating markers
+### The broad-lineage gating markers → 8 lineages
 
-`Pan_Cytokeratin, Vimentin, SMA, CD31, INS, GCG, SST, CD3e, CD20, CD163` — mapping to
-the six lineages Epithelial, Fibroblast, Muscle, Endothelial, Endocrine, Immune. The
-full imaging panel is larger (~59-plex); only these gate the broad lineage.
+Main pass (`restore_gated_redsea`, 10 markers):
+`Pan_Cytokeratin, Vimentin, SMA, CD31, INS, GCG, SST, CD3e, CD20, CD163`. Extra pass
+(`restore_gated_redsea_extra`, via `restore --extra`): `CD99, B3TUBB, MPO`. Together they
+map to the **eight** lineages Epithelial, Fibroblast, Muscle, Endothelial, Endocrine
+(INS/GCG/SST or bright CD99), Immune, **Neural** (B3TUBB), **Neutrophil** (MPO). Before
+typing, the hormone floor rewrites `{INS,GCG,SST}_pos = (_norm ≥ 5)`. The full imaging
+panel is larger (~59-plex); only these gate the broad lineage.
 
 ## Region scheme
 
