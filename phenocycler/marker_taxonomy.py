@@ -39,7 +39,7 @@ EXCLUDED = ["DAPI", "IAPP", "Ker8_18", "Keratin_5"]
 
 # --- TYPE / lineage-identity markers: drive phenotyping and the identity heatmap ---
 # Ordered in CLASS BLOCKS following the heatmap row order (LIN_ORDER: Epithelial, Fibroblast, Muscle,
-# Neural, Endothelial, Endocrine, Immune, Neutrophil) so the heatmap reads as a rough diagonal and
+# Neural, Endothelial, Endocrine, Immune) so the heatmap reads as a rough diagonal and
 # markers of the same class sit together (e.g. CD56 next to B3TUBB in the neural block).
 TYPE = [
     # epithelial / exocrine (acinar + ductal)
@@ -57,7 +57,7 @@ TYPE = [
     # immune lineage / subtype (lymphoid then myeloid)
     "CD3e", "CD8", "CD4", "FOXP3", "CD20", "CD79a", "CD68", "CD163", "Iba1", "CD206",
     "M2Gal3", "CD11c", "CD209", "CD11b",
-    # neutrophil / myeloid granulocyte
+    # neutrophil / granulocyte (MPO — folded into the Immune class)
     "MPO",
     # batch-2-only structural (present only in batch-2 donors; harmless if absent)
     "b_Catenin1",

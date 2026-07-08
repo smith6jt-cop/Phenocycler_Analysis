@@ -65,9 +65,9 @@ subclustering, and the interactive R Shiny app.
   separated β/α/δ cells (`hormone_floor.py`). CD99/B3TUBB/MPO are gated in a separate
   RESTORE pass (`restore --extra`) so the validated 10-marker gates stay byte-identical.
 - **Broad lineage** assigns each cell by a strict hierarchy — Endocrine (INS/GCG/SST or
-  bright CD99) → Immune → Endothelial → Neutrophil (MPO) → Neural (B3TUBB) → structural
-  argmax (Epithelial / Fibroblast / Muscle) → Epithelial default — producing **eight**
-  lineages and no "Unassigned" bucket.
+  bright CD99) → Immune (CD3e/CD20/CD163/MPO — neutrophils are immune) → Endothelial →
+  Neural (B3TUBB) → structural argmax (Epithelial / Fibroblast / Muscle) → Epithelial
+  default — producing **seven** lineages and no "Unassigned" bucket.
 
 ## Installation
 
@@ -152,7 +152,7 @@ phenocycler/            installable package
   redsea.py             Step 2 — pixel REDSEA (+ parallel driver + CuPy backend)
   restore.py            Step 3 — RESTORE driver (headless stubs, robust LUT, parallel apply)
   hormone_floor.py      Step 4 — threshold-relative endocrine floor (false-endocrine fix)
-  lineage.py            Step 5 — deterministic 8-class broad-lineage hierarchy
+  lineage.py            Step 5 — deterministic 7-class broad-lineage hierarchy
   marker_taxonomy.py    TYPE / PROCESS / EXCLUDED marker split (single source of truth)
   qupath_export.py      Step 6 — per-image UUID-keyed CSVs for QuPath
   figures.py            Step 7 — cell-type × marker identity dotplot + heatmap
@@ -164,7 +164,7 @@ external/RESTORE/       vendored RESTORE (git submodule, commit 38df59b)
 notebooks/              thin step notebooks + orchestrator
 scripts/groovy/         QuPath export/import Groovy scripts
 scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
-tests/                  pytest: REDSEA math, RESTORE guard, 8-class lineage invariants
+tests/                  pytest: REDSEA math, RESTORE guard, 7-class lineage invariants
 config.ini              paths + tunables
 pyproject.toml          editable-install metadata (pip install -e .)
 ```

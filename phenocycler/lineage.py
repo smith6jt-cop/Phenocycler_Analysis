@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Step 5 — broad lineage assignment (every cell typed into 8 classes, ZERO "Unassigned").
+Step 5 — broad lineage assignment (every cell typed into 7 classes, ZERO "Unassigned").
 
 Faithful port of ``scripts/senior/assign_broad_lineage.py`` (Islet-Explorer-Senior).  Each cell is
 typed by a HIERARCHICAL rule (no "Unassigned" bucket — the mandate is to fix the upstream cause, not
 invent a junk category):
 
   1. Endocrine    if INS/GCG/SST `_pos` OR bright CD99          (islet hormones β/α/δ + PP/ε/EC)
-  2. Immune       elif CD3e/CD20/CD163 `_pos`                    (leukocytes)
+  2. Immune       elif CD3e/CD20/CD163/MPO `_pos`                (leukocytes incl. granulocytes)
   3. Endothelial  elif CD31 `_pos`                               (vessels)
-  4. Neutrophil   elif MPO `_pos`                                (granulocytes)
-  5. Neural       elif B3TUBB `_pos`                             (nerves / Schwann)
-  6. else STRUCTURAL background → argmax of (Pan_Cytokeratin, Vimentin, SMA) `_norm`
+  4. Neural       elif B3TUBB `_pos`                             (nerves / Schwann)
+  5. else STRUCTURAL background → argmax of (Pan_Cytokeratin, Vimentin, SMA) `_norm`
         → Epithelial / Fibroblast / Muscle, with cells below ALL three structural thresholds
         defaulted to Epithelial (flagged `epi_default`).
 
 Applied sequentially (last write wins) → precedence high→low: Endocrine > Immune > Endothelial >
-Neutrophil > Neural > structural.  Neural/Neutrophil sit lowest of the specific lineages: they pull
-B3TUBB⁺/MPO⁺ cells OUT of the structural bucket but yield to a genuine endocrine/immune/endothelial
-call (MPO+CD163+ → Immune macrophage; INS+B3TUBB+ → Endocrine β-cell with spillover).
+Neural > structural.  Neural sits lowest of the specific lineages: it pulls B3TUBB⁺ cells OUT of the
+structural bucket but yields to a genuine endocrine/immune/endothelial call.  MPO (neutrophils) is
+folded into Immune — neutrophils ARE immune cells — and gated at ``immune_min_norm`` (the extra-dir
+equivalent of the CD3e/CD20/CD163 floor).
 
 Why hierarchical + an Epithelial default (not plain argmax-of-`_norm` over all classes): RESTORE sets
 each threshold at mean+3σ of the marker's NEGATIVE population — right for the sparse specific markers,
@@ -80,14 +80,15 @@ def status_map(cfg: PipelineConfig) -> dict:
         return {}
 
 
-def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_bright: float = CD99_BRIGHT):
-    """Type every cell in one donor by the deterministic 8-class hierarchy (zero Unassigned).
+def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_bright: float = CD99_BRIGHT,
+                 immune_min_norm: float = 2.0):
+    """Type every cell in one donor by the deterministic 7-class hierarchy (zero Unassigned).
 
     Returns (out_df, mfrac) where mfrac is the {INS,GCG} marker-positivity fraction (% of ALL cells)
     for the disease-trend panel (the Endocrine lineage lumps INS|GCG|SST|CD99, masking β-loss).
     """
     g = pd.read_parquet(gated_f)
-    # merge the separately-gated B3TUBB/CD99/MPO (Neural/Endocrine/Neutrophil markers) by object_id;
+    # merge the separately-gated B3TUBB/CD99/MPO (Neural/Endocrine/Immune markers) by object_id;
     # keeps the validated 10-marker gates untouched. NaN (a cell absent from the extra run) → not-pos.
     ex_cols = ["object_id"] + [f"{m}_{s}" for m in EXTRA_MARKERS for s in ("pos", "norm")]
     ex_f = Path(extra_gated_dir) / f"donor_id={donor}" / "data_0.parquet"
@@ -106,6 +107,10 @@ def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_brig
     # CD99 is broad; the standard mean+3σ gate over-calls a non-islet population. Keep only BRIGHT CD99
     # (>= cd99_bright × the per-image RESTORE threshold) — validated islet-coherent (marker_taxonomy).
     g["CD99_pos"] = g["CD99_norm"] >= cd99_bright
+    # MPO (neutrophils, folded into Immune): gate at the immune floor K — same RESTORE marginal-positive
+    # shoulder as CD3e/CD20/CD163 (which are floored upstream in the hormone_floor stage); MPO lives in
+    # the extra dir so it is floored here in-script instead.
+    g["MPO_pos"] = g["MPO_norm"] >= immune_min_norm
 
     norm = {m: g[f"{m}_norm"].to_numpy(np.float64) for ms in LINEAGES.values() for m in ms}
     pos = {m: g[f"{m}_pos"].to_numpy(bool) for ms in LINEAGES.values() for m in ms}
@@ -114,7 +119,7 @@ def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_brig
     # structural background: argmax over Pan_Cytokeratin / Vimentin / SMA _norm
     struct = np.vstack([scores[L] for L in STRUCT]).T            # N x 3
     sorder = np.argsort(-struct, axis=1)
-    # dtype "<U16" so longer labels ("Endothelial"/"Neutrophil") are not silently truncated by the
+    # dtype "<U16" so longer labels ("Endothelial") are not silently truncated by the
     # narrow fixed width of np.array(STRUCT) (longest structural name = "Epithelial", 10 chars).
     struct_call = np.array(STRUCT)[sorder[:, 0]].astype("<U16")
     ss = np.take_along_axis(struct, sorder, axis=1)
@@ -125,18 +130,16 @@ def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_brig
 
     # hierarchy: specific _pos lineages take precedence over the structural background.
     endocrine = pos["INS"] | pos["GCG"] | pos["SST"] | pos["CD99"]
-    immune = pos["CD3e"] | pos["CD20"] | pos["CD163"]
+    immune = pos["CD3e"] | pos["CD20"] | pos["CD163"] | pos["MPO"]   # +MPO (neutrophils folded in)
     endoth = pos["CD31"]
     neural = pos["B3TUBB"]
-    neutrophil = pos["MPO"]
     broad = struct_call.copy()
     margin = struct_margin.astype(np.float64)
     broad[neural] = "Neural";          margin[neural] = scores["Neural"][neural] - 1.0
-    broad[neutrophil] = "Neutrophil";  margin[neutrophil] = scores["Neutrophil"][neutrophil] - 1.0
     broad[endoth] = "Endothelial";     margin[endoth] = scores["Endothelial"][endoth] - 1.0
     broad[immune] = "Immune";          margin[immune] = scores["Immune"][immune] - 1.0
     broad[endocrine] = "Endocrine";    margin[endocrine] = scores["Endocrine"][endocrine] - 1.0
-    specific = endocrine | immune | endoth | neural | neutrophil
+    specific = endocrine | immune | endoth | neural
     epi_default = (~specific) & (~struct_pos)   # epithelial by background (validated), flagged for Step-2
 
     out = pd.DataFrame({"object_id": g["object_id"].astype(str), "donor_id": donor,
@@ -156,12 +159,12 @@ def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_brig
 
 
 def _assign_and_write(donor: str, gated_dir: str, cells_dir: str, extra_gated_dir: str,
-                      out_dir: str, cd99_bright: float) -> dict:
+                      out_dir: str, cd99_bright: float, immune_min_norm: float) -> dict:
     """Worker: assign one donor, write its partition, return composition + marker-fraction summary."""
     gf = sorted(glob.glob(str(Path(gated_dir) / f"donor_id={donor}" / "*.parquet")))
     if not gf:
         return {}
-    out, mfrac = assign_donor(donor, gf[0], cells_dir, extra_gated_dir, cd99_bright)
+    out, mfrac = assign_donor(donor, gf[0], cells_dir, extra_gated_dir, cd99_bright, immune_min_norm)
     dst = Path(out_dir) / f"donor_id={donor}"
     dst.mkdir(parents=True, exist_ok=True)
     out.to_parquet(dst / "data_0.parquet", index=False)
@@ -183,7 +186,8 @@ def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFram
 
     fn = functools.partial(_assign_and_write, gated_dir=str(cfg.restore_gated_dir),
                            cells_dir=str(cfg.cells_dir), extra_gated_dir=str(cfg.restore_gated_extra_dir),
-                           out_dir=str(cfg.broad_dir), cd99_bright=float(cfg.cd99_bright))
+                           out_dir=str(cfg.broad_dir), cd99_bright=float(cfg.cd99_bright),
+                           immune_min_norm=float(cfg.immune_min_norm))
     results = [r for r in map_donors(fn, donor_ids, n_jobs=n_jobs, ordered=True) if r]
     if not results:
         raise SystemExit("[err] no donors assigned")

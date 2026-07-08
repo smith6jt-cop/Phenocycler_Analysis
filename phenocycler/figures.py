@@ -58,9 +58,9 @@ from .marker_taxonomy import heatmap_markers, TYPE, PROCESS, EXCLUDED, CD99_BRIG
 RMARK = ["Pan_Cytokeratin", "Vimentin", "SMA", "B3TUBB", "CD31",
          "INS", "GCG", "SST", "CD99", "CD3e", "CD20", "CD163", "MPO"]
 # Heatmap row order (encodes the intended diagonal reading of the identity heatmap). These are the same
-# 8 mutually-exclusive broad classes as config.LINEAGES; the literal order is preserved from upstream.
-LIN_ORDER = ["Epithelial", "Fibroblast", "Muscle", "Neural", "Endothelial", "Endocrine", "Immune", "Neutrophil"]
-assert set(LIN_ORDER) == set(LINEAGES), "figures LIN_ORDER drifted from config.LINEAGES (8 broad classes)"
+# 7 mutually-exclusive broad classes as config.LINEAGES; the literal order is preserved from upstream.
+LIN_ORDER = ["Epithelial", "Fibroblast", "Muscle", "Neural", "Endothelial", "Endocrine", "Immune"]
+assert set(LIN_ORDER) == set(LINEAGES), "figures LIN_ORDER drifted from config.LINEAGES (7 broad classes)"
 # Non-marker columns to exclude from the full heatmap panel.
 META = {"object_id", "donor_id", "image", "cell_area", "cell_area_px", "cell_region", "islet_num"}
 
@@ -109,7 +109,8 @@ def run_figures(cfg: PipelineConfig, *, donors=None) -> dict:
                 columns=["object_id"] + gcols_main).to_pandas()
         gx = ds.dataset(cfg.restore_gated_extra_dir / f"donor_id={d}", format="parquet").to_table(
                 columns=["object_id"] + gcols_extra).to_pandas()
-        gx["CD99_pos"] = gx["CD99_norm"] >= CD99_BRIGHT   # bright-only CD99 (matches the Endocrine gate)
+        gx["CD99_pos"] = gx["CD99_norm"] >= CD99_BRIGHT          # bright-only CD99 (matches the Endocrine gate)
+        gx["MPO_pos"] = gx["MPO_norm"] >= cfg.immune_min_norm    # MPO floored at the immune K (matches lineage)
         e = ds.dataset(cfg.cells_redsea_dir / f"donor_id={d}", format="parquet").to_table(
                 columns=["object_id"] + panel).to_pandas()
         df = bl.merge(g, on="object_id").merge(gx, on="object_id").merge(e, on="object_id")

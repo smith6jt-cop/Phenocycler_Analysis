@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Orchestrator — run the full raw-data → 8-class broad-lineage pipeline end to end.
+Orchestrator — run the full raw-data → 7-class broad-lineage pipeline end to end.
 
 Idempotent ``run_step`` (skips a stage when its outputs already exist unless
 ``force=True``) + a final status table, in-process against the ``phenocycler``
@@ -9,9 +9,9 @@ notebook / earlier port OMITTED):
 
     cells → redsea → restore → restore_extra* → hormone_floor* → lineage → qupath → figures
 
-``hormone_floor`` (rewrites {INS,GCG,SST}_pos = _norm ≥ K) MUST run before
-``lineage`` or the false-endocrine over-calling returns; ``restore_extra`` gates
-B3TUBB/CD99/MPO for the Neural/Endocrine-CD99/Neutrophil classes.
+``hormone_floor`` (floors {INS,GCG,SST}_pos at K=5 AND {CD3e,CD20,CD163}_pos at K=2) MUST run before
+``lineage`` or the false-endocrine + false-immune over-calling returns; ``restore_extra`` gates
+B3TUBB/CD99/MPO for the Neural / Endocrine-CD99 / Immune-MPO markers.
 
     python -m phenocycler.pipeline                       # run every missing step
     python -m phenocycler.pipeline --only hormone_floor lineage figures
@@ -35,8 +35,8 @@ STAGES = [
     ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
     ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (10 markers)"),
     ("restore_extra", "restore_gated_redsea_extra/donor_id=*", "RESTORE gated (extra 3)"),
-    ("hormone_floor", "restore_gated_redsea/donor_id=*", "Hormone floor (K=5)"),
-    ("lineage", "phenotype/broad/donor_id=*", "Broad lineage (8-class)"),
+    ("hormone_floor", "restore_gated_redsea/donor_id=*", "Norm floor (hormone K5 + immune K2)"),
+    ("lineage", "phenotype/broad/donor_id=*", "Broad lineage (7-class)"),
     ("qupath", "phenotype/qupath_class/pheno_class_*.csv", "QuPath CSVs"),
     ("figures", "phenotype/celltype_marker_dotplot.png", "Identity QC figures"),
 ]
@@ -49,10 +49,10 @@ def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
     return len(glob.glob(str(cfg.data_dir / pattern)))
 
 
-def _lineage_is_8class(cfg: PipelineConfig) -> bool:
-    """True only if the broad-lineage partitions exist AND carry the 8-class score columns.
-
-    A stale 6-class ``broad/`` therefore counts as 'not done', so the lineage step re-runs.
+def _lineage_is_current(cfg: PipelineConfig) -> bool:
+    """True only if broad-lineage partitions exist AND carry the CURRENT 7-class score columns
+    (Neural present; Neutrophil folded into Immune -> absent). A stale 6-/8-class ``broad/`` therefore
+    counts as 'not done', so the lineage step re-runs.
     """
     files = sorted(glob.glob(str(cfg.broad_dir / "donor_id=*" / "*.parquet")))
     if not files:
@@ -62,7 +62,7 @@ def _lineage_is_8class(cfg: PipelineConfig) -> bool:
         cols = set(pq.ParquetFile(files[0]).schema.names)
     except Exception:
         return False
-    return {"score_Neural", "score_Neutrophil"}.issubset(cols)
+    return "score_Neural" in cols and "score_Neutrophil" not in cols
 
 
 def _run_step(cfg, name, func, pattern, checker, force) -> None:
@@ -101,7 +101,7 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
         # Guarantee a rollback point: if no pre-floor backup exists yet, snapshot the (un-floored)
         # gated dir to restore_gated_redsea.pre_hormonefloor BEFORE flooring it in place. Then always
         # floor FROM that backup so the result is reproducible from a clean RESTORE (idempotent — the
-        # floor only rewrites {INS,GCG,SST}_pos; _norm is untouched).
+        # floor only rewrites {INS,GCG,SST}+{CD3e,CD20,CD163}_pos; _norm is untouched).
         prefloor = cfg.restore_gated_prefloor_dir
         if not prefloor.exists() and cfg.restore_gated_dir.exists():
             shutil.copytree(cfg.restore_gated_dir, prefloor)
@@ -126,7 +126,7 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
         "restore": (_restore, "restore_gated_redsea/donor_id=*", None),
         "restore_extra": (_restore_extra, "restore_gated_redsea_extra/donor_id=*", None),
         "hormone_floor": (_hormone_floor, None, None),
-        "lineage": (_lineage, "phenotype/broad/donor_id=*", _lineage_is_8class),
+        "lineage": (_lineage, "phenotype/broad/donor_id=*", _lineage_is_current),
         "qupath": (_qupath, "phenotype/qupath_class/pheno_class_*.csv", None),
         "figures": (_figures, "phenotype/celltype_marker_dotplot.png", None),
     }
@@ -146,7 +146,7 @@ def print_status(cfg: PipelineConfig) -> None:
     for name, pattern, label in STAGES:
         n = _has_outputs(cfg, pattern)
         if name == "lineage":
-            state = "OK (8-class)" if _lineage_is_8class(cfg) else ("STALE (6-class)" if n else "MISSING")
+            state = "OK (7-class)" if _lineage_is_current(cfg) else ("STALE (re-run)" if n else "MISSING")
         elif name == "hormone_floor":
             state = "OK" if n else "MISSING"   # in-place; presence of restore_gated is the proxy
         else:

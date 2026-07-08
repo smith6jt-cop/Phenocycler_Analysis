@@ -54,15 +54,16 @@ data/
     └── intermediates/<id>.npz                    # data/edge/sizes/contact (--save-intermediates)
 ```
 
-### The broad-lineage gating markers → 8 lineages
+### The broad-lineage gating markers → 7 lineages
 
 Main pass (`restore_gated_redsea`, 10 markers):
 `Pan_Cytokeratin, Vimentin, SMA, CD31, INS, GCG, SST, CD3e, CD20, CD163`. Extra pass
 (`restore_gated_redsea_extra`, via `restore --extra`): `CD99, B3TUBB, MPO`. Together they
-map to the **eight** lineages Epithelial, Fibroblast, Muscle, Endothelial, Endocrine
-(INS/GCG/SST or bright CD99), Immune, **Neural** (B3TUBB), **Neutrophil** (MPO). Before
-typing, the hormone floor rewrites `{INS,GCG,SST}_pos = (_norm ≥ 5)`. The full imaging
-panel is larger (~59-plex); only these gate the broad lineage.
+map to the **seven** lineages Epithelial, Fibroblast, Muscle, Endothelial, Endocrine
+(INS/GCG/SST or bright CD99), Immune (CD3e/CD20/CD163/**MPO** — neutrophils are immune),
+**Neural** (B3TUBB). Before typing, the norm floor rewrites `{INS,GCG,SST}_pos = (_norm ≥ 5)`
+and `{CD3e,CD20,CD163}_pos = (_norm ≥ 2)` (MPO gated at 2 in lineage). The full imaging panel
+is larger (~59-plex); only these gate the broad lineage.
 
 ## Region scheme
 
