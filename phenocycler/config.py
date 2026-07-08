@@ -5,7 +5,7 @@ Everything that was a hardcoded absolute path or a magic constant in the
 upstream ``scripts/senior/*.py`` scripts lives here instead, resolved from
 ``config.ini`` (see the repo root) with environment-variable and keyword
 overrides.  The scientific defaults (REDSEA subtract-only / α=1 / 1-px band,
-RESTORE SSC model + robust guard, the 8 broad lineages) are preserved exactly;
+RESTORE SSC model + robust guard, the 7 broad lineages) are preserved exactly;
 this module only makes the *paths* and *compute knobs* configurable.
 
 Resolution order for every value: explicit keyword override  >  environment
@@ -24,20 +24,20 @@ from typing import Optional
 # Scientific constants (faithful to Islet-Explorer-Senior; not usually tuned)
 # --------------------------------------------------------------------------- #
 
-# Broad-lineage gating markers -> the eight mutually-exclusive lineages
+# Broad-lineage gating markers -> the seven mutually-exclusive lineages
 # (scripts/senior/assign_broad_lineage.py).  CD99 (bright-only) is an Endocrine
-# gate; Neural (B3TUBB) and Neutrophil (MPO) are carved out of the structural /
-# immune background.  CD99/B3TUBB/MPO are gated in a SEPARATE RESTORE pass
-# (EXTRA_MARKER_PAIRS) and merged by object_id at assignment time.
+# gate; Neural (B3TUBB) is carved out of the structural background; MPO
+# (neutrophils/granulocytes) is folded into Immune (neutrophils ARE immune cells).
+# CD99/B3TUBB/MPO are gated in a SEPARATE RESTORE pass (EXTRA_MARKER_PAIRS) and
+# merged by object_id at assignment time.
 LINEAGES: dict[str, list[str]] = {
     "Epithelial": ["Pan_Cytokeratin"],
     "Fibroblast": ["Vimentin"],
-    "Immune": ["CD3e", "CD20", "CD163"],
+    "Immune": ["CD3e", "CD20", "CD163", "MPO"],   # +MPO (neutrophils folded into Immune)
     "Endocrine": ["INS", "GCG", "SST", "CD99"],
     "Endothelial": ["CD31"],
     "Muscle": ["SMA"],
     "Neural": ["B3TUBB"],
-    "Neutrophil": ["MPO"],
 }
 # Structural background is resolved by argmax of these three `_norm` scores.
 STRUCT_LINEAGES: list[str] = ["Epithelial", "Fibroblast", "Muscle"]
@@ -45,13 +45,13 @@ STRUCT_LINEAGES: list[str] = ["Epithelial", "Fibroblast", "Muscle"]
 LINEAGE_COLORS: dict[str, str] = {
     "Epithelial": "#4477AA", "Fibroblast": "#EE6677", "Immune": "#228833",
     "Endocrine": "#CCBB44", "Endothelial": "#66CCEE", "Muscle": "#AA3377",
-    "Neural": "#B5838D", "Neutrophil": "#E69F00",   # dusty rose / Okabe-Ito orange (CVD-safe)
+    "Neural": "#B5838D",   # dusty rose (CVD-safe)
 }
 # unique 3-char codes for the terse per-donor progress line (Endocrine/Endothelial
-# and Neural/Neutrophil would otherwise both collide under a naive name[:3]).
+# would otherwise collide under a naive name[:3]).
 LINEAGE_ABBR: dict[str, str] = {
     "Epithelial": "Epi", "Fibroblast": "Fib", "Immune": "Imm", "Endocrine": "Enc",
-    "Endothelial": "Eth", "Muscle": "Mus", "Neural": "Nrl", "Neutrophil": "Neu",
+    "Endothelial": "Eth", "Muscle": "Mus", "Neural": "Nrl",
 }
 STATUS_ORDER: list[str] = ["ND", "AAB", "T1D"]
 
@@ -73,7 +73,7 @@ DEFAULT_MARKER_PAIRS: list[list[str]] = [
 
 # Extra RESTORE pass (run separately with --no-robust --no-ref-qc so the validated
 # 10-pair gates in restore_gated_redsea stay byte-identical).  These three markers
-# (Endocrine-CD99 / Neural-B3TUBB / Neutrophil-MPO) are gated against Pan_Cytokeratin
+# (Endocrine-CD99 / Neural-B3TUBB / Immune-MPO) are gated against Pan_Cytokeratin
 # into restore_gated_redsea_extra and merged into the lineage call by object_id.
 EXTRA_MARKER_PAIRS: list[list[str]] = [
     ["CD99", "Pan_Cytokeratin"],
@@ -82,9 +82,14 @@ EXTRA_MARKER_PAIRS: list[list[str]] = [
 ]
 EXTRA_MARKERS: list[str] = [p[0] for p in EXTRA_MARKER_PAIRS]   # CD99, B3TUBB, MPO
 
-# {INS,GCG,SST}_pos are floored to _norm >= hormone_min_norm by the hormone_floor
-# stage (scripts/senior/apply_hormone_floor.py) before lineage assignment.
+# _pos floors applied by the hormone_floor stage before lineage assignment, to strip the
+# RESTORE marginal-positive shoulder (mean+3sigma threshold landing in the noise for sparse markers):
+#   - hormones {INS,GCG,SST} at hormone_min_norm (K=5) -- the false-endocrine fix.
+#   - immune {CD3e,CD20,CD163} at immune_min_norm (K=2) -- the false-immune over-call fix (e.g. donor
+#     6476's 40% CD3e was a threshold over-call; K=2 validated to preserve 6579's real pancreatitis
+#     T-cell mode + the ND->T1D T-gain). MPO (extra dir) is gated at immune_min_norm in lineage.py.
 HORMONE_MARKERS: list[str] = ["INS", "GCG", "SST"]
+IMMUNE_FLOOR_MARKERS: list[str] = ["CD3e", "CD20", "CD163"]   # main-dir immune markers floored in-stage
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INI = _REPO_ROOT / "config.ini"
@@ -122,6 +127,7 @@ class PipelineConfig:
 
     # -- lineage (assign_broad_lineage.py + apply_hormone_floor.py + marker_taxonomy.py) --
     hormone_min_norm: float = 5.0    # K: {INS,GCG,SST}_pos := _norm >= K (false-endocrine floor)
+    immune_min_norm: float = 2.0     # K: {CD3e,CD20,CD163,MPO}_pos := _norm >= K (false-immune floor)
     cd99_bright: float = 3.0         # CD99_pos := CD99_norm >= this (bright-only Endocrine gate)
 
     # -- compute -------------------------------------------------------------
@@ -436,6 +442,7 @@ _INI_SCHEMA = {
     },
     "lineage": {
         "hormone_min_norm": ("hormone_min_norm", float),
+        "immune_min_norm": ("immune_min_norm", float),
         "cd99_bright": ("cd99_bright", float),
     },
     "compute": {
@@ -481,6 +488,7 @@ _ENV_OVERRIDES = {
     "n_jobs": ("PHENOCYCLER_JOBS", int),
     "use_gpu": ("PHENOCYCLER_USE_GPU", _as_bool),
     "hormone_min_norm": ("PHENOCYCLER_HORMONE_MIN_NORM", float),
+    "immune_min_norm": ("PHENOCYCLER_IMMUNE_MIN_NORM", float),
     # integration
     "integration_mode": ("PHENOCYCLER_INTEGRATION_MODE", str),
     "xenium_paths_csv": ("PHENOCYCLER_XENIUM_PATHS_CSV", Path),
