@@ -124,8 +124,8 @@ def run_figures(cfg: PipelineConfig, *, donors=None) -> dict:
         print(f"[{d}] {len(df):,} cells aggregated", flush=True)
 
     lineages = [l for l in LIN_ORDER if l in n] + [l for l in n if l not in LIN_ORDER]
-    frac = np.vstack([pos_sum[l] / n[l] for l in lineages])                          # L x 10 fraction positive
-    cnorm = np.vstack([norm_sum[l] / np.maximum(norm_cnt[l], 1) for l in lineages])  # L x 10 NaN-safe mean norm
+    frac = np.vstack([pos_sum[l] / n[l] for l in lineages])                          # L x 13 fraction positive
+    cnorm = np.vstack([norm_sum[l] / np.maximum(norm_cnt[l], 1) for l in lineages])  # L x 13 NaN-safe mean norm
     expr = np.vstack([expr_sum[l] / np.maximum(expr_cnt[l], 1) for l in lineages])   # L x P  NaN-safe mean
     # Colour by ABSOLUTE mean RESTORE norm on a single shared scale (all markers directly comparable),
     # NOT the per-marker 0..1 rescale. A few lineage-defining markers are very bright (Muscle SMA ~20,

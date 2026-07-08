@@ -41,7 +41,7 @@ data/
 ├── restore_thresholds_redsea.csv                 # Step 3: per-image KMeans/GMM/SSC thresholds (chosen flag)
 ├── restore_gated_redsea/donor_id=<id>/data_0.parquet         # Step 3: {m}_pos/_norm/_log2r (10 markers)
 ├── restore_gated_redsea_extra/donor_id=<id>/data_0.parquet   # Step 3 (extra): CD99/B3TUBB/MPO _pos/_norm
-├── restore_gated_redsea.pre_hormonefloor/                    # Step 4: pre-floor backup (rollback point)
+├── restore_gated_redsea.pre_hormonefloor/                    # Step 4: un-floored backup, auto-created by hormone_floor on first run (rollback point)
 ├── phenotype/
 │   ├── broad/donor_id=<id>/data_0.parquet        # Step 5: broad_lineage, assign_margin, epi_default, score_* (8)
 │   ├── broad_lineage_composition.png             # Step 5: composition + disease-trend figure

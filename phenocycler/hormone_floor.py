@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hormone-strength floor on the RESTORE positivity calls — the false-endocrine fix.
+Step 4 — hormone-strength floor on the RESTORE positivity calls (the false-endocrine fix).
 
 Faithful port of ``scripts/senior/apply_hormone_floor.py`` (Islet-Explorer-Senior), made
 config-driven + per-donor parallel and given an in-process ``run_hormone_floor(cfg)`` entry

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 5 (optional QC) — export the broad lineage as per-image CSVs keyed by
+Step 6 (optional QC) — export the broad lineage as per-image CSVs keyed by
 QuPath's detection UUID, for the companion ``scripts/groovy/import_broad_lineage.groovy``
 (UUID match -> set PathClass directly).
 

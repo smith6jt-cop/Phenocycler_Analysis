@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import shutil
 from pathlib import Path
 
 from .config import PipelineConfig, load_config
@@ -97,10 +98,15 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
         restore.run_restore_extra(cfg)
 
     def _hormone_floor():
-        # floor from the pre-hormone-floor backup when present (reproducible from a clean RESTORE);
-        # otherwise floor restore_gated_redsea in place (idempotent — _norm is untouched).
-        src = (cfg.restore_gated_prefloor_dir
-               if cfg.restore_gated_prefloor_dir.exists() else cfg.restore_gated_dir)
+        # Guarantee a rollback point: if no pre-floor backup exists yet, snapshot the (un-floored)
+        # gated dir to restore_gated_redsea.pre_hormonefloor BEFORE flooring it in place. Then always
+        # floor FROM that backup so the result is reproducible from a clean RESTORE (idempotent — the
+        # floor only rewrites {INS,GCG,SST}_pos; _norm is untouched).
+        prefloor = cfg.restore_gated_prefloor_dir
+        if not prefloor.exists() and cfg.restore_gated_dir.exists():
+            shutil.copytree(cfg.restore_gated_dir, prefloor)
+            print(f"[hormone_floor] backed up un-floored gates -> {prefloor}")
+        src = prefloor if prefloor.exists() else cfg.restore_gated_dir
         hormone_floor.run_hormone_floor(cfg, gated_dir=src, out_dir=cfg.restore_gated_dir)
 
     def _lineage():

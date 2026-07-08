@@ -38,7 +38,7 @@ never a cohort constant, and every metric is reported per donor (6476 pancreatit
 CD3e — validated on its own data, not normalized toward the cohort).
 
 The metric functions (`endocrine_objective`, `guardrails`, `realvsfalse`, `assign_stratum`) are importable so
-`redsea_full_validate.py` applies the SAME definitions to α-swept, re-RESTORE'd data — one source of truth.
+an α-sweep / re-RESTORE validator can reuse the SAME definitions — one source of truth.
 
 Inputs (read-only, all present, 22 donors):
   data/cells_redsea/donor_id=*        corrected MFI (Pan_Cytokeratin, Ker8_18, Keratin_5, Vimentin, ...)

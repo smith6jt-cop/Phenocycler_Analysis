@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 4 — broad lineage assignment (every cell typed into 8 classes, ZERO "Unassigned").
+Step 5 — broad lineage assignment (every cell typed into 8 classes, ZERO "Unassigned").
 
 Faithful port of ``scripts/senior/assign_broad_lineage.py`` (Islet-Explorer-Senior).  Each cell is
 typed by a HIERARCHICAL rule (no "Unassigned" bucket — the mandate is to fix the upstream cause, not
@@ -90,7 +90,15 @@ def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_brig
     # merge the separately-gated B3TUBB/CD99/MPO (Neural/Endocrine/Neutrophil markers) by object_id;
     # keeps the validated 10-marker gates untouched. NaN (a cell absent from the extra run) → not-pos.
     ex_cols = ["object_id"] + [f"{m}_{s}" for m in EXTRA_MARKERS for s in ("pos", "norm")]
-    ex = pd.read_parquet(Path(extra_gated_dir) / f"donor_id={donor}" / "data_0.parquet", columns=ex_cols)
+    ex_f = Path(extra_gated_dir) / f"donor_id={donor}" / "data_0.parquet"
+    if not ex_f.exists():
+        raise FileNotFoundError(
+            f"extra-gated markers missing for donor {donor}: {ex_f}\n"
+            f"run the extra RESTORE pass first (`restore --extra`, i.e. the 'restore_extra' stage)")
+    ex = pd.read_parquet(ex_f, columns=ex_cols)
+    # cast BOTH object_id columns to str so the merge key dtype matches regardless of how each parquet
+    # stored it (pandas 'string' vs object) — otherwise the merge can mis-match or raise.
+    g["object_id"] = g["object_id"].astype(str)
     g = g.merge(ex.astype({"object_id": str}), on="object_id", how="left")
     for m in EXTRA_MARKERS:
         g[f"{m}_pos"] = g[f"{m}_pos"].fillna(False).astype(bool)
