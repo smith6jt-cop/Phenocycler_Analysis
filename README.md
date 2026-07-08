@@ -7,10 +7,11 @@ faithful, optimized port of the "Senior phenotyping pipeline" from
 restructured into a reusable, testable package with per-donor parallelism and an
 optional GPU backend.
 
-The pipeline corrects two dominant artifacts of dense multiplexed tissue imaging —
-**lateral marker spillover** (REDSEA) and **per-image intensity / autofluorescence
-drift** (RESTORE) — and then assigns every cell to one of six mutually-exclusive
-lineages with **zero "Unassigned"** cells.
+The pipeline corrects three dominant artifacts of dense multiplexed tissue imaging —
+**lateral marker spillover** (REDSEA), **per-image intensity / autofluorescence drift**
+(RESTORE), and **false-endocrine over-calling** (a threshold-relative hormone floor) —
+and then assigns every cell to one of **eight** mutually-exclusive lineages with
+**zero "Unassigned"** cells.
 
 ```
  raw .qptiff  ─┐
@@ -22,10 +23,14 @@ lineages with **zero "Unassigned"** cells.
  qptiff + GeoJSON ─────────▶ [2] REDSEA spillover ───▶ data/cells_redsea/
                                                      │
                             [3] RESTORE normalize ───▶ data/restore_gated_redsea/
-                                (SSC, per-image)      │
-                            [4] broad lineage ────────▶ data/phenotype/broad/   (6 lineages, 0 Unassigned)
+                                (SSC, per-image)      │   + restore_gated_redsea_extra/ (CD99/B3TUBB/MPO)
                                                      │
-                            [5] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
+                            [4] hormone floor (K=5) ─▶ data/restore_gated_redsea/  (false-endocrine fix)
+                                                     │
+                            [5] broad lineage ────────▶ data/phenotype/broad/   (8 lineages, 0 Unassigned)
+                                                     │
+                            [6] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
+                            [7] identity figures ─────▶ data/phenotype/celltype_marker_*.png
 ```
 
 ## Scope
@@ -54,9 +59,15 @@ subclustering, and the interactive R Shiny app.
   per image × marker pair (SSC is the default), with a robust cohort-median guard on
   degenerate thresholds. Pan-Cytokeratin is the universal negative reference (except
   `CD3e ← CD163`).
-- **Broad lineage** assigns each cell by a strict hierarchy — Endocrine → Immune →
-  Endothelial → structural argmax (Epithelial / Fibroblast / Muscle) → Epithelial
-  default — producing six lineages and no "Unassigned" bucket.
+- **Hormone floor** rewrites `{INS,GCG,SST}_pos = (_norm ≥ K)` (K=5) *before* typing:
+  RESTORE's per-image hormone threshold lands in the noise for β-loss donors, so this
+  threshold-relative floor rejects the noise-tail false positives while keeping real,
+  separated β/α/δ cells (`hormone_floor.py`). CD99/B3TUBB/MPO are gated in a separate
+  RESTORE pass (`restore --extra`) so the validated 10-marker gates stay byte-identical.
+- **Broad lineage** assigns each cell by a strict hierarchy — Endocrine (INS/GCG/SST or
+  bright CD99) → Immune → Endothelial → Neutrophil (MPO) → Neural (B3TUBB) → structural
+  argmax (Epithelial / Fibroblast / Muscle) → Epithelial default — producing **eight**
+  lineages and no "Unassigned" bucket.
 
 ## Installation
 
@@ -70,6 +81,18 @@ pip install spams-bin  # SSC model for RESTORE (if not already pulled by environ
 
 If you cloned without `--recurse-submodules`: `git submodule update --init --recursive`.
 
+**Consuming this as a dependency (e.g. from Islet-Explorer-Senior).** The package is
+config-driven, so it can be added as a git submodule and installed *editable* into an
+existing analysis environment instead of its own conda env:
+
+```bash
+pip install -e .    # into your existing env (e.g. Senior's scvi-env, Python 3.13 / numpy 2.2)
+```
+
+`environment.yml` pins a self-contained reference env (Python 3.11); when embedding in
+another project, run under that project's interpreter and point `config.ini` (or the
+`PHENOCYCLER_*` env vars) at its data.
+
 ## Quick start
 
 1. Edit `config.ini` `[paths]` to point at your raw `.qptiff` images, the QuPath
@@ -78,7 +101,7 @@ If you cloned without `--recurse-submodules`: `git submodule update --init --rec
 3. Run the whole pipeline (idempotent — skips completed steps):
 
 ```bash
-python -m phenocycler.pipeline            # cells → redsea → restore → lineage → qupath
+python -m phenocycler.pipeline            # cells → redsea → restore(+extra) → hormone_floor → lineage → qupath → figures
 python -m phenocycler.pipeline --status   # just show what exists
 ```
 
@@ -107,8 +130,10 @@ the primary optimization here.
 | 1. cells_parquet | DuckDB (out-of-core) | multithreaded (`[compute] duckdb_threads`) | n/a (I/O bound) |
 | 2. REDSEA | NumPy + SciPy-sparse | per-donor pool (`--jobs`) **or** SLURM array (one donor/task) | optional CuPy (`--gpu`): `bincount` + sparse `F@edge` |
 | 3. RESTORE | vendored RESTORE (SSC) | per-donor apply pool (`--jobs`); subsample cap keeps SSC tractable | — |
-| 4. broad lineage | vectorized NumPy | per-donor pool (`--jobs`) | — |
-| 5. QuPath export | pandas | serial (I/O-light) | — |
+| 4. hormone floor | pandas | per-donor pool (`--jobs`) | — |
+| 5. broad lineage | vectorized NumPy | per-donor pool (`--jobs`) | — |
+| 6. QuPath export | pandas | serial (I/O-light) | — |
+| 7. identity figures | pandas + matplotlib | streaming | — |
 
 Set `[compute] n_jobs` in `config.ini` (or `--jobs N`) for the process pools, and
 `use_gpu = true` (+ `pip install cupy-cuda12x`) for the REDSEA CuPy path. For
@@ -126,8 +151,12 @@ phenocycler/            installable package
   cells_parquet.py      Step 1 — DuckDB CSV -> partitioned parquet
   redsea.py             Step 2 — pixel REDSEA (+ parallel driver + CuPy backend)
   restore.py            Step 3 — RESTORE driver (headless stubs, robust LUT, parallel apply)
-  lineage.py            Step 4 — deterministic broad-lineage hierarchy
-  qupath_export.py      Step 5 — per-image UUID-keyed CSVs for QuPath
+  hormone_floor.py      Step 4 — threshold-relative endocrine floor (false-endocrine fix)
+  lineage.py            Step 5 — deterministic 8-class broad-lineage hierarchy
+  marker_taxonomy.py    TYPE / PROCESS / EXCLUDED marker split (single source of truth)
+  qupath_export.py      Step 6 — per-image UUID-keyed CSVs for QuPath
+  figures.py            Step 7 — cell-type × marker identity dotplot + heatmap
+  reassess_diag.py      read-only acceptance yardstick (endocrine + guardrail metrics)
   pipeline.py           idempotent orchestrator + status table
   parallel.py           per-donor process pool
   gpu.py                optional CuPy/RAPIDS backend with CPU fallback
@@ -135,8 +164,9 @@ external/RESTORE/       vendored RESTORE (git submodule, commit 38df59b)
 notebooks/              thin step notebooks + orchestrator
 scripts/groovy/         QuPath export/import Groovy scripts
 scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
-tests/                  pytest: REDSEA math, RESTORE guard, lineage invariants
+tests/                  pytest: REDSEA math, RESTORE guard, 8-class lineage invariants
 config.ini              paths + tunables
+pyproject.toml          editable-install metadata (pip install -e .)
 ```
 
 ## Testing

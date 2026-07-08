@@ -52,7 +52,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .config import PipelineConfig, load_config, DEFAULT_MARKER_PAIRS
+from .config import PipelineConfig, load_config, DEFAULT_MARKER_PAIRS, EXTRA_MARKER_PAIRS
 from .parallel import map_donors
 
 MODEL_COLORS = {"KMeans": "magenta", "GMM": "blue", "SSC": "green"}
@@ -414,9 +414,17 @@ def qc_positive_fractions(frac_df, markers, qc_dir):
 def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=None,
                 subsample=None, marker_pairs=None, marker_sigma=None, limit_scenes=None,
                 donors=None, skip_apply=False, robust=None, robust_factor=None,
-                reuse_threshs=False, ref_qc=True, seed=None, n_jobs=None):
+                reuse_threshs=False, ref_qc=True, seed=None, n_jobs=None,
+                out_dir: Optional[Path] = None, gated_dir: Optional[Path] = None,
+                thresh_csv: Optional[Path] = None):
     """Run RESTORE fit + robust LUT + per-donor apply.  Reads the REDSEA-corrected
-    cells by default; writes gated parquet + thresholds csv."""
+    cells by default; writes gated parquet + thresholds csv.
+
+    ``out_dir`` / ``gated_dir`` / ``thresh_csv`` default (``None``) to the canonical
+    ``cfg.restore_dir`` / ``cfg.restore_gated_dir`` / ``cfg.restore_thresholds_csv``, so the
+    normal 10-marker path is byte-unchanged; :func:`run_restore_extra` overrides them to run
+    the second (extra-marker) pass into the ``*_extra`` dirs without touching the validated
+    10-marker gates."""
     cells_dir = Path(cells_dir) if cells_dir is not None else cfg.cells_redsea_dir
     model = model or cfg.restore_model
     subsample = cfg.restore_subsample if subsample is None else subsample
@@ -430,9 +438,9 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
     print(f"[config] pairs (target<-reference): {pairs}")
     print(f"[config] markers={markers}  chosen_model={model}  subsample={subsample}  cells_dir={cells_dir}")
 
-    out_dir = cfg.restore_dir
-    gated_dir = cfg.restore_gated_dir
-    thresh_csv = cfg.restore_thresholds_csv
+    out_dir = cfg.restore_dir if out_dir is None else Path(out_dir)
+    gated_dir = cfg.restore_gated_dir if gated_dir is None else Path(gated_dir)
+    thresh_csv = cfg.restore_thresholds_csv if thresh_csv is None else Path(thresh_csv)
     qc_dir = out_dir / "qc"
     qc_dir.mkdir(parents=True, exist_ok=True)
 
@@ -492,6 +500,39 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
     return thr_df
 
 
+def run_restore_extra(cfg: PipelineConfig, *, donors=None):
+    """Second RESTORE pass for the extra markers (CD99/B3TUBB/MPO <- Pan_Cytokeratin).
+
+    Runs the SAME RESTORE machinery as :func:`run_restore` on ``EXTRA_MARKER_PAIRS`` with
+    ``robust=False`` and ``ref_qc=False``, reading the REDSEA-corrected cells
+    (``cfg.cells_redsea_dir``) and writing to the ``*_extra`` dirs
+    (``cfg.restore_redsea_extra_dir`` / ``cfg.restore_gated_extra_dir`` /
+    ``cfg.restore_thresholds_extra_csv``).  Keeping this a separate pass leaves the validated
+    10-marker gates in ``restore_gated_redsea`` byte-identical.  Equivalent to the Senior
+    command::
+
+        restore_normalize.py \\
+          --marker-pairs 'CD99:Pan_Cytokeratin,B3TUBB:Pan_Cytokeratin,MPO:Pan_Cytokeratin' \\
+          --cells-dir data/cells_redsea --out-dir data/restore_redsea_extra \\
+          --gated-dir data/restore_gated_redsea_extra \\
+          --thresh-csv data/restore_thresholds_extra.csv --no-robust --no-ref-qc
+
+    The gated output ({m}_pos / {m}_norm / {m}_log2r for CD99/B3TUBB/MPO) is merged into the
+    broad-lineage call by ``object_id`` at assignment time."""
+    pairs = [list(p) for p in EXTRA_MARKER_PAIRS]
+    return run_restore(
+        cfg,
+        cells_dir=cfg.cells_redsea_dir,
+        marker_pairs=pairs,
+        donors=donors,
+        robust=False,
+        ref_qc=False,
+        out_dir=cfg.restore_redsea_extra_dir,
+        gated_dir=cfg.restore_gated_extra_dir,
+        thresh_csv=cfg.restore_thresholds_extra_csv,
+    )
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -511,11 +552,19 @@ def main(argv=None):
     ap.add_argument("--reuse-threshs", action="store_true")
     ap.add_argument("--ref-qc", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--extra", action="store_true",
+                    help="run the SECOND RESTORE pass for the extra markers "
+                         "(CD99/B3TUBB/MPO <- Pan_Cytokeratin) into the *_extra dirs; forces "
+                         "robust off + ref-qc off so the 10-marker gates stay byte-identical "
+                         "(other pair/model/sigma flags are ignored)")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
     if a.jobs is not None:
         cfg.n_jobs = a.jobs
+    if a.extra:
+        run_restore_extra(cfg, donors=a.donors)
+        return 0
     pairs = ([p.split(":") for p in a.marker_pairs.split(",")] if a.marker_pairs else None)
     sigma = ({k: float(v) for k, v in (p.split(":") for p in a.marker_sigma.split(","))}
              if a.marker_sigma else None)

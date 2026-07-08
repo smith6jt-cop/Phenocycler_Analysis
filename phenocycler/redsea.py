@@ -76,6 +76,13 @@ class RedseaParams:
     save_intermediates: bool = False
     use_gpu: bool = False
     gpu_device: int = 0
+    # -- optional per-channel alpha + receptivity ("brightness") gate: the abandoned "keratin
+    #    lever", kept ADDITIVE and OFF by default.  When these stay at their defaults the
+    #    compensation is bit-identical to scalar-alpha REDSEA. --
+    alpha_per_channel: Optional[str] = None   # 'Name=val,Name2=val2'; unlisted channels use `alpha`
+    gate_brightness: bool = False             # enable the receptivity gate
+    gate_channels: Optional[str] = None       # comma-separated aggressor channels (default keratins+Vim)
+    gate_kappa: float = 1.0                   # gate aggressiveness
 
     @classmethod
     def from_config(cls, cfg: PipelineConfig, **overrides) -> "RedseaParams":
@@ -232,16 +239,97 @@ def contact_matrix_gapbridge(mask, n, grow):
 
 
 # --------------------------------------------------------------------------- compensate
-def compensate(data, edge, sizes, M, comp_mode, alpha, backend=None):
-    """REDSEA compensation. corrected_sum = data + comp_mode*edge - alpha*(F @ edge), clamp>=0.
+DEFAULT_GATE_CHANNELS = ["Pan_Cytokeratin", "Ker8_18", "Keratin_5", "Vimentin"]
+
+
+def parse_alpha_per_channel(spec, cols, default):
+    """Build a length-C per-channel alpha vector from 'Name=val,Name2=val2' (unlisted -> `default`).
+    Warns on any name not in `cols`. Returns None if spec is falsy (caller uses the scalar `default`)."""
+    if not spec:
+        return None
+    a = np.full(len(cols), float(default), dtype=np.float64)
+    ci = {c: k for k, c in enumerate(cols)}
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        name, _, val = tok.partition("=")
+        name = name.strip()
+        if name not in ci:
+            log(f"  [alpha] WARNING: channel '{name}' not in the panel — ignored")
+            continue
+        a[ci[name]] = float(val)
+    return a
+
+
+def build_gate(params, cols):
+    """Config for the receptivity (directional) gate, or None when disabled. `channels` is a bool[C]
+    mask of the aggressor channels to gate (default the keratins + Vimentin); other channels always
+    subtract fully (w=1).  `params` is a :class:`RedseaParams` (or any object exposing the gate_*
+    attributes)."""
+    if not getattr(params, "gate_brightness", False):
+        return None
+    want = (params.gate_channels.split(",") if getattr(params, "gate_channels", None)
+            else DEFAULT_GATE_CHANNELS)
+    want = {c.strip() for c in want if c.strip()}
+    chan = np.array([c in want for c in cols], dtype=bool)
+    missing = want - set(cols)
+    if missing:
+        log(f"  [gate] WARNING: gate channels not in panel — ignored: {sorted(missing)}")
+    log(f"  [gate] receptivity gate ON: kappa={params.gate_kappa} "
+        f"channels={[c for c in cols if c in want]}")
+    return {"channels": chan, "kappa": float(params.gate_kappa)}
+
+
+def receptivity_weight(data, edge, sizes, bandcount, gate):
+    """Per-cell/per-channel weight w[i,c] in [0,1] scaling the spillover subtraction, from each cell's
+    OWN spillover signature — no global reference (self-calibrating per cell).
+
+    A spillover VICTIM has its signal concentrated at the shared boundary: the 1-px band is much brighter
+    than the interior (neighbour keratin bleeding in). A real SOURCE is uniform: band ~= interior. So the
+    fractional excess of band-over-interior density is the receptivity:
+        band_density  = edge / bandcount                        (mean channel in the boundary band)
+        int_density   = (data - edge) / (sizes - bandcount)     (mean channel in the interior)
+        excess        = clip((band_density - int_density) / band_density, 0, 1)     # 0 uniform .. 1 rim-only
+        w             = clip(kappa * excess, 0, 1)
+    Victims (band >> interior) -> w->1 -> subtract the neighbour spillover; real acinar/vessel/fibroblast
+    cells (uniform bright) -> w->0 -> PROTECTED. `kappa` scales aggressiveness (higher cleans more). Cells
+    with no band (isolated) already have F-row 0, so their subtraction is 0 regardless. Non-gated channels
+    get w=1 (unchanged full subtraction)."""
+    if bandcount is None:
+        raise ValueError("receptivity gate needs per-cell bandcount — regenerate intermediates with the "
+                         "current code (--save-intermediates) or run with --keep-mask so it recomputes")
+    bc = np.maximum(bandcount, 1.0)[:, None]
+    ia = np.maximum(sizes - bandcount, 1.0)[:, None]
+    band_density = edge / bc
+    int_density = np.clip((data - edge) / ia, 0, None)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        excess = np.where(band_density > 0, (band_density - int_density) / band_density, 0.0)
+    excess = np.clip(excess, 0.0, 1.0)
+    w = np.clip(gate["kappa"] * excess, 0.0, 1.0)
+    return np.where(gate["channels"][None, :], w, 1.0)
+
+
+def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None, backend=None):
+    """REDSEA compensation. corrected_sum = data + comp_mode*edge - (alpha [* w]) * (F @ edge), clamp>=0.
       comp_mode=1 : subtract + reinforce (redseapy default)
       comp_mode=0 : subtract only (remove incoming neighbour spillover; no reinforce)
-    F is row-normalized contact (F[i,j]=contact[i,j]/rowsum_i); isolated cells -> F row 0
-    (passthrough). Returns (corrected_mean[N,C], clamp_frac[C], n_isolated).
+    F is row-normalized contact (F[i,j]=contact[i,j]/rowsum_i); isolated cells -> F row 0 (passthrough).
 
-    ``backend`` (optional): a :class:`phenocycler.gpu.Backend`; when on GPU the sparse
-    ``F @ edge`` matmul runs on the device.  ``backend=None`` is the exact CPU path."""
-    if backend is not None and backend.on_gpu:  # pragma: no cover - GPU only
+    ``alpha`` : scalar OR length-C vector (per-channel subtraction strength), broadcast over the columns
+                of (F @ edge) [N×C].
+    ``gate``  : None (w=1) or a receptivity-gate config from :func:`build_gate` (needs ``bandcount``)
+                that protects bright-interior cells channel-wise.
+    ``backend`` (optional): a :class:`phenocycler.gpu.Backend`; when on GPU the sparse ``F @ edge``
+                matmul runs on the device. The GPU fast path is taken ONLY for the default (scalar
+                alpha, no gate) call; gated / per-channel-alpha calls fall through to the CPU branch
+                (correct, since data/edge/sizes/M are already NumPy there).
+
+    The DEFAULT call (scalar ``alpha``, ``gate=None``, and a CPU/``None`` backend) is BYTE-IDENTICAL to
+    the original single-alpha REDSEA — it executes the exact same expression.
+    Returns (corrected_mean[N,C], clamp_frac[C], n_isolated)."""
+    if (backend is not None and backend.on_gpu
+            and gate is None and np.ndim(alpha) == 0):  # pragma: no cover - GPU only
         xp = backend.xp
         d = xp.asarray(data)
         e = xp.asarray(edge)
@@ -266,7 +354,15 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, backend=None):
     nz = rowsum > 0
     inv[nz] = 1.0 / rowsum[nz]
     F = sp.diags(inv) @ M                            # rows sum to 1 (recipient form)
-    corrected_sum = data + comp_mode * edge - alpha * (F @ edge)
+    if gate is None and np.ndim(alpha) == 0:
+        # DEFAULT path — identical expression to the original single-alpha REDSEA (bit-for-bit).
+        corrected_sum = data + comp_mode * edge - alpha * (F @ edge)
+    else:
+        # opt-in "keratin lever": per-channel alpha vector and/or the receptivity gate.
+        sub = np.asarray(alpha, dtype=np.float64) * (F @ edge)   # scalar or (C,) broadcasts over cols
+        if gate is not None:
+            sub = sub * receptivity_weight(data, edge, sizes, bandcount, gate)
+        corrected_sum = data + comp_mode * edge - sub
     np.clip(corrected_sum, 0, None, out=corrected_sum)
     with np.errstate(invalid="ignore", divide="ignore"):
         corrected = corrected_sum / sizes[:, None]
@@ -276,22 +372,36 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, backend=None):
 
 
 # --------------------------------------------------------------------------- intermediates / io
-def save_intermediates(cfg: PipelineConfig, donor, oids, cols, data, edge, sizes, M):
+def save_intermediates(cfg: PipelineConfig, donor, oids, cols, data, edge, sizes, M, bandcount=None):
     cfg.inter_dir.mkdir(parents=True, exist_ok=True)
     p = cfg.inter_dir / f"{donor}.npz"
     M = M.tocsr()
+    # bandcount is persisted ONLY when the receptivity gate is on (it is None otherwise), so a
+    # default run writes exactly the same .npz keys as before.
+    extra = {} if bandcount is None else {"bandcount": np.asarray(bandcount, dtype=np.float32)}
     np.savez_compressed(p, oids=np.array(oids, dtype=object), cols=np.array(cols),
                         data=data.astype(np.float32), edge=edge.astype(np.float32),
                         sizes=sizes, m_data=M.data, m_indices=M.indices, m_indptr=M.indptr,
-                        m_shape=np.array(M.shape))
-    log(f"[{donor}] saved intermediates -> {p}")
+                        m_shape=np.array(M.shape), **extra)
+    log(f"[{donor}] saved intermediates -> {p}" + ("" if bandcount is None else " (+bandcount)"))
 
 
 def load_intermediates(cfg: PipelineConfig, donor):
+    """Returns (oids, cols, data, edge, sizes, M, bandcount). `bandcount` is None for .npz files
+    written without the gate (the default), in which case a gated re-run recomputes it from the mask."""
     z = np.load(cfg.inter_dir / f"{donor}.npz", allow_pickle=True)
     M = sp.csr_matrix((z["m_data"], z["m_indices"], z["m_indptr"]), shape=tuple(z["m_shape"]))
+    bandcount = z["bandcount"].astype(np.float64) if "bandcount" in z.files else None
     return (list(z["oids"]), list(z["cols"]), z["data"].astype(np.float64),
-            z["edge"].astype(np.float64), z["sizes"].astype(np.float64), M)
+            z["edge"].astype(np.float64), z["sizes"].astype(np.float64), M, bandcount)
+
+
+def bandcount_from_mask(mask, n, edge_radius):
+    """Recompute per-cell boundary-band pixel counts from a persisted mask (for old intermediates that
+    predate bandcount). Mirrors the band construction in process_donor."""
+    inner = find_boundaries(mask, mode="inner", connectivity=2, background=0)
+    band = binary_dilation(inner, diamond(edge_radius)) & (mask > 0)
+    return np.bincount(mask.ravel()[np.flatnonzero(band.ravel())], minlength=n + 1)[1:].astype(np.float64)
 
 
 def write_corrected(cfg: PipelineConfig, donor, oids, cols, corrected, sizes):
@@ -316,6 +426,7 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
 
     tf, pages, ch_names, (H, W), px_um = qptiff_channels(qptiff, level)
     cols = [SANITIZE(c) for c in ch_names]
+    gate = build_gate(params, cols)          # None unless --gate-brightness (default: off)
     log(f"[{donor}] level={level} dims={H}x{W} channels={len(cols)} px_um={px_um} "
         f"gpu={backend.on_gpu}")
 
@@ -333,6 +444,10 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
     band_idx = np.flatnonzero(band.ravel())
     mask_flat = mask.ravel()
     mask_band = mask_flat[band_idx]
+    # per-cell band-pixel count — only the receptivity gate needs it, so compute it only then
+    bandcount = None
+    if gate is not None:
+        bandcount = np.bincount(mask_band, minlength=n + 1)[1:].astype(np.float64)
     log(f"[{donor}] boundary band: {band_idx.size:,} px "
         f"({100*band_idx.size/mask.size:.1f}% of image), {time.time()-t0:.0f}s")
     del inner, band
@@ -367,12 +482,16 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
     log(f"[{donor}] contact matrix (gap_bridge={params.gap_bridge}): {M.nnz:,} contacts, "
         f"{time.time()-t0:.0f}s")
     if params.save_intermediates:
-        save_intermediates(cfg, donor, oids, cols, data, edge, sizes, M)
+        save_intermediates(cfg, donor, oids, cols, data, edge, sizes, M, bandcount=bandcount)
 
-    # 5) compensate
+    # 5) compensate (scalar alpha + no gate by default; optional per-channel vector + brightness gate)
+    alpha = parse_alpha_per_channel(params.alpha_per_channel, cols, params.alpha)
+    alpha = params.alpha if alpha is None else alpha
     corrected, clamp_frac, n_isolated = compensate(
-        data, edge, sizes, M, params.comp_mode, params.alpha, backend)
-    log(f"[{donor}] compensate(mode={params.comp_mode}, alpha={params.alpha}): "
+        data, edge, sizes, M, params.comp_mode, alpha,
+        bandcount=bandcount, gate=gate, backend=backend)
+    log(f"[{donor}] compensate(mode={params.comp_mode}, "
+        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}): "
         f"{n_isolated} isolated cells")
 
     # alignment sanity vs the existing parquet (correlation of UNcorrected mean)
@@ -418,15 +537,30 @@ def alignment_check(cfg, donor, oids, cols, uncorr_mean, sizes, px_um):
 def recompensate_from_intermediates(donor: str, cfg: PipelineConfig, params: RedseaParams):
     """Reload cached intermediates and just (re)compensate + write (fast alpha sweeps)."""
     backend = get_backend(params.use_gpu, params.gpu_device)
-    oids, cols, data, edge, sizes, M = load_intermediates(cfg, donor)
+    oids, cols, data, edge, sizes, M, bandcount = load_intermediates(cfg, donor)
+    mask = None
     if params.gap_bridge > 0 and (cfg.mask_dir / f"{donor}.tif").exists():
         mask = tifffile.imread(cfg.mask_dir / f"{donor}.tif")
         M = contact_matrix_gapbridge(mask, len(oids), params.gap_bridge)
-        del mask
         log(f"[{donor}] recomputed gap-bridged contacts: {M.nnz:,}")
+    alpha = parse_alpha_per_channel(params.alpha_per_channel, cols, params.alpha)
+    alpha = params.alpha if alpha is None else alpha
+    gate = build_gate(params, cols)
+    if gate is not None and bandcount is None:   # old .npz predates bandcount -> recompute from mask
+        if mask is None and (cfg.mask_dir / f"{donor}.tif").exists():
+            mask = tifffile.imread(cfg.mask_dir / f"{donor}.tif")
+        if mask is None:
+            raise SystemExit("gate needs bandcount but intermediates predate it and no mask exists — "
+                             "regenerate with --save-intermediates --keep-mask")
+        bandcount = bandcount_from_mask(mask, len(oids), params.edge_radius)
+        log(f"[{donor}] recomputed bandcount from mask")
+    del mask
     corrected, clamp_frac, n_iso = compensate(
-        data, edge, sizes, M, params.comp_mode, params.alpha, backend)
-    log(f"[{donor}] recompensate(mode={params.comp_mode}, alpha={params.alpha}): {n_iso} isolated")
+        data, edge, sizes, M, params.comp_mode, alpha,
+        bandcount=bandcount, gate=gate, backend=backend)
+    log(f"[{donor}] recompensate(mode={params.comp_mode}, "
+        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}): "
+        f"{n_iso} isolated")
     write_corrected(cfg, donor, oids, cols, corrected, sizes)
     return donor
 
@@ -463,6 +597,18 @@ def main(argv=None):
     ap.add_argument("--comp-mode", type=int, default=None, choices=[0, 1],
                     help="0=subtract only (default); 1=subtract+reinforce")
     ap.add_argument("--alpha", type=float, default=None, help="spillover subtraction strength")
+    ap.add_argument("--alpha-per-channel", default=None,
+                    help="per-channel subtraction strengths, e.g. "
+                         "'Pan_Cytokeratin=2,Ker8_18=2,Keratin_5=1.5,Vimentin=1.5'. Channels not listed "
+                         "use --alpha; default None -> the scalar --alpha for every channel (bit-identical).")
+    ap.add_argument("--gate-brightness", action="store_true",
+                    help="enable the receptivity (brightness) gate: protect cells bright in their OWN "
+                         "interior (real acinar keratin / vessel-fibroblast Vimentin) and fully clean dim "
+                         "victims. Off by default (w=1 -> bit-identical output).")
+    ap.add_argument("--gate-channels", default=None,
+                    help="comma-separated channels to brightness-gate (default: the keratins + Vimentin).")
+    ap.add_argument("--gate-kappa", type=float, default=1.0,
+                    help="receptivity-gate aggressiveness; higher -> clean more cells (w saturates faster).")
     ap.add_argument("--gap-bridge", type=int, default=None,
                     help="bridge background gaps <= N px in the contact graph (0 disables)")
     ap.add_argument("--keep-mask", action="store_true", help="persist the int32 instance mask")
@@ -484,7 +630,11 @@ def main(argv=None):
         if src is not None:
             over[k] = src
     params = RedseaParams.from_config(cfg, keep_mask=a.keep_mask,
-                                      save_intermediates=a.save_intermediates, **over)
+                                      save_intermediates=a.save_intermediates,
+                                      alpha_per_channel=a.alpha_per_channel,
+                                      gate_brightness=a.gate_brightness,
+                                      gate_channels=a.gate_channels,
+                                      gate_kappa=a.gate_kappa, **over)
 
     if a.all:
         donors = cfg.discover_donors()
