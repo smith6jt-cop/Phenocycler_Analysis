@@ -2,18 +2,18 @@
 """
 Step 3 — RESTORE per-image intensity normalization of mutually-exclusive markers.
 
-Faithful port of ``scripts/senior/restore_normalize.py`` (Islet-Explorer-Senior).
 Applies RESTORE (Chang Lab / OHSU; vendored under ``external/RESTORE``) to the
-REDSEA-corrected single-cell data.  **Pan_Cytokeratin** (the abundant ~91% acinar
-majority) is the universal negative control; the lone ``CD3e <- CD163`` exception
-keeps a clean exclusive immune reference (see ``DEFAULT_MARKER_PAIRS`` in
-``config.py``).  Three 2-cluster models (KMeans, GMM, SSC) split background vs.
-signal per image×pair; the threshold is ``mean + 3σ`` of the target intensity in
-the target-negative cluster.  SSC is the default gating model.
+REDSEA-corrected single-cell data.  Marker thresholds come from a curated web of
+DIRECTIONAL mutually-exclusive pairs (``MARKER_PAIRS`` in ``config.py``): each pair
+``[target, counterpart]`` thresholds the target using the counterpart's positive
+cells as its negative population.  Three 2-cluster models (KMeans, GMM, SSC) split
+background vs. signal per image×pair; the threshold is ``mean + 3σ`` of the target
+intensity in the target-negative cluster.  SSC is the default gating model.
 
 Operates on RAW / REDSEA-corrected QuPath mean intensities (RESTORE's idx_select
-uses an absolute >50 floor and clusters on raw 2D intensities — do NOT log the
-input).  SSC needs ``spams`` (``pip install spams-bin``).
+and clustering run on raw 2D intensities — do NOT log the input).  The co-positive
+idx_select prefilter is replaced by the corrected mutually-exclusive single-positive
+selection (see ``patch_restore_idx_floor``).  SSC needs ``spams`` (``pip install spams-bin``).
 
 Pipeline (config-driven paths; the REDSEA-corrected branch):
     <cells_redsea>/donor_id=*/data_0.parquet   (REDSEA-corrected MFI)
@@ -49,10 +49,11 @@ import numpy as np
 import pandas as pd
 
 import matplotlib
-matplotlib.use("Agg")
+if not matplotlib.get_backend().startswith("module://"):  # keep a notebook's inline/widget backend; force Agg only headless
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .config import PipelineConfig, load_config, DEFAULT_MARKER_PAIRS, EXTRA_MARKER_PAIRS
+from .config import PipelineConfig, load_config, MARKER_PAIRS, FUNCTIONAL_PAIRS
 from .parallel import map_donors
 
 MODEL_COLORS = {"KMeans": "magenta", "GMM": "blue", "SSC": "green"}
@@ -149,6 +150,155 @@ def patch_restore_no_kde(Normalization):
     print("[kde-stub] figure-only gaussian_kde neutralized")
 
 
+# --------------------------------------------------------------------------- #
+# Shared selection + threshold statistics — the SINGLE source of the idx-floor
+# selection math, used both by the production ``patch_restore_idx_floor`` below
+# and by the interactive threshold-tracing diagnostics (``phenocycler.diagnostics``).
+# --------------------------------------------------------------------------- #
+def idx_select(T, R, neg_q=0.5, ratio_x=0.75, ratio_y=0.5, nonzero_q=0.0):
+    """Mutually-exclusive single-positive selection for a directional ``[target, reference]`` pair.
+
+    Returns ``(mask, c0, c1)`` where ``mask`` keeps the two axis-hugging arms —
+        REF+ / TGT<=c0   the target-NEGATIVE population that thresholds the target
+        TGT+ / REF<=c1   signal
+    and ``c0``/``c1`` are the per-axis near-zero ceilings = the ``neg_q`` quantile of T / R.
+    ``neg_q <= 0`` reverts to RESTORE's vendored CO-POSITIVE ``>50`` prefilter (comparison escape hatch).
+    ``nonzero_q > 0`` floors ``c0``/``c1`` at that quantile of the marker's NONZERO cells — a guard for
+    REDSEA's zero-clip (if >=50% of a sparse marker is clamped to 0, ``quantile(T, neg_q)`` collapses to
+    0 and the negative arm keeps only exact-zero cells). ``nonzero_q == 0`` is the exact current math.
+    This is the exact selection the RESTORE idx-floor patch applies — kept in one place."""
+    T = np.asarray(T, float); R = np.asarray(R, float)
+    if neg_q <= 0:                                             # vendored co-positive >50 escape hatch
+        f0 = f1 = 50.0
+        mask = ((T > f0) & (R > np.quantile(R, ratio_y))) | ((R > f1) & (T > np.quantile(T, ratio_x)))
+        return mask, f0, f1
+    c0 = float(np.quantile(T, neg_q)); c1 = float(np.quantile(R, neg_q))   # OFF-marker near-zero ceilings
+    if nonzero_q > 0:                       # guard REDSEA zero-clip collapse (>=50% zeros -> c0/c1 == 0)
+        Tnz = T[T > 0]; Rnz = R[R > 0]
+        if Tnz.size: c0 = max(c0, float(np.quantile(Tnz, nonzero_q)))
+        if Rnz.size: c1 = max(c1, float(np.quantile(Rnz, nonzero_q)))
+    mask = (((R > np.quantile(R, ratio_y)) & (T <= c0)) |     # REF+ / TGT-  = negative pop
+            ((T > np.quantile(T, ratio_x)) & (R <= c1)))       # TGT+ / REF-  = signal
+    return mask, c0, c1
+
+
+def neg_stat(v, stat="mean3sd", k=3.0, pctile=99.865):
+    """Threshold from the target-negative population's target-axis values (raw MFI).
+
+    ``mean3sd`` is the production statistic (``mean + k·std``, ddof=0, matching vendored RESTORE);
+    ``mad``/``logmad`` are sigma-consistent robust variants (median + k·1.4826·MAD, the latter in
+    log space); ``pctile`` is coverage-matched to k·sigma (default 99.865 = 100·Φ(3))."""
+    v = np.asarray(v, float); v = v[np.isfinite(v)]
+    if v.size < 2:
+        return np.nan
+    if stat == "mean3sd":
+        return float(v.mean() + k * v.std())
+    if stat == "mad":
+        m = np.median(v); return float(m + k * 1.4826 * np.median(np.abs(v - m)))
+    if stat == "pctile":
+        return float(np.percentile(v, pctile))
+    if stat == "logmad":
+        lv = np.log1p(np.clip(v, 0, None)); m = np.median(lv)   # clip: REDSEA can go slightly < 0
+        return float(np.expm1(m + k * 1.4826 * np.median(np.abs(lv - m))))
+    raise ValueError(f"unknown neg_stat: {stat!r}")
+
+
+def fit_clusters(cloud, model="SSC", subsample=15000, seed=0, ssc_vendor=None):
+    """Fit the RESTORE 2-cluster model on an idx_select cloud (columns = target, reference) and return
+    ``(cloud, labels, neg)`` where ``neg`` is the cluster index with the largest std on the REFERENCE
+    axis (reference-positive => target-negative — exactly the vendored negative-cluster selection).
+    ``model`` in {"KMeans","GMM","SSC"}; SSC (default) needs the vendored ``ssc`` package (``spams``)."""
+    from sklearn.cluster import KMeans
+    from sklearn.mixture import GaussianMixture
+    cloud = np.asarray(cloud, float)
+    rng = np.random.default_rng(seed)
+    if len(cloud) > subsample:
+        cloud = cloud[rng.choice(len(cloud), subsample, replace=False)]
+    if model == "KMeans":
+        labels = KMeans(n_clusters=2, random_state=seed, n_init=10).fit_predict(cloud)
+    elif model == "GMM":
+        labels = GaussianMixture(n_components=2, n_init=5, random_state=seed).fit_predict(cloud)
+    elif model == "SSC":
+        vendor = Path(ssc_vendor) if ssc_vendor else (Path(__file__).resolve().parents[1]
+                                                      / "external" / "RESTORE" / "python_code")
+        if str(vendor) not in sys.path:
+            sys.path.insert(0, str(vendor))
+        try:
+            from ssc.cluster.selfrepresentation import SparseSubspaceClusteringOMP  # NB stochastic + slow
+        except ModuleNotFoundError as e:
+            raise SystemExit(f"[fatal] SSC needs the vendored ssc pkg + spams ({e}); pip install spams-bin")
+        m = SparseSubspaceClusteringOMP(n_clusters=2); m.fit(cloud); labels = m.labels_
+    else:
+        raise ValueError(f"unknown model: {model!r}")
+    clusters = [cloud[labels == 0], cloud[labels == 1]]
+    neg = int(np.argmax([c[:, 1].std() if len(c) else -1 for c in clusters]))
+    return cloud, labels, neg
+
+
+def patch_restore_idx_floor(Normalization, neg_q=0.5, neg_stat_name="mean3sd",
+                            nonzero_q=0.0, presence_min_sep=0.0, subsample=15000, seed=0):
+    """Replace RESTORE's CO-POSITIVE idx_select prefilter with the correct MUTUALLY-EXCLUSIVE
+    single-positive selection for the directional ``[target, reference]`` pair.
+
+    The vendored idx_select selects cells HIGH IN BOTH markers — each of its two arms AND-requires
+    the target AND the reference to be elevated, i.e. the co-positive top-right corner. For a
+    mutually-exclusive pair those are the doublet/spillover/segmentation-error contamination — the
+    one population that must NEVER define a negative control. Clustering that corner and taking its
+    'negative' sub-cluster leaves the target-negative mean sitting out among the co-positive cells,
+    so ``mean+3σ`` lands near the target p99 (on 6374 ND: INS → ~10,144 MFI → 0.6% of islet-core
+    cells called INS⁺, i.e. an ND islet with no β-cells — false).
+
+    Corrected: select the two axis-hugging single-positive arms —
+        REF+ / TGT≈0  → the NEGATIVE population that thresholds the target
+        TGT+ / REF≈0  → signal
+    where 'near-zero' for the OFF marker is a per-(image, marker) quantile ``neg_q`` (DYNAMIC knob;
+    default median). Downstream 2-cluster + max-reference-std still isolates the reference arm as the
+    negative population. The vendored threshold core (and the sigma + cluster-cap patches) is
+    otherwise unchanged; discarded figure objects are hv stubs (save_figs=False)."""
+    R = sys.modules[Normalization.__module__]
+    ratio_x, ratio_y = 0.75, 0.5
+
+    @functools.wraps(Normalization.get_marker_pair_thresh)
+    def wrapper(self, data, scene, marker_pair, batch):
+        tmp = data[marker_pair].to_numpy()                       # col 0 = target, col 1 = reference
+        sel, _c0, _c1 = idx_select(tmp[:, 0], tmp[:, 1], neg_q, ratio_x, ratio_y, nonzero_q)  # single-positive arms
+        marker_pair_data = tmp[sel]
+        xlabel = marker_pair[0]
+        # Item 2 (opt-in, default off): per-image signal-presence guard. If the idx_select cloud has no
+        # separated positive population, call the marker ABSENT for this image (thresh=+inf -> 0 positives)
+        # rather than letting the 2-cluster fit emit a finite mu+3sigma on pure noise (e.g. beta-loss INS).
+        if presence_min_sep > 0:
+            cl, lab, neg = fit_clusters(marker_pair_data, "KMeans", subsample, seed)
+            negv = cl[lab == neg][:, 0]; posv = cl[lab != neg][:, 0]
+            nsd = float(negv.std()) if negv.size else 0.0
+            sep = (float(posv.mean()) - float(negv.mean())) / nsd if (nsd > 0 and posv.size) else 0.0
+            if sep < presence_min_sep:
+                for nm in ("KMeans", "GMM", "SSC"):
+                    self.threshs[batch][scene][xlabel][nm] = float("inf")
+                print(f"[presence] {scene} {xlabel}: sep={sep:.2f} < {presence_min_sep} -> absent (0 positives)")
+                return R.hv.Scatter(marker_pair_data), []
+        models = (("KMeans", "magenta", R.cluster.KMeans(n_clusters=2)),
+                  ("GMM", "blue", R.mixture.GaussianMixture(n_components=2, n_init=10)),
+                  ("SSC", "green", R.sr.SparseSubspaceClusteringOMP(n_clusters=2)))
+        for name, color, model in models:
+            if neg_stat_name == "mean3sd":   # vendored mu+3sigma (production); carries the sigma + cluster-cap patches
+                fn = self.get_GMM_thresh if name == "GMM" else self.get_clustering_thresh
+                thresh, _ = fn(marker_pair_data, marker_pair, model, 3, color, batch)
+            else:                            # Item 1 (opt-in): robust negative-cluster statistic on the target axis
+                cl, lab, neg = fit_clusters(marker_pair_data, name, subsample, seed)
+                thresh = neg_stat(cl[lab == neg][:, 0], stat=neg_stat_name)
+            self.threshs[batch][scene][xlabel][name] = thresh
+        return R.hv.Scatter(marker_pair_data), []
+
+    Normalization.get_marker_pair_thresh = wrapper
+    extra = [f"neg_stat={neg_stat_name}"] if neg_stat_name != "mean3sd" else []
+    if nonzero_q > 0: extra.append(f"nonzero_q={nonzero_q}")
+    if presence_min_sep > 0: extra.append(f"presence_min_sep={presence_min_sep}")
+    print(f"[idx-select] mutually-exclusive single-positive arms (REF+/TGT- neg | TGT+/REF- signal); "
+          f"OFF-marker near-zero ceiling = per-(image,marker) quantile {neg_q} (was co-positive corner)"
+          + (f"; {', '.join(extra)}" if extra else ""))
+
+
 def import_restore(vendor: Path):
     _install_headless_stubs()
     if str(vendor) not in sys.path:
@@ -208,7 +358,10 @@ def build_restore_input(cells_dir, markers, subsample, seed, limit_scenes=None, 
 # Reference exclusivity QC
 # --------------------------------------------------------------------------- #
 def _idx_select(T, R, ratio_x=0.75, ratio_y=0.5):
-    """Replicate RESTORE's idx_select prefilter (>50 floor + quantile box)."""
+    """AUDIT-ONLY co-expression probe (the vendored co-positive selection): its svd_ratio measures
+    collinearity IN the co-expressing region (low ratio => the two markers co-vary => poor mutual
+    exclusivity). This is intentionally NOT the corrected single-positive threshold selection used by
+    ``patch_restore_idx_floor`` — here we WANT to look at the co-positive corner to score the pair."""
     return (((T > 50) & (R > np.quantile(R, ratio_y))) |
             ((R > 50) & (T > np.quantile(T, ratio_x))))
 
@@ -416,15 +569,15 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
                 donors=None, skip_apply=False, robust=None, robust_factor=None,
                 reuse_threshs=False, ref_qc=True, seed=None, n_jobs=None,
                 out_dir: Optional[Path] = None, gated_dir: Optional[Path] = None,
-                thresh_csv: Optional[Path] = None):
+                thresh_csv: Optional[Path] = None, idx_floor_q=None,
+                neg_stat=None, presence_min_sep=None, idx_nonzero_q=None):
     """Run RESTORE fit + robust LUT + per-donor apply.  Reads the REDSEA-corrected
     cells by default; writes gated parquet + thresholds csv.
 
     ``out_dir`` / ``gated_dir`` / ``thresh_csv`` default (``None``) to the canonical
-    ``cfg.restore_dir`` / ``cfg.restore_gated_dir`` / ``cfg.restore_thresholds_csv``, so the
-    normal 10-marker path is byte-unchanged; :func:`run_restore_extra` overrides them to run
-    the second (extra-marker) pass into the ``*_extra`` dirs without touching the validated
-    10-marker gates."""
+    ``cfg.restore_dir`` / ``cfg.restore_gated_dir`` / ``cfg.restore_thresholds_csv``;
+    :func:`run_restore_functional` overrides them to run the OPTIONAL functional-marker pass into the
+    ``*_extra`` dirs without touching the main gates."""
     cells_dir = Path(cells_dir) if cells_dir is not None else cfg.cells_redsea_dir
     model = model or cfg.restore_model
     subsample = cfg.restore_subsample if subsample is None else subsample
@@ -432,8 +585,12 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
     robust_factor = cfg.restore_robust_factor if robust_factor is None else robust_factor
     seed = cfg.restore_seed if seed is None else seed
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
+    idx_floor_q = cfg.restore_idx_floor_q if idx_floor_q is None else idx_floor_q
+    neg_stat_name = cfg.restore_neg_stat if neg_stat is None else neg_stat
+    presence_min_sep = cfg.restore_presence_min_sep if presence_min_sep is None else presence_min_sep
+    idx_nonzero_q = cfg.restore_idx_nonzero_q if idx_nonzero_q is None else idx_nonzero_q
 
-    pairs = marker_pairs or [list(p) for p in DEFAULT_MARKER_PAIRS]
+    pairs = marker_pairs or [list(p) for p in MARKER_PAIRS]
     markers = sorted({m for pair in pairs for m in pair})
     print(f"[config] pairs (target<-reference): {pairs}")
     print(f"[config] markers={markers}  chosen_model={model}  subsample={subsample}  cells_dir={cells_dir}")
@@ -449,6 +606,9 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
         patch_restore_sigma(Normalization, marker_sigma)
     patch_restore_cluster_cap(Normalization, subsample, seed)
     patch_restore_no_kde(Normalization)
+    if idx_floor_q and idx_floor_q > 0:   # scale-invariant idx_select floor (vendored >50 is OHSU-calibrated)
+        patch_restore_idx_floor(Normalization, idx_floor_q, neg_stat_name, idx_nonzero_q,
+                                presence_min_sep, subsample, seed)
 
     print("[step1] building RESTORE input (full images; idx_select runs on all cells) ...")
     data = build_restore_input(cells_dir, markers, None, seed, limit_scenes, donors)
@@ -500,26 +660,13 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
     return thr_df
 
 
-def run_restore_extra(cfg: PipelineConfig, *, donors=None):
-    """Second RESTORE pass for the extra markers (CD99/B3TUBB/MPO <- Pan_Cytokeratin).
-
-    Runs the SAME RESTORE machinery as :func:`run_restore` on ``EXTRA_MARKER_PAIRS`` with
-    ``robust=False`` and ``ref_qc=False``, reading the REDSEA-corrected cells
-    (``cfg.cells_redsea_dir``) and writing to the ``*_extra`` dirs
-    (``cfg.restore_redsea_extra_dir`` / ``cfg.restore_gated_extra_dir`` /
-    ``cfg.restore_thresholds_extra_csv``).  Keeping this a separate pass leaves the validated
-    10-marker gates in ``restore_gated_redsea`` byte-identical.  Equivalent to the Senior
-    command::
-
-        restore_normalize.py \\
-          --marker-pairs 'CD99:Pan_Cytokeratin,B3TUBB:Pan_Cytokeratin,MPO:Pan_Cytokeratin' \\
-          --cells-dir data/cells_redsea --out-dir data/restore_redsea_extra \\
-          --gated-dir data/restore_gated_redsea_extra \\
-          --thresh-csv data/restore_thresholds_extra.csv --no-robust --no-ref-qc
-
-    The gated output ({m}_pos / {m}_norm / {m}_log2r for CD99/B3TUBB/MPO) is merged into the
-    broad-lineage call by ``object_id`` at assignment time."""
-    pairs = [list(p) for p in EXTRA_MARKER_PAIRS]
+def run_restore_functional(cfg: PipelineConfig, *, donors=None):
+    """OPTIONAL second RESTORE pass for the functional / state markers (``FUNCTIONAL_PAIRS`` in
+    ``config.py`` — activation / exhaustion / IFN-driven). RESTORE's reliably-negative-lineage
+    assumption is weaker here, so it runs with ``robust=False`` / ``ref_qc=False`` into the ``*_extra``
+    dirs; VALIDATE the cutoffs before use. These are STATE annotations, not compartments, and are NOT
+    part of the default pipeline. NB ``CD38`` is batch-1 only (missing in batch-2 donors)."""
+    pairs = [list(p) for p in FUNCTIONAL_PAIRS]
     return run_restore(
         cfg,
         cells_dir=cfg.cells_redsea_dir,
@@ -542,7 +689,7 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=None, help="per-donor apply pool size")
     ap.add_argument("--subsample", type=int, default=None)
     ap.add_argument("--model", default=None, choices=["GMM", "KMeans", "SSC"])
-    ap.add_argument("--marker-pairs", default=None, help="override pairs, e.g. 'CD3e:CD163,CD99:CD163'")
+    ap.add_argument("--marker-pairs", default=None, help="override pairs, e.g. 'CD3e:CD20,INS:GCG'")
     ap.add_argument("--marker-sigma", default=None, help="per-target sigma, e.g. 'Pan_Cytokeratin:1.0'")
     ap.add_argument("--limit-scenes", type=int, default=None)
     ap.add_argument("--donors", nargs="*", default=None)
@@ -552,18 +699,29 @@ def main(argv=None):
     ap.add_argument("--reuse-threshs", action="store_true")
     ap.add_argument("--ref-qc", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--extra", action="store_true",
-                    help="run the SECOND RESTORE pass for the extra markers "
-                         "(CD99/B3TUBB/MPO <- Pan_Cytokeratin) into the *_extra dirs; forces "
-                         "robust off + ref-qc off so the 10-marker gates stay byte-identical "
-                         "(other pair/model/sigma flags are ignored)")
+    ap.add_argument("--idx-floor-q", type=float, default=None,
+                    help="per-(image,marker) quantile floor for idx_select (default cfg 0.5; "
+                         "0 reverts to RESTORE's hardcoded >50)")
+    ap.add_argument("--neg-stat", default=None, choices=["mean3sd", "mad", "logmad", "pctile"],
+                    help="negative-cluster threshold statistic (default cfg mean3sd == vendored mu+3sigma; "
+                         "mad/logmad/pctile are opt-in robust variants — evaluate per-donor first)")
+    ap.add_argument("--presence-min-sep", type=float, default=None,
+                    help="opt-in per-image signal-presence guard: call a marker ABSENT (0 positives) if its "
+                         "idx_select cloud shows cluster separation < this many neg-sigma (default cfg 0 == off)")
+    ap.add_argument("--idx-nonzero-q", type=float, default=None,
+                    help="opt-in REDSEA zero-clip guard: floor the idx_select OFF-marker ceiling at this "
+                         "quantile of the marker's NONZERO cells (default cfg 0 == off)")
+    ap.add_argument("--functional", action="store_true",
+                    help="OPTIONAL second RESTORE pass for the functional / state markers "
+                         "(FUNCTIONAL_PAIRS) into the *_extra dirs (robust off + ref-qc off); validate "
+                         "the cutoffs before use (other pair/model/sigma flags are ignored)")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
     if a.jobs is not None:
         cfg.n_jobs = a.jobs
-    if a.extra:
-        run_restore_extra(cfg, donors=a.donors)
+    if a.functional:
+        run_restore_functional(cfg, donors=a.donors)
         return 0
     pairs = ([p.split(":") for p in a.marker_pairs.split(",")] if a.marker_pairs else None)
     sigma = ({k: float(v) for k, v in (p.split(":") for p in a.marker_sigma.split(","))}
@@ -572,7 +730,9 @@ def main(argv=None):
                 marker_pairs=pairs, marker_sigma=sigma, limit_scenes=a.limit_scenes,
                 donors=a.donors, skip_apply=a.skip_apply, robust=a.robust,
                 robust_factor=a.robust_factor, reuse_threshs=a.reuse_threshs,
-                ref_qc=a.ref_qc, seed=a.seed)
+                ref_qc=a.ref_qc, seed=a.seed, idx_floor_q=a.idx_floor_q,
+                neg_stat=a.neg_stat, presence_min_sep=a.presence_min_sep,
+                idx_nonzero_q=a.idx_nonzero_q)
     return 0
 
 

@@ -24,72 +24,72 @@ from typing import Optional
 # Scientific constants (faithful to Islet-Explorer-Senior; not usually tuned)
 # --------------------------------------------------------------------------- #
 
-# Broad-lineage gating markers -> the seven mutually-exclusive lineages
-# (scripts/senior/assign_broad_lineage.py).  CD99 (bright-only) is an Endocrine
-# gate; Neural (B3TUBB) is carved out of the structural background; MPO
-# (neutrophils/granulocytes) is folded into Immune (neutrophils ARE immune cells).
-# CD99/B3TUBB/MPO are gated in a SEPARATE RESTORE pass (EXTRA_MARKER_PAIRS) and
-# merged by object_id at assignment time.
-LINEAGES: dict[str, list[str]] = {
-    "Epithelial": ["Pan_Cytokeratin"],
-    "Fibroblast": ["Vimentin"],
-    "Immune": ["CD3e", "CD20", "CD163", "MPO"],   # +MPO (neutrophils folded into Immune)
-    "Endocrine": ["INS", "GCG", "SST", "CD99"],
-    "Endothelial": ["CD31"],
-    "Muscle": ["SMA"],
-    "Neural": ["B3TUBB"],
-}
-# Structural background is resolved by argmax of these three `_norm` scores.
-STRUCT_LINEAGES: list[str] = ["Epithelial", "Fibroblast", "Muscle"]
+# Broad phenotyping — 5-compartment ORDERED RESIDUAL partition (+ explicit "Other").
+# Each cell is typed by the first matching gate in COMPARTMENT_ORDER (each gate runs on the
+# residual of the prior); cells failing every gate -> "Other" (real panel gaps: mast/Schwann/
+# adipocyte/quiescent-stellate). Endocrine/exocrine are a SUB-branch of Epithelial (hormone+ vs
+# hormone-). Priority: Epithelial > Endothelial > Neural > Immune > Mesenchymal > Other.
+# See phenocycler/lineage.py for the tree + sub-splits.
+COMPARTMENT_ORDER: list[str] = ["Epithelial", "Endothelial", "Neural", "Immune", "Mesenchymal"]
+OTHER_LABEL: str = "Other"
 
-LINEAGE_COLORS: dict[str, str] = {
-    "Epithelial": "#4477AA", "Fibroblast": "#EE6677", "Immune": "#228833",
-    "Endocrine": "#CCBB44", "Endothelial": "#66CCEE", "Muscle": "#AA3377",
-    "Neural": "#B5838D",   # dusty rose (CVD-safe)
+# Anchor gate marker(s) per compartment — a cell enters the compartment if ANY is `_pos`.
+# Mesenchymal is ORDERED: SMA (muscle/pericyte) claimed first, then Vimentin (fibroblast/stellate)
+# in the SMA-negative residual (Vimentin is the most promiscuous marker -> gated last).
+COMPARTMENT_GATES: dict[str, list[str]] = {
+    "Epithelial":  ["E_cadherin"],          # only epithelial marker that stays + on endocrine
+    "Endothelial": ["CD31"],
+    "Neural":      ["B3TUBB"],               # residual (after epithelial) so islet TUBB3 is gone
+    "Immune":      ["CD3e", "CD20", "CD79a", "CD68", "CD163", "CD206", "Iba1", "CD11b", "CD11c", "MPO"],
+    "Mesenchymal": ["SMA", "Vimentin"],
 }
-# unique 3-char codes for the terse per-donor progress line (Endocrine/Endothelial
-# would otherwise collide under a naive name[:3]).
-LINEAGE_ABBR: dict[str, str] = {
-    "Epithelial": "Epi", "Fibroblast": "Fib", "Immune": "Imm", "Endocrine": "Enc",
-    "Endothelial": "Eth", "Muscle": "Mus", "Neural": "Nrl",
+
+# Endocrine sub-branch of Epithelial: hormone+ = endocrine (beta INS, alpha GCG, delta SST);
+# hormone- epithelial = exocrine. (IAPP removed 2026-07-10 — failed marker.)
+ENDOCRINE_MARKERS: list[str] = ["INS", "GCG", "SST"]
+
+COMPARTMENT_COLORS: dict[str, str] = {
+    "Epithelial": "#4477AA", "Endothelial": "#66CCEE", "Neural": "#B5838D",
+    "Immune": "#228833", "Mesenchymal": "#AA3377", "Other": "#BBBBBB",
+}
+# unique 3-char codes for the terse per-donor progress line.
+COMPARTMENT_ABBR: dict[str, str] = {
+    "Epithelial": "Epi", "Endothelial": "Eth", "Neural": "Nrl",
+    "Immune": "Imm", "Mesenchymal": "Mes", "Other": "Oth",
 }
 STATUS_ORDER: list[str] = ["ND", "AAB", "T1D"]
 
-# RESTORE mutually-exclusive [target, reference] pairs
-# (scripts/senior/restore_normalize.py DEFAULT_MARKER_PAIRS).  Pan_Cytokeratin
-# is the universal negative control; CD3e<-CD163 is the documented exception.
-DEFAULT_MARKER_PAIRS: list[list[str]] = [
-    ["Pan_Cytokeratin", "Vimentin"],
-    ["Vimentin", "Pan_Cytokeratin"],
-    ["INS", "Pan_Cytokeratin"],
-    ["GCG", "Pan_Cytokeratin"],
-    ["SST", "Pan_Cytokeratin"],
-    ["CD31", "Pan_Cytokeratin"],
-    ["SMA", "Pan_Cytokeratin"],
-    ["CD3e", "CD163"],
-    ["CD20", "Pan_Cytokeratin"],
-    ["CD163", "Pan_Cytokeratin"],
+# RESTORE mutually-exclusive pairs, DIRECTIONAL: [target, counterpart] — [0] is thresholded, [1] is the
+# mutually-exclusive counterpart that defines the negative population (RESTORE keys threshs on the TARGET
+# only, so reciprocals like INS<->GCG / CD3e<->CD20 are separate entries). ONE RESTORE pass over all
+# markers (the old separate "extra" pass is folded in). Counterparts are biologically curated (user).
+MARKER_PAIRS: list[list[str]] = [
+    # Epithelial (<- CD31: spatially-separated exclusive negative, avoids intraepithelial-lymphocyte leak)
+    ["E_cadherin", "CD31"], ["Pan_Cytokeratin", "CD31"], ["Ker8_18", "CD31"], ["EpCAM", "CD31"],
+    ["Keratin_5", "CD31"], ["TP63", "CD31"],
+    # Endothelial / stroma (<- E_cadherin: epithelium = dominant negative mass)
+    ["CD31", "E_cadherin"], ["CD34", "E_cadherin"], ["Podoplanin", "E_cadherin"], ["SMA", "E_cadherin"],
+    ["Vimentin", "E_cadherin"],                 # Vimentin only ever a TARGET, never a counterpart
+    # Neural (<- CD3e: TUBB3-negative & non-epithelial; endocrine co-expresses TUBB3)
+    ["B3TUBB", "CD3e"],
+    # Endocrine, intra-islet reciprocal (negative sits in the target's microenvironment)
+    ["INS", "GCG"], ["GCG", "INS"], ["SST", "INS"],   # IAPP removed 2026-07-10 — failed marker
+    # Immune (co-localized immune counterparts = shared autofluorescence context)
+    ["CD3e", "CD20"], ["CD20", "CD3e"], ["CD79a", "CD3e"],
+    ["CD4", "CD20"], ["CD8", "CD20"], ["FOXP3", "CD20"],
+    ["CD68", "CD3e"], ["CD163", "CD3e"], ["CD206", "CD3e"], ["Iba1", "CD3e"], ["CD11b", "CD3e"],
+    ["CD11c", "CD3e"], ["CD209", "CD3e"], ["MPO", "CD3e"],
+    ["Granzyme_B", "CD20"], ["CD57", "CD20"], ["CD56", "CD20"],   # CD56/CD57 for NK; never a counterpart
 ]
 
-# Extra RESTORE pass (run separately with --no-robust --no-ref-qc so the validated
-# 10-pair gates in restore_gated_redsea stay byte-identical).  These three markers
-# (Endocrine-CD99 / Neural-B3TUBB / Immune-MPO) are gated against Pan_Cytokeratin
-# into restore_gated_redsea_extra and merged into the lineage call by object_id.
-EXTRA_MARKER_PAIRS: list[list[str]] = [
-    ["CD99", "Pan_Cytokeratin"],
-    ["B3TUBB", "Pan_Cytokeratin"],
-    ["MPO", "Pan_Cytokeratin"],
+# Optional functional/state markers (activation/exhaustion/IFN-driven) — RESTORE's reliably-negative-
+# lineage assumption is weaker here; run separately and validate the cutoffs. These are STATE
+# annotations, not compartments. NB: CD38 is batch-1 only (b_Catenin1 replaces it in batch-2).
+FUNCTIONAL_PAIRS: list[list[str]] = [
+    ["PD_1", "E_cadherin"], ["LAG3", "E_cadherin"], ["TOX", "E_cadherin"], ["TCF_1", "CD68"],
+    ["ICOS", "E_cadherin"], ["VISTA", "E_cadherin"], ["CD39", "E_cadherin"], ["CD38", "E_cadherin"],
+    ["PD_L1", "CD20"], ["IDO1", "CD20"], ["iNOS", "CD20"], ["HLA_DR", "CD3e"],
 ]
-EXTRA_MARKERS: list[str] = [p[0] for p in EXTRA_MARKER_PAIRS]   # CD99, B3TUBB, MPO
-
-# _pos floors applied by the hormone_floor stage before lineage assignment, to strip the
-# RESTORE marginal-positive shoulder (mean+3sigma threshold landing in the noise for sparse markers):
-#   - hormones {INS,GCG,SST} at hormone_min_norm (K=5) -- the false-endocrine fix.
-#   - immune {CD3e,CD20,CD163} at immune_min_norm (K=2) -- the false-immune over-call fix (e.g. donor
-#     6476's 40% CD3e was a threshold over-call; K=2 validated to preserve 6579's real pancreatitis
-#     T-cell mode + the ND->T1D T-gain). MPO (extra dir) is gated at immune_min_norm in lineage.py.
-HORMONE_MARKERS: list[str] = ["INS", "GCG", "SST"]
-IMMUNE_FLOOR_MARKERS: list[str] = ["CD3e", "CD20", "CD163"]   # main-dir immune markers floored in-stage
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INI = _REPO_ROOT / "config.ini"
@@ -124,11 +124,28 @@ class PipelineConfig:
     restore_robust_factor: float = 3.0
     restore_min_cell_area: float = 5.0
     restore_seed: int = 0
+    # idx_select OFF-marker near-zero ceiling: per-(image,marker) quantile for the corrected
+    # MUTUALLY-EXCLUSIVE single-positive selection (REF+/TGT≈0 negative pop | TGT+/REF≈0 signal),
+    # replacing RESTORE's co-positive corner. DYNAMIC knob (default median q0.5). 0/negative ->
+    # revert to the vendored co-positive >50 prefilter (comparison escape hatch only).
+    restore_idx_floor_q: float = 0.5
+    # -- 3 opt-in evaluation knobs (default == current behavior; activate per-donor from figures) --
+    # Item 1: negative-cluster threshold statistic. "mean3sd" == vendored mu+3sigma (production);
+    #   "mad"/"logmad"/"pctile" are robust variants (median+k*1.4826*MAD / coverage-matched pctile).
+    restore_neg_stat: str = "mean3sd"
+    # Item 2: per-image signal-presence guard. If >0, an (image,marker) whose idx_select cloud shows
+    #   cluster-mean separation < this many negative-sigma is called ABSENT (thresh=+inf -> 0 positives).
+    restore_presence_min_sep: float = 0.0
+    # Item 3: REDSEA zero-clip guard for the idx_select OFF-marker ceilings. If >0, floor c0/c1 at the
+    #   nonzero_q quantile of the marker's NONZERO cells (prevents ceiling collapse to 0 when >=50%
+    #   of cells are REDSEA-clamped to zero). 0 == disabled (exact current math).
+    restore_idx_nonzero_q: float = 0.0
 
-    # -- lineage (assign_broad_lineage.py + apply_hormone_floor.py + marker_taxonomy.py) --
-    hormone_min_norm: float = 5.0    # K: {INS,GCG,SST}_pos := _norm >= K (false-endocrine floor)
-    immune_min_norm: float = 2.0     # K: {CD3e,CD20,CD163,MPO}_pos := _norm >= K (false-immune floor)
-    cd99_bright: float = 3.0         # CD99_pos := CD99_norm >= this (bright-only Endocrine gate)
+    # -- RESTORE efficacy diagnostic (scripts/R/restore_mxnorm_diagnostics.R via mxnorm) ---
+    restore_diag_subsample: int = 20000   # cells/donor for the mxnorm diagnostic (stratified by cell_region)
+    restore_diag_seed: int = 0
+
+    # (former [lineage] _norm-floor + cd99_bright knobs removed — floors dropped in the curated redesign)
 
     # -- compute -------------------------------------------------------------
     n_jobs: int = 1                  # per-donor process pool size (1 == serial)
@@ -173,11 +190,6 @@ class PipelineConfig:
         return self.data_dir / "restore_gated_redsea"
 
     @property
-    def restore_gated_prefloor_dir(self) -> Path:
-        # pre-hormone-floor backup; the hormone_floor stage reads this and (re)writes restore_gated_dir
-        return self.data_dir / "restore_gated_redsea.pre_hormonefloor"
-
-    @property
     def restore_redsea_extra_dir(self) -> Path:
         return self.data_dir / "restore_redsea_extra"
 
@@ -192,6 +204,11 @@ class PipelineConfig:
     @property
     def restore_thresholds_extra_csv(self) -> Path:
         return self.data_dir / "restore_thresholds_extra.csv"
+
+    @property
+    def restore_mxnorm_dir(self) -> Path:
+        """mxnorm before/after RESTORE-efficacy diagnostic outputs (efficacy CSV + figures)."""
+        return self.restore_dir / "mxnorm"
 
     @property
     def redsea_reassess_dir(self) -> Path:
@@ -251,11 +268,14 @@ _INI_SCHEMA = {
         "robust_factor": ("restore_robust_factor", float),
         "min_cell_area": ("restore_min_cell_area", float),
         "seed": ("restore_seed", int),
+        "idx_floor_q": ("restore_idx_floor_q", float),
+        "neg_stat": ("restore_neg_stat", str),
+        "presence_min_sep": ("restore_presence_min_sep", float),
+        "idx_nonzero_q": ("restore_idx_nonzero_q", float),
     },
-    "lineage": {
-        "hormone_min_norm": ("hormone_min_norm", float),
-        "immune_min_norm": ("immune_min_norm", float),
-        "cd99_bright": ("cd99_bright", float),
+    "restore_diag": {
+        "subsample": ("restore_diag_subsample", int),
+        "seed": ("restore_diag_seed", int),
     },
     "compute": {
         "n_jobs": ("n_jobs", int),
@@ -274,8 +294,6 @@ _ENV_OVERRIDES = {
     "restore_vendor": ("PHENOCYCLER_RESTORE_VENDOR", Path),
     "n_jobs": ("PHENOCYCLER_JOBS", int),
     "use_gpu": ("PHENOCYCLER_USE_GPU", lambda s: str(s).lower() in ("1", "true", "yes", "on")),
-    "hormone_min_norm": ("PHENOCYCLER_HORMONE_MIN_NORM", float),
-    "immune_min_norm": ("PHENOCYCLER_IMMUNE_MIN_NORM", float),
 }
 
 

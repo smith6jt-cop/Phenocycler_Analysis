@@ -7,11 +7,11 @@ faithful, optimized port of the "Senior phenotyping pipeline" from
 restructured into a reusable, testable package with per-donor parallelism and an
 optional GPU backend.
 
-The pipeline corrects three dominant artifacts of dense multiplexed tissue imaging —
-**lateral marker spillover** (REDSEA), **per-image intensity / autofluorescence drift**
-(RESTORE), and **false-endocrine over-calling** (a threshold-relative hormone floor) —
-and then assigns every cell to one of **eight** mutually-exclusive lineages with
-**zero "Unassigned"** cells.
+The pipeline corrects the two dominant artifacts of dense multiplexed tissue imaging —
+**lateral marker spillover** (REDSEA) and **per-image intensity / autofluorescence drift**
+(RESTORE, over a curated web of directional mutually-exclusive marker pairs) — and then
+assigns every cell to one of **5 compartments** by an ordered residual gating tree, with an
+explicit **`Other`** terminal for cells that fail every gate (real panel gaps, not force-assigned).
 
 ```
  raw .qptiff  ─┐
@@ -23,14 +23,14 @@ and then assigns every cell to one of **eight** mutually-exclusive lineages with
  qptiff + GeoJSON ─────────▶ [2] REDSEA spillover ───▶ data/cells_redsea/
                                                      │
                             [3] RESTORE normalize ───▶ data/restore_gated_redsea/
-                                (SSC, per-image)      │   + restore_gated_redsea_extra/ (CD99/B3TUBB/MPO)
+                                (SSC, per-image;      │   {m}_pos / _norm / _log2r — ONE pass, all markers
+                                 curated pairs)       │
                                                      │
-                            [4] hormone floor (K=5) ─▶ data/restore_gated_redsea/  (false-endocrine fix)
+                            [4] broad phenotyping ────▶ data/phenotype/broad/  (5 compartments + Other;
+                                (ordered residual)    │                         compartment + cell_type)
                                                      │
-                            [5] broad lineage ────────▶ data/phenotype/broad/   (8 lineages, 0 Unassigned)
-                                                     │
-                            [6] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
-                            [7] identity figures ─────▶ data/phenotype/celltype_marker_*.png
+                            [5] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
+                            [6] identity figures ─────▶ data/phenotype/celltype_marker_*.png
 ```
 
 ## Scope
@@ -54,20 +54,18 @@ subclustering, and the interactive R Shiny app.
   applies `corrected = clip(data − α·(F @ edge))` (subtract-only, α=1, 1-px band by
   default).
 - **RESTORE** (Chang et al., *Commun. Biol.* 2020) normalizes per-image intensity using
-  mutually-exclusive reference markers. `phenocycler/restore.py` drives the **vendored**
+  mutually-exclusive marker pairs. `phenocycler/restore.py` drives the **vendored**
   RESTORE (`external/RESTORE`, git submodule) headlessly, fitting KMeans/GMM/**SSC**
-  per image × marker pair (SSC is the default), with a robust cohort-median guard on
-  degenerate thresholds. Pan-Cytokeratin is the universal negative reference (except
-  `CD3e ← CD163`).
-- **Hormone floor** rewrites `{INS,GCG,SST}_pos = (_norm ≥ K)` (K=5) *before* typing:
-  RESTORE's per-image hormone threshold lands in the noise for β-loss donors, so this
-  threshold-relative floor rejects the noise-tail false positives while keeping real,
-  separated β/α/δ cells (`hormone_floor.py`). CD99/B3TUBB/MPO are gated in a separate
-  RESTORE pass (`restore --extra`) so the validated 10-marker gates stay byte-identical.
-- **Broad lineage** assigns each cell by a strict hierarchy — Endocrine (INS/GCG/SST or
-  bright CD99) → Immune (CD3e/CD20/CD163/MPO — neutrophils are immune) → Endothelial →
-  Neural (B3TUBB) → structural argmax (Epithelial / Fibroblast / Muscle) → Epithelial
-  default — producing **seven** lineages and no "Unassigned" bucket.
+  per image × pair (SSC is the default), with a robust cohort-median guard on degenerate
+  thresholds. The pairs are a **curated directional web** (`MARKER_PAIRS` in `config.py`):
+  each `[target, counterpart]` thresholds the target against a biologically mutually-exclusive
+  counterpart (e.g. `E_cadherin ← CD31`, `B3TUBB ← CD3e`, intra-islet `INS ↔ GCG`) — not a
+  single universal reference. All markers are thresholded in ONE pass.
+- **Broad phenotyping** (`lineage.py`) assigns each cell by an **ordered residual gating tree**:
+  Epithelial (E-cadherin) → Endothelial (CD31) → Neural (B3TUBB) → Immune (marker union + NK) →
+  Mesenchymal (SMA then Vimentin), each gate on the residual of the prior; cells failing every
+  gate → **`Other`**. Endocrine (β/α/δ) and Exocrine are the hormone⁺/⁻ sub-branches of
+  Epithelial. Output: `compartment` (5 + Other) + finer `cell_type`.
 
 ## Installation
 
@@ -101,7 +99,7 @@ another project, run under that project's interpreter and point `config.ini` (or
 3. Run the whole pipeline (idempotent — skips completed steps):
 
 ```bash
-python -m phenocycler.pipeline            # cells → redsea → restore(+extra) → hormone_floor → lineage → qupath → figures
+python -m phenocycler.pipeline            # cells → redsea → restore → lineage → qupath → figures
 python -m phenocycler.pipeline --status   # just show what exists
 ```
 
@@ -130,10 +128,9 @@ the primary optimization here.
 | 1. cells_parquet | DuckDB (out-of-core) | multithreaded (`[compute] duckdb_threads`) | n/a (I/O bound) |
 | 2. REDSEA | NumPy + SciPy-sparse | per-donor pool (`--jobs`) **or** SLURM array (one donor/task) | optional CuPy (`--gpu`): `bincount` + sparse `F@edge` |
 | 3. RESTORE | vendored RESTORE (SSC) | per-donor apply pool (`--jobs`); subsample cap keeps SSC tractable | — |
-| 4. hormone floor | pandas | per-donor pool (`--jobs`) | — |
-| 5. broad lineage | vectorized NumPy | per-donor pool (`--jobs`) | — |
-| 6. QuPath export | pandas | serial (I/O-light) | — |
-| 7. identity figures | pandas + matplotlib | streaming | — |
+| 4. broad phenotyping | vectorized NumPy | per-donor pool (`--jobs`) | — |
+| 5. QuPath export | pandas | serial (I/O-light) | — |
+| 6. identity figures | pandas + matplotlib | streaming | — |
 
 Set `[compute] n_jobs` in `config.ini` (or `--jobs N`) for the process pools, and
 `use_gpu = true` (+ `pip install cupy-cuda12x`) for the REDSEA CuPy path. For
@@ -151,20 +148,19 @@ phenocycler/            installable package
   cells_parquet.py      Step 1 — DuckDB CSV -> partitioned parquet
   redsea.py             Step 2 — pixel REDSEA (+ parallel driver + CuPy backend)
   restore.py            Step 3 — RESTORE driver (headless stubs, robust LUT, parallel apply)
-  hormone_floor.py      Step 4 — threshold-relative endocrine floor (false-endocrine fix)
-  lineage.py            Step 5 — deterministic 7-class broad-lineage hierarchy
+  lineage.py            Step 4 — ordered residual gating tree (5 compartments + Other)
   marker_taxonomy.py    TYPE / PROCESS / EXCLUDED marker split (single source of truth)
-  qupath_export.py      Step 6 — per-image UUID-keyed CSVs for QuPath
-  figures.py            Step 7 — cell-type × marker identity dotplot + heatmap
-  reassess_diag.py      read-only acceptance yardstick (endocrine + guardrail metrics)
+  qupath_export.py      Step 5 — per-image UUID-keyed CSVs for QuPath
+  figures.py            Step 6 — cell-type × marker identity dotplot + heatmap
   pipeline.py           idempotent orchestrator + status table
   parallel.py           per-donor process pool
   gpu.py                optional CuPy/RAPIDS backend with CPU fallback
 external/RESTORE/       vendored RESTORE (git submodule, commit 38df59b)
 notebooks/              thin step notebooks + orchestrator
 scripts/groovy/         QuPath export/import Groovy scripts
+scripts/R/              RESTORE efficacy diagnostic (mxnorm) + its installer (R 4.5.1)
 scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
-tests/                  pytest: REDSEA math, RESTORE guard, 7-class lineage invariants
+tests/                  pytest: REDSEA math, RESTORE guard, ordered-residual lineage invariants
 config.ini              paths + tunables
 pyproject.toml          editable-install metadata (pip install -e .)
 ```

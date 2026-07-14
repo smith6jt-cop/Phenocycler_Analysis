@@ -63,13 +63,16 @@ def test_flatten_threshs_drops_global_batch():
     assert np.isclose(row.threshold.iloc[0], 120.0)
 
 
-def test_default_marker_pairs_reference_exception():
-    """Pan_Cytokeratin is the universal reference except CD3e<-CD163."""
-    from phenocycler.config import DEFAULT_MARKER_PAIRS
-    pairs = {t: r for t, r in DEFAULT_MARKER_PAIRS}
-    assert pairs["CD3e"] == "CD163"
-    for t in ("INS", "GCG", "SST", "CD31", "SMA", "CD20", "CD163"):
-        assert pairs[t] == "Pan_Cytokeratin"
+def test_marker_pairs_curated_directional():
+    """Curated directional [target, counterpart] web (no universal reference); targets unique."""
+    from phenocycler.config import MARKER_PAIRS
+    targets = [p[0] for p in MARKER_PAIRS]
+    assert len(targets) == len(set(targets))            # RESTORE keys on target -> no silent overwrite
+    pairs = {t: r for t, r in MARKER_PAIRS}
+    assert pairs["E_cadherin"] == "CD31"                # epithelial anchor <- endothelial
+    assert pairs["CD31"] == "E_cadherin"                # reciprocal
+    assert pairs["B3TUBB"] == "CD3e"                    # neural <- immune (TUBB3-negative)
+    assert ["INS", "GCG"] in MARKER_PAIRS and ["GCG", "INS"] in MARKER_PAIRS   # intra-islet reciprocal
 
 
 def test_headless_stubs_importable():

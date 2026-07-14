@@ -1,48 +1,32 @@
 #!/usr/bin/env python3
 """
-Step 5 — broad lineage assignment (every cell typed into 7 classes, ZERO "Unassigned").
+Broad phenotyping — 5-compartment ORDERED RESIDUAL partition (+ explicit "Other").
 
-Faithful port of ``scripts/senior/assign_broad_lineage.py`` (Islet-Explorer-Senior).  Each cell is
-typed by a HIERARCHICAL rule (no "Unassigned" bucket — the mandate is to fix the upstream cause, not
-invent a junk category):
+Every cell is typed by the first matching gate in ``COMPARTMENT_ORDER``, each gate running on the
+RESIDUAL of the prior (so the priority order IS the multi-positive tie-break); cells failing every gate
+land in ``Other`` (real panel gaps — mast/Schwann/adipocyte/quiescent-stellate — NOT force-assigned).
+Priority high->low:
 
-  1. Endocrine    if INS/GCG/SST `_pos` OR bright CD99          (islet hormones β/α/δ + PP/ε/EC)
-  2. Immune       elif CD3e/CD20/CD163/MPO `_pos`                (leukocytes incl. granulocytes)
-  3. Endothelial  elif CD31 `_pos`                               (vessels)
-  4. Neural       elif B3TUBB `_pos`                             (nerves / Schwann)
-  5. else STRUCTURAL background → argmax of (Pan_Cytokeratin, Vimentin, SMA) `_norm`
-        → Epithelial / Fibroblast / Muscle, with cells below ALL three structural thresholds
-        defaulted to Epithelial (flagged `epi_default`).
+  1. Epithelial  <- E_cadherin_pos      (exocrine + endocrine; the only epithelial marker that stays +
+                                         on endocrine). sub: Endocrine (hormone+: beta INS, alpha
+                                         GCG, delta SST) vs Exocrine (hormone-; basal/ductal Keratin_5/TP63)
+  2. Endothelial <- CD31_pos            (sub: lymphatic Podoplanin+, else vascular)
+  3. Neural      <- B3TUBB_pos          (residual, after epithelial -> islet TUBB3 co-expression removed)
+  4. Immune      <- ANY(CD3e/CD20/CD79a/CD68/CD163/CD206/Iba1/CD11b/CD11c/MPO)_pos
+                     sub: T / B / Plasma / Neutrophil / Macrophage / DC / NK / Immune-other
+  5. Mesenchymal <- SMA_pos (Muscle), then Vimentin_pos in the SMA-neg residual (Fibroblast)
+  6. Other       <- failed every gate
 
-Applied sequentially (last write wins) → precedence high→low: Endocrine > Immune > Endothelial >
-Neural > structural.  Neural sits lowest of the specific lineages: it pulls B3TUBB⁺ cells OUT of the
-structural bucket but yields to a genuine endocrine/immune/endothelial call.  MPO (neutrophils) is
-folded into Immune — neutrophils ARE immune cells — and gated at ``immune_min_norm`` (the extra-dir
-equivalent of the CD3e/CD20/CD163 floor).
+`_pos` comes straight from RESTORE (no `_norm` floor). Reads ONE RESTORE-gated parquet per donor
+(all markers, `{m}_pos`/`{m}_norm`).
 
-Why hierarchical + an Epithelial default (not plain argmax-of-`_norm` over all classes): RESTORE sets
-each threshold at mean+3σ of the marker's NEGATIVE population — right for the sparse specific markers,
-but it flags only the brightest ~20% of any ABUNDANT marker, so a plain argmax scatters the dim acinar
-majority.  Hence sparse lineages use the calibrated `_pos`; the structural background uses `_norm`
-argmax; marker-negative cells default to Epithelial (validated via Ker8_18/Pan_CK medians).
-
-CD99/B3TUBB/MPO are gated in a SEPARATE RESTORE pass (``restore_gated_redsea_extra``) so the validated
-10-marker gates in ``restore_gated_redsea`` stay byte-identical; they are merged here by ``object_id``.
-CD99 is broad, so only BRIGHT CD99 (``_norm >= cfg.cd99_bright``) counts as Endocrine.
-
-The endocrine ``_pos`` calls assume the hormone floor (``hormone_floor`` stage) has already rewritten
-``{INS,GCG,SST}_pos = (_norm >= K)`` upstream — run the pipeline in stage order.
-
-Inputs : <restore_gated_dir>/donor_id=*/data_0.parquet        ({m}_norm, {m}_pos; the 10 markers)
-         <restore_gated_extra_dir>/donor_id=*/data_0.parquet   (B3TUBB/CD99/MPO _pos/_norm)
-         <cells_dir>/donor_id=*/data_0.parquet                 (cell_region, islet_num)
-         <donor_metadata>                                      (disease.status)
-Outputs: <phenotype_dir>/broad/donor_id=*/data_0.parquet
+Inputs : <restore_gated_dir>/donor_id=*/data_0.parquet   ({m}_pos, {m}_norm)
+         <cells_dir>/donor_id=*/data_0.parquet           (cell_region, islet_num)
+         <donor_metadata>                                 (disease.status; figure only)
+Outputs: <phenotype_dir>/broad/donor_id=*/data_0.parquet  (object_id, donor_id, compartment, cell_type, ...)
          <phenotype_dir>/broad_lineage_composition.png
 
-Additions vs upstream: config-driven paths + optional per-donor parallel assignment.
-
-    python -m phenocycler.lineage --jobs 4
+    python -m phenocycler.lineage --jobs 8
 """
 
 from __future__ import annotations
@@ -57,16 +41,16 @@ import pandas as pd
 from scipy.stats import kruskal, mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 import matplotlib
-matplotlib.use("Agg")
+if not matplotlib.get_backend().startswith("module://"):  # keep a notebook's inline/widget backend; force Agg only headless
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .config import (PipelineConfig, load_config, LINEAGES, STRUCT_LINEAGES,
-                     LINEAGE_COLORS, LINEAGE_ABBR, STATUS_ORDER, EXTRA_MARKERS)
-from .marker_taxonomy import CD99_BRIGHT
+from .config import (PipelineConfig, load_config, COMPARTMENT_ORDER, COMPARTMENT_GATES,
+                     ENDOCRINE_MARKERS, COMPARTMENT_COLORS, COMPARTMENT_ABBR, STATUS_ORDER, OTHER_LABEL)
 from .parallel import map_donors
 
-LNAMES = list(LINEAGES)
-STRUCT = list(STRUCT_LINEAGES)
+# 6 rows for composition (5 compartments + Other), in priority order.
+CLASSES = COMPARTMENT_ORDER + [OTHER_LABEL]
 
 
 def status_map(cfg: PipelineConfig) -> dict:
@@ -80,104 +64,132 @@ def status_map(cfg: PipelineConfig) -> dict:
         return {}
 
 
-def assign_donor(donor: str, gated_f: str, cells_dir, extra_gated_dir, cd99_bright: float = CD99_BRIGHT,
-                 immune_min_norm: float = 2.0):
-    """Type every cell in one donor by the deterministic 7-class hierarchy (zero Unassigned).
+def _pos_norm_getters(g: pd.DataFrame):
+    """Return (pos, norm) closures giving `{m}_pos` (bool) / `{m}_norm` (float) for any marker, with
+    all-False / 0.0 fallbacks for a marker absent from this donor's gated parquet (e.g. batch-specific)."""
+    n = len(g)
+    zeros_b = np.zeros(n, bool)
+    zeros_f = np.zeros(n, np.float64)
 
-    Returns (out_df, mfrac) where mfrac is the {INS,GCG} marker-positivity fraction (% of ALL cells)
-    for the disease-trend panel (the Endocrine lineage lumps INS|GCG|SST|CD99, masking β-loss).
-    """
+    def pos(m: str) -> np.ndarray:
+        c = f"{m}_pos"
+        return g[c].fillna(False).to_numpy(bool) if c in g.columns else zeros_b
+
+    def norm(m: str) -> np.ndarray:
+        c = f"{m}_norm"
+        return g[c].fillna(0.0).to_numpy(np.float64) if c in g.columns else zeros_f
+
+    return pos, norm
+
+
+def _cell_types(compartment: np.ndarray, pos, norm) -> np.ndarray:
+    """Finer sub-split within each compartment (secondary annotation). Later writes win, so within a
+    compartment the more-specific / higher-priority identity overrides a co-positive lower one."""
+    n = len(compartment)
+    ct = compartment.astype("<U24").copy()
+
+    # --- Epithelial: endocrine (hormone+) vs exocrine (hormone-) ---
+    epi = compartment == "Epithelial"
+    horm = np.zeros(n, bool)
+    for m in ENDOCRINE_MARKERS:
+        horm |= pos(m)
+    exo = epi & ~horm
+    ct[exo] = "Exocrine"
+    ct[exo & (pos("Keratin_5") | pos("TP63"))] = "Exocrine-ductal"
+    endo = epi & horm
+    # endocrine subtype by dominant hormone _norm: beta = INS, alpha = GCG, delta = SST
+    # (IAPP removed 2026-07-10 — failed marker; beta was max(INS, IAPP))
+    beta = norm("INS")
+    sub = np.array(["Endocrine-beta", "Endocrine-alpha", "Endocrine-delta"])[
+        np.argmax(np.vstack([beta, norm("GCG"), norm("SST")]).T, axis=1)]
+    ct[endo] = sub[endo]
+
+    # --- Endothelial: vascular vs lymphatic (Podoplanin+) ---
+    eth = compartment == "Endothelial"
+    ct[eth] = "Endothelial-vascular"
+    ct[eth & pos("Podoplanin")] = "Endothelial-lymphatic"
+
+    # --- Neural ---
+    ct[compartment == "Neural"] = "Neural"
+
+    # --- Immune (last-write-wins precedence: myeloid -> B/Plasma -> NK -> T, so lymphoid identity wins) ---
+    imm = compartment == "Immune"
+    ct[imm] = "Immune-other"
+    ct[imm & (pos("CD11c") | pos("CD209"))] = "DC"
+    ct[imm & (pos("CD68") | pos("CD163") | pos("CD206") | pos("Iba1"))] = "Macrophage"
+    ct[imm & pos("MPO")] = "Neutrophil"
+    b = imm & (pos("CD20") | pos("CD79a"))
+    ct[b] = "B"
+    ct[b & pos("CD38")] = "Plasma"                                   # CD38 is batch-1 only -> no Plasma in batch-2
+    ct[imm & pos("CD56") & pos("CD57") & ~pos("CD3e")] = "NK"
+    ct[imm & pos("CD3e")] = "T"
+
+    # --- Mesenchymal: fibroblast (Vimentin) then muscle (SMA wins — claimed first in the ordered gate) ---
+    mes = compartment == "Mesenchymal"
+    ct[mes & pos("Vimentin")] = "Fibroblast"
+    ct[mes & pos("SMA")] = "Muscle"
+
+    return ct
+
+
+def assign_donor(donor: str, gated_f: str, cells_dir):
+    """Type every cell in one donor by the ordered residual gating tree (+ Other).
+
+    Returns (out_df, mfrac) where mfrac is the {INS,GCG} positivity fraction (% of ALL cells) for the
+    disease-trend panel (the Endocrine sub-branch lumps the hormones, masking beta-loss)."""
     g = pd.read_parquet(gated_f)
-    # merge the separately-gated B3TUBB/CD99/MPO (Neural/Endocrine/Immune markers) by object_id;
-    # keeps the validated 10-marker gates untouched. NaN (a cell absent from the extra run) → not-pos.
-    ex_cols = ["object_id"] + [f"{m}_{s}" for m in EXTRA_MARKERS for s in ("pos", "norm")]
-    ex_f = Path(extra_gated_dir) / f"donor_id={donor}" / "data_0.parquet"
-    if not ex_f.exists():
-        raise FileNotFoundError(
-            f"extra-gated markers missing for donor {donor}: {ex_f}\n"
-            f"run the extra RESTORE pass first (`restore --extra`, i.e. the 'restore_extra' stage)")
-    ex = pd.read_parquet(ex_f, columns=ex_cols)
-    # cast BOTH object_id columns to str so the merge key dtype matches regardless of how each parquet
-    # stored it (pandas 'string' vs object) — otherwise the merge can mis-match or raise.
     g["object_id"] = g["object_id"].astype(str)
-    g = g.merge(ex.astype({"object_id": str}), on="object_id", how="left")
-    for m in EXTRA_MARKERS:
-        g[f"{m}_pos"] = g[f"{m}_pos"].fillna(False).astype(bool)
-        g[f"{m}_norm"] = g[f"{m}_norm"].fillna(0.0)
-    # CD99 is broad; the standard mean+3σ gate over-calls a non-islet population. Keep only BRIGHT CD99
-    # (>= cd99_bright × the per-image RESTORE threshold) — validated islet-coherent (marker_taxonomy).
-    g["CD99_pos"] = g["CD99_norm"] >= cd99_bright
-    # MPO (neutrophils, folded into Immune): gate at the immune floor K — same RESTORE marginal-positive
-    # shoulder as CD3e/CD20/CD163 (which are floored upstream in the hormone_floor stage); MPO lives in
-    # the extra dir so it is floored here in-script instead.
-    g["MPO_pos"] = g["MPO_norm"] >= immune_min_norm
+    pos, norm = _pos_norm_getters(g)
+    n = len(g)
 
-    norm = {m: g[f"{m}_norm"].to_numpy(np.float64) for ms in LINEAGES.values() for m in ms}
-    pos = {m: g[f"{m}_pos"].to_numpy(bool) for ms in LINEAGES.values() for m in ms}
-    scores = {L: np.max([norm[m] for m in LINEAGES[L]], axis=0) for L in LNAMES}
+    # ordered residual gating: first matching compartment claims the cell; the rest -> Other.
+    compartment = np.array([OTHER_LABEL] * n, dtype="<U16")   # "Endothelial"/"Mesenchymal" = 11 chars
+    assigned = np.zeros(n, bool)
+    for comp in COMPARTMENT_ORDER:
+        hit = np.zeros(n, bool)
+        for m in COMPARTMENT_GATES[comp]:
+            hit |= pos(m)
+        if comp == "Immune":
+            # NK cells express NONE of the 10 canonical immune markers, so add the CD56+CD57+ gate to pull
+            # them into Immune (they are NOT an "Other" gap per the user). Safe here: epithelial + neural
+            # (the CD56 confounders) are already removed by this point in the residual. Sub-typed "NK".
+            hit |= (pos("CD56") & pos("CD57"))
+        take = (~assigned) & hit
+        compartment[take] = comp
+        assigned |= take
 
-    # structural background: argmax over Pan_Cytokeratin / Vimentin / SMA _norm
-    struct = np.vstack([scores[L] for L in STRUCT]).T            # N x 3
-    sorder = np.argsort(-struct, axis=1)
-    # dtype "<U16" so longer labels ("Endothelial") are not silently truncated by the
-    # narrow fixed width of np.array(STRUCT) (longest structural name = "Epithelial", 10 chars).
-    struct_call = np.array(STRUCT)[sorder[:, 0]].astype("<U16")
-    ss = np.take_along_axis(struct, sorder, axis=1)
-    struct_margin = ss[:, 0] - ss[:, 1]
-    # cells below every structural threshold → Epithelial (validated background acinar).
-    struct_pos = pos["Pan_Cytokeratin"] | pos["Vimentin"] | pos["SMA"]
-    struct_call[~struct_pos] = "Epithelial"
-
-    # hierarchy: specific _pos lineages take precedence over the structural background.
-    endocrine = pos["INS"] | pos["GCG"] | pos["SST"] | pos["CD99"]
-    immune = pos["CD3e"] | pos["CD20"] | pos["CD163"] | pos["MPO"]   # +MPO (neutrophils folded in)
-    endoth = pos["CD31"]
-    neural = pos["B3TUBB"]
-    broad = struct_call.copy()
-    margin = struct_margin.astype(np.float64)
-    broad[neural] = "Neural";          margin[neural] = scores["Neural"][neural] - 1.0
-    broad[endoth] = "Endothelial";     margin[endoth] = scores["Endothelial"][endoth] - 1.0
-    broad[immune] = "Immune";          margin[immune] = scores["Immune"][immune] - 1.0
-    broad[endocrine] = "Endocrine";    margin[endocrine] = scores["Endocrine"][endocrine] - 1.0
-    specific = endocrine | immune | endoth | neural
-    epi_default = (~specific) & (~struct_pos)   # epithelial by background (validated), flagged for Step-2
+    cell_type = _cell_types(compartment, pos, norm)
 
     out = pd.DataFrame({"object_id": g["object_id"].astype(str), "donor_id": donor,
-                        "broad_lineage": broad, "assign_margin": margin.astype(np.float32),
-                        "epi_default": epi_default})
-    for L in LNAMES:
-        out[f"score_{L}"] = scores[L].astype(np.float32)
-    # attach cell_region / islet_num for downstream
+                        "compartment": compartment, "cell_type": cell_type})
+    # attach cell_region / islet_num for downstream (spatial / drill-down)
     cf = sorted(glob.glob(str(Path(cells_dir) / f"donor_id={donor}" / "*.parquet")))
     if cf:
         ctx = pd.read_parquet(cf[0], columns=["object_id", "cell_region", "islet_num"])
         out = out.merge(ctx.astype({"object_id": str}), on="object_id", how="left")
-    # β/α positivity fractions (% of ALL cells) — the Endocrine lineage lumps INS|GCG|SST|CD99, so it
-    # masks β-loss (INS↓) behind α-persistence (GCG↑); track them apart for the disease-trend panel.
-    mfrac = {"INS": 100 * pos["INS"].mean(), "GCG": 100 * pos["GCG"].mean()}
+    mfrac = {"INS": 100 * pos("INS").mean(), "GCG": 100 * pos("GCG").mean()}
     return out, mfrac
 
 
-def _assign_and_write(donor: str, gated_dir: str, cells_dir: str, extra_gated_dir: str,
-                      out_dir: str, cd99_bright: float, immune_min_norm: float) -> dict:
+def _assign_and_write(donor: str, gated_dir: str, cells_dir: str, out_dir: str) -> dict:
     """Worker: assign one donor, write its partition, return composition + marker-fraction summary."""
     gf = sorted(glob.glob(str(Path(gated_dir) / f"donor_id={donor}" / "*.parquet")))
     if not gf:
         return {}
-    out, mfrac = assign_donor(donor, gf[0], cells_dir, extra_gated_dir, cd99_bright, immune_min_norm)
+    out, mfrac = assign_donor(donor, gf[0], cells_dir)
     dst = Path(out_dir) / f"donor_id={donor}"
     dst.mkdir(parents=True, exist_ok=True)
     out.to_parquet(dst / "data_0.parquet", index=False)
-    vc = out["broad_lineage"].value_counts()
-    comp = (vc / len(out) * 100).reindex(LNAMES).fillna(0)
-    n = len(out); weak = int(out["epi_default"].sum())
-    print(f"[{donor}] {n:,} cells | " + " ".join(f"{LINEAGE_ABBR[L]}={comp[L]:.0f}%" for L in LNAMES) +
-          f" | epi_default={100*weak/n:.1f}% | Unassigned=0", flush=True)
-    return {"donor": donor, "comp": comp.to_dict(), "mfrac": mfrac, "n": n, "weak": weak}
+    vc = out["compartment"].value_counts()
+    comp = (vc / len(out) * 100).reindex(CLASSES).fillna(0)
+    n = len(out); other = int((out["compartment"] == OTHER_LABEL).sum())
+    print(f"[{donor}] {n:,} cells | " + " ".join(f"{COMPARTMENT_ABBR[c]}={comp[c]:.0f}%" for c in CLASSES) +
+          f" | Other={100*other/n:.1f}%", flush=True)
+    return {"donor": donor, "comp": comp.to_dict(), "mfrac": mfrac, "n": n, "other": other}
 
 
 def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFrame:
-    """Assign broad lineage for all donors (parallel), write partitions + composition figure."""
+    """Assign compartments for all donors (parallel), write partitions + composition figure."""
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
     cfg.broad_dir.mkdir(parents=True, exist_ok=True)
     donor_ids = donors or cfg.discover_donors(cfg.restore_gated_dir)
@@ -185,29 +197,26 @@ def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFram
         raise SystemExit(f"[err] no gated donors under {cfg.restore_gated_dir}")
 
     fn = functools.partial(_assign_and_write, gated_dir=str(cfg.restore_gated_dir),
-                           cells_dir=str(cfg.cells_dir), extra_gated_dir=str(cfg.restore_gated_extra_dir),
-                           out_dir=str(cfg.broad_dir), cd99_bright=float(cfg.cd99_bright),
-                           immune_min_norm=float(cfg.immune_min_norm))
+                           cells_dir=str(cfg.cells_dir), out_dir=str(cfg.broad_dir))
     results = [r for r in map_donors(fn, donor_ids, n_jobs=n_jobs, ordered=True) if r]
     if not results:
         raise SystemExit("[err] no donors assigned")
 
     smap = status_map(cfg)
-    comp = {r["donor"]: pd.Series(r["comp"]).reindex(LNAMES).fillna(0) for r in results}
+    comp = {r["donor"]: pd.Series(r["comp"]).reindex(CLASSES).fillna(0) for r in results}
     mfracs = {r["donor"]: r["mfrac"] for r in results}
     n_total = sum(r["n"] for r in results)
-    weak_total = sum(r["weak"] for r in results)
+    other_total = sum(r["other"] for r in results)
     C = pd.DataFrame(comp).T
     C["status"] = [smap.get(d, "?") for d in C.index]
     M = pd.DataFrame(mfracs).T
     M["status"] = [smap.get(d, "?") for d in M.index]
-    print(f"\n[total] {n_total:,} cells, 0 Unassigned, "
-          f"{100*weak_total/max(n_total,1):.1f}% epithelial-by-background "
-          "(sub-threshold but confirmed epithelial via Ker8_18; resolved in Step 2)")
+    print(f"\n[total] {n_total:,} cells, {100*other_total/max(n_total,1):.1f}% Other "
+          "(failed every gate — real panel gaps, NOT force-assigned)")
 
     _composition_figure(C, M, cfg.phenotype_dir / "broad_lineage_composition.png")
     print("\ncomposition by status (mean %):")
-    print(C.groupby("status")[LNAMES].mean().reindex(STATUS_ORDER).round(1).to_string())
+    print(C.groupby("status")[CLASSES].mean().reindex(STATUS_ORDER).round(1).to_string())
     print("\ndisease trend (mean % of cells positive, by status):")
     print(pd.concat([M.groupby("status")[["INS", "GCG"]].mean(),
                      C.groupby("status")["Immune"].mean()], axis=1)
@@ -216,8 +225,8 @@ def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFram
 
 
 def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
-    """Per-donor stacked composition (broken y-axis) + per-lineage boxplots by disease status with
-    non-parametric stats.  Faithful port of the upstream assign_broad_lineage.py figure."""
+    """Per-donor stacked composition (broken y-axis) + per-compartment boxplots by disease status with
+    non-parametric stats. Units of replication are donors, not cells."""
     plt.rcParams.update({"font.size": 15, "xtick.labelsize": 14, "ytick.labelsize": 14,
                          "axes.titlesize": 17, "axes.labelsize": 16, "legend.fontsize": 14})
     _rank = {s: i for i, s in enumerate(STATUS_ORDER)}
@@ -225,8 +234,7 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     SLABEL = {"ND": "ND", "AAB": "Aab+", "T1D": "T1D"}
     SCOL = {"ND": "#4477AA", "AAB": "#CC6633", "T1D": "#228833"}   # Paul-Tol status colours
     present_status = [s for s in STATUS_ORDER if (C["status"] == s).any()]
-    # per-donor % for each (status, lineage) — the units of replication are donors, not cells.
-    gdata = {s: {L: C.loc[C["status"] == s, L].to_numpy(np.float64) for L in LNAMES} for s in present_status}
+    gdata = {s: {L: C.loc[C["status"] == s, L].to_numpy(np.float64) for L in CLASSES} for s in present_status}
     PAIRS = [(present_status[i], present_status[j])
              for i in range(len(present_status)) for j in range(i + 1, len(present_status))]
 
@@ -236,23 +244,22 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
             kw = dict(transform=ax_.transAxes, color="k", clip_on=False, lw=1)
             ax_.plot((-d, +d), ys, **kw); ax_.plot((1 - d, 1 + d), ys, **kw)
 
-    # ---- statistics: per-lineage Kruskal–Wallis omnibus (BH across lineages), then pairwise
-    #      Mann–Whitney U (BH across all lineage×pair tests). Non-parametric: small, unequal n and
-    #      genuinely non-normal per-donor composition. Brackets drawn only where the omnibus survives.
+    # ---- statistics: per-compartment Kruskal-Wallis omnibus (BH across compartments), then pairwise
+    #      Mann-Whitney U (BH across all compartment x pair tests). Brackets only where omnibus survives.
     omni_p = {}
-    for L in LNAMES:
+    for L in CLASSES:
         arrs = [gdata[s][L] for s in present_status if len(gdata[s][L]) > 0]
         try:
             omni_p[L] = float(kruskal(*arrs).pvalue) if len(arrs) >= 2 else np.nan
         except ValueError:      # all values identical across groups
             omni_p[L] = np.nan
-    _Lok = [L for L in LNAMES if np.isfinite(omni_p[L])]
-    omni_q = {L: np.nan for L in LNAMES}
+    _Lok = [L for L in CLASSES if np.isfinite(omni_p[L])]
+    omni_q = {L: np.nan for L in CLASSES}
     if _Lok:
         omni_q.update(dict(zip(_Lok, multipletests([omni_p[L] for L in _Lok], method="fdr_bh")[1])))
 
-    pw = []   # (lineage, a, b, p)
-    for L in LNAMES:
+    pw = []   # (compartment, a, b, p)
+    for L in CLASSES:
         for a, b in PAIRS:
             xa, xb = gdata[a][L], gdata[b][L]
             try:
@@ -277,15 +284,15 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     outer = fig.add_gridspec(1, 2, width_ratios=[1.05, 1.95], wspace=0.13)
     gsA = outer[0].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.06)
     a_top, a_bot = fig.add_subplot(gsA[0]), fig.add_subplot(gsA[1])
-    gsB = outer[1].subgridspec(2, 4, hspace=0.62, wspace=0.34)
-    bax = {L: fig.add_subplot(gsB[i // 4, i % 4]) for i, L in enumerate(LNAMES)}
+    gsB = outer[1].subgridspec(2, 3, hspace=0.62, wspace=0.34)
+    bax = {L: fig.add_subplot(gsB[i // 3, i % 3]) for i, L in enumerate(CLASSES)}
 
     # A: per-donor stacked composition — split y-axis (Epithelial dominates the low range; the split
-    # expands the top so the minority lineages are legible). Ordered ND→Aab+→T1D.
+    # expands the top so the minority compartments are legible). Ordered ND->Aab+->T1D.
     xA = np.arange(len(Cs)); bottom = np.zeros(len(Cs)); handles = []
-    for L in LNAMES:
-        h = a_top.bar(xA, Cs[L], bottom=bottom, color=LINEAGE_COLORS[L], width=0.85)
-        a_bot.bar(xA, Cs[L], bottom=bottom, color=LINEAGE_COLORS[L], width=0.85)
+    for L in CLASSES:
+        h = a_top.bar(xA, Cs[L], bottom=bottom, color=COMPARTMENT_COLORS[L], width=0.85)
+        a_bot.bar(xA, Cs[L], bottom=bottom, color=COMPARTMENT_COLORS[L], width=0.85)
         bottom += Cs[L].to_numpy(); handles.append(h)
     a_hi = max(15.0, float(np.floor(Cs["Epithelial"].min())) - 4)      # break below the lowest Epithelial
     a_top.set_ylim(a_hi, 100); a_bot.set_ylim(0, 8)
@@ -294,9 +301,9 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     a_bot.set_xticks(xA)   # rotate donor labels vertical so many large labels never overlap
     a_bot.set_xticklabels([f"{d}  {Cs.loc[d,'status']}" for d in Cs.index], rotation=90, fontsize=12)
 
-    # B: per-lineage box plots by disease status — box = median/IQR, diamond = mean ± SEM, dots =
+    # B: per-compartment box plots by disease status — box = median/IQR, diamond = mean +/- SEM, dots =
     # individual donors (deterministic jitter). Significant pairwise differences bracketed above.
-    for L in LNAMES:
+    for L in CLASSES:
         ax = bax[L]
         data = [gdata[s][L] for s in present_status]
         bp = ax.boxplot(data, positions=list(range(len(present_status))), widths=0.6,
@@ -318,9 +325,9 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
                         capsize=4, elinewidth=1.4, zorder=4)
         ax.set_xticks(range(len(present_status)))
         ax.set_xticklabels([SLABEL[s] for s in present_status], fontsize=12)
-        if LNAMES.index(L) % 4 == 0:
+        if CLASSES.index(L) % 3 == 0:
             ax.set_ylabel("% of cells", fontsize=13)
-        ax.set_title(L, fontsize=14, color=LINEAGE_COLORS[L])
+        ax.set_title(L, fontsize=14, color=COMPARTMENT_COLORS[L])
 
         allv = np.concatenate([d for d in data if len(d)]) if any(len(d) for d in data) else np.array([0.0, 1.0])
         lo, hi = float(allv.min()), float(allv.max())
@@ -342,19 +349,19 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     ap_t, ap_b = a_top.get_position(), a_bot.get_position()
     fig.text(ap_t.x0 - 0.032, (ap_b.y0 + ap_t.y1) / 2, "% of cells",
              rotation="vertical", va="center", ha="center", fontsize=16)
-    a_bot.legend(handles=handles, labels=LNAMES, loc="upper center", ncol=4,
+    a_bot.legend(handles=handles, labels=CLASSES, loc="upper center", ncol=3,
                  fontsize=13, frameon=False, bbox_to_anchor=(0.5, -0.9))
     ap = a_top.get_position()
-    bp0 = bax[LNAMES[0]].get_position(); bp3 = bax[LNAMES[3]].get_position()
+    bp0 = bax[CLASSES[0]].get_position(); bp2 = bax[CLASSES[2]].get_position()
     ty = ap.y1 + 0.05
-    fig.text((ap.x0 + ap.x1) / 2, ty, "Broad-lineage composition per donor",
+    fig.text((ap.x0 + ap.x1) / 2, ty, "Compartment composition per donor",
              ha="center", va="bottom", fontsize=17)
-    fig.text((bp0.x0 + bp3.x1) / 2, ty, "Composition by disease status (per-donor)",
+    fig.text((bp0.x0 + bp2.x1) / 2, ty, "Composition by disease status (per-donor)",
              ha="center", va="bottom", fontsize=17)
-    fig.text((bp0.x0 + bp3.x1) / 2, 0.045,
-             "Box = median/IQR · whiskers = range · diamond = mean ± SEM · dots = donors.",
+    fig.text((bp0.x0 + bp2.x1) / 2, 0.045,
+             "Box = median/IQR . whiskers = range . diamond = mean +/- SEM . dots = donors.",
              ha="center", va="center", fontsize=11)
-    fig.suptitle("Cell Phenotyping Stage 1: Broad Lineages", fontsize=20, y=1.0)
+    fig.suptitle("Cell Phenotyping: 5 compartments + Other (ordered residual gating)", fontsize=20, y=1.0)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[saved] {path}")

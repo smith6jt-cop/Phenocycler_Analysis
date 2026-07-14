@@ -1,139 +1,136 @@
-"""Unit tests for the deterministic 7-class broad-lineage hierarchy (zero Unassigned)."""
+"""Unit tests for the 5-compartment ordered-residual phenotyping (+ explicit Other)."""
 
 from __future__ import annotations
 
 import pandas as pd
 
 from phenocycler import lineage
-from phenocycler.config import LINEAGES, EXTRA_MARKERS
+from phenocycler.config import COMPARTMENT_ORDER, OTHER_LABEL
 
-# Markers gated in the MAIN restore_gated_redsea pass vs the EXTRA pass (CD99/B3TUBB/MPO, merged by
-# object_id at assignment time).
-MAIN_MARKERS = [m for ms in LINEAGES.values() for m in ms if m not in EXTRA_MARKERS]
+CLASSES = COMPARTMENT_ORDER + [OTHER_LABEL]
 
 
 def _write(tmp_path, rows):
-    """Write main-gated + extra-gated + cells partitions for donor TEST from per-cell dicts.
-
-    Each row: {"id": str, <marker>: (pos: bool, norm: float), ...}. A marker in EXTRA_MARKERS is
-    routed to the extra-gated frame; all others to the main-gated frame. Unset -> (False, 0.0).
-    """
+    """Write ONE restore_gated parquet (all markers) + a cells partition for donor TEST.
+    row = {"id": str, <marker>: (pos: bool, norm: float), ...}; an unset marker -> (False, 0.0)."""
     ids = [r["id"] for r in rows]
-
-    def _frame(markers):
-        d = {"object_id": ids}
-        for m in markers:
-            d[f"{m}_pos"] = [bool(r.get(m, (False, 0.0))[0]) for r in rows]
-            d[f"{m}_norm"] = [float(r.get(m, (False, 0.0))[1]) for r in rows]
-        return pd.DataFrame(d)
-
+    markers = sorted({m for r in rows for m in r if m != "id"})
+    d = {"object_id": [str(i) for i in ids]}
+    for m in markers:
+        d[f"{m}_pos"] = [bool(r.get(m, (False, 0.0))[0]) for r in rows]
+        d[f"{m}_norm"] = [float(r.get(m, (False, 0.0))[1]) for r in rows]
     gdir = tmp_path / "restore_gated_redsea" / "donor_id=TEST"; gdir.mkdir(parents=True)
-    gf = gdir / "data_0.parquet"; _frame(MAIN_MARKERS).to_parquet(gf, index=False)
-    xdir = tmp_path / "restore_gated_redsea_extra" / "donor_id=TEST"; xdir.mkdir(parents=True)
-    _frame(EXTRA_MARKERS).to_parquet(xdir / "data_0.parquet", index=False)
+    gf = gdir / "data_0.parquet"; pd.DataFrame(d).to_parquet(gf, index=False)
     cdir = tmp_path / "cells" / "donor_id=TEST"; cdir.mkdir(parents=True)
     pd.DataFrame({"object_id": [str(i) for i in ids], "cell_region": "tissue",
                   "islet_num": ""}).to_parquet(cdir / "data_0.parquet", index=False)
-    return str(gf), tmp_path / "cells", tmp_path / "restore_gated_redsea_extra"
+    return str(gf), tmp_path / "cells"
 
 
-def _assign(tmp_path, rows, cd99_bright=3.0, immune_min_norm=2.0):
-    gf, cells_dir, extra_dir = _write(tmp_path, rows)
-    out, _ = lineage.assign_donor("TEST", gf, cells_dir, extra_dir,
-                                  cd99_bright=cd99_bright, immune_min_norm=immune_min_norm)
+def _assign(tmp_path, rows):
+    gf, cells_dir = _write(tmp_path, rows)
+    out, _ = lineage.assign_donor("TEST", gf, cells_dir)
     return out
 
 
-def test_hierarchy_and_zero_unassigned(tmp_path):
+def test_priority_order_and_other(tmp_path):
     rows = [
-        {"id": "e",   "INS": (True, 5.0)},                                  # Endocrine
-        {"id": "i",   "CD3e": (True, 4.0)},                                 # Immune
-        {"id": "v",   "CD31": (True, 3.0)},                                 # Endothelial
-        {"id": "mpo", "MPO": (False, 4.0)},                                 # Immune (MPO folded in, norm>=2)
-        {"id": "nrl", "B3TUBB": (True, 4.0)},                               # Neural
-        {"id": "cd99", "CD99": (False, 5.0)},                              # Endocrine (bright CD99)
-        {"id": "epi", "Pan_Cytokeratin": (False, 0.9),
-                      "Vimentin": (False, 0.1), "SMA": (False, 0.1)},       # Epithelial by default
-        {"id": "fib", "Vimentin": (True, 2.0),
-                      "Pan_Cytokeratin": (False, 0.5), "SMA": (False, 0.3)},# Fibroblast (struct argmax)
-        {"id": "mus", "SMA": (True, 3.0),
-                      "Pan_Cytokeratin": (False, 0.5), "Vimentin": (False, 0.3)},  # Muscle
-        {"id": "e_over_i", "INS": (True, 5.0), "CD3e": (True, 9.0)},        # Endocrine > Immune
-        {"id": "i_over_v", "CD3e": (True, 4.0), "CD31": (True, 9.0)},       # Immune > Endothelial
-        {"id": "mpo_over_nrl", "MPO": (False, 5.0), "B3TUBB": (True, 9.0)}, # Immune (MPO) > Neural
-        {"id": "endo_over_mpo", "INS": (True, 5.0), "MPO": (False, 9.0)},   # Endocrine > Immune (MPO)
-        {"id": "imm_over_nrl", "CD3e": (True, 3.0), "B3TUBB": (True, 9.0)}, # Immune > Neural
+        {"id": "epi", "E_cadherin": (True, 3)},
+        {"id": "eth", "CD31": (True, 3)},
+        {"id": "nrl", "B3TUBB": (True, 3)},
+        {"id": "imm", "CD3e": (True, 3)},
+        {"id": "mus", "SMA": (True, 3)},
+        {"id": "fib", "Vimentin": (True, 3)},
+        {"id": "other"},                                                 # nothing positive -> Other
+        {"id": "epi>eth", "E_cadherin": (True, 3), "CD31": (True, 9)},    # Epithelial wins
+        {"id": "eth>mes", "CD31": (True, 3), "SMA": (True, 9)},           # Endothelial > Mesenchymal
+        {"id": "nrl>mes", "B3TUBB": (True, 3), "Vimentin": (True, 9)},    # Neural > Mesenchymal
+        {"id": "imm>mes", "CD3e": (True, 3), "Vimentin": (True, 9)},      # Immune > Mesenchymal
     ]
     out = _assign(tmp_path, rows)
-    call = dict(zip(out["object_id"], out["broad_lineage"]))
-    assert call["e"] == "Endocrine"
-    assert call["i"] == "Immune"
-    assert call["v"] == "Endothelial"
-    assert call["mpo"] == "Immune"
-    assert call["nrl"] == "Neural"
-    assert call["cd99"] == "Endocrine"
-    assert call["epi"] == "Epithelial"
-    assert call["fib"] == "Fibroblast"
-    assert call["mus"] == "Muscle"
-    assert call["e_over_i"] == "Endocrine"
-    assert call["i_over_v"] == "Immune"
-    assert call["mpo_over_nrl"] == "Immune"
-    assert call["endo_over_mpo"] == "Endocrine"
-    assert call["imm_over_nrl"] == "Immune"
-
-    # core invariant: every cell typed into one of the seven lineages; zero Unassigned; no Neutrophil
-    assert set(out["broad_lineage"]).issubset(set(LINEAGES))
-    assert "Neutrophil" not in set(out["broad_lineage"])
-    assert (out["broad_lineage"] == "Unassigned").sum() == 0
-    assert len(out) == len(rows)
+    c = dict(zip(out["object_id"], out["compartment"]))
+    assert c["epi"] == "Epithelial"
+    assert c["eth"] == "Endothelial"
+    assert c["nrl"] == "Neural"
+    assert c["imm"] == "Immune"
+    assert c["mus"] == "Mesenchymal" and c["fib"] == "Mesenchymal"
+    assert c["other"] == "Other"
+    assert c["epi>eth"] == "Epithelial"
+    assert c["eth>mes"] == "Endothelial"
+    assert c["nrl>mes"] == "Neural"
+    assert c["imm>mes"] == "Immune"
+    assert set(c.values()).issubset(set(CLASSES))
 
 
-def test_cd99_bright_gate(tmp_path):
-    """Only bright CD99 (_norm >= cd99_bright) is Endocrine; dim CD99 falls to the structural call."""
+def test_other_terminal_not_force_assigned(tmp_path):
+    out = _assign(tmp_path, [{"id": "x", "CD44": (True, 5)},              # state marker, no gate
+                             {"id": "y"}]).set_index("object_id")
+    assert out.loc["x", "compartment"] == "Other" and out.loc["x", "cell_type"] == "Other"
+    assert out.loc["y", "compartment"] == "Other"
+
+
+def test_endocrine_vs_exocrine_subsplit(tmp_path):
     rows = [
-        {"id": "bright", "CD99": (False, 5.0)},                             # Endocrine
-        {"id": "dim", "CD99": (False, 2.0), "Vimentin": (True, 2.0)},       # Fibroblast (CD99 too dim)
-    ]
-    out = _assign(tmp_path, rows, cd99_bright=3.0).set_index("object_id")
-    assert out.loc["bright", "broad_lineage"] == "Endocrine"
-    assert out.loc["dim", "broad_lineage"] == "Fibroblast"
-
-
-def test_mpo_immune_gate(tmp_path):
-    """MPO folds into Immune, gated at immune_min_norm: bright MPO -> Immune, dim MPO -> structural."""
-    rows = [
-        {"id": "bright", "MPO": (False, 5.0)},                              # Immune (MPO_norm >= 2)
-        {"id": "dim", "MPO": (False, 1.2), "Vimentin": (True, 2.0)},        # Fibroblast (MPO too dim)
-    ]
-    out = _assign(tmp_path, rows, immune_min_norm=2.0).set_index("object_id")
-    assert out.loc["bright", "broad_lineage"] == "Immune"
-    assert out.loc["dim", "broad_lineage"] == "Fibroblast"
-
-
-def test_epi_default_flag(tmp_path):
-    """Cells positive for no structural marker are Epithelial-by-default and flagged."""
-    rows = [
-        {"id": "weak", "Pan_Cytokeratin": (False, 0.2),
-                       "Vimentin": (False, 0.1), "SMA": (False, 0.05)},
-        {"id": "strongvim", "Vimentin": (True, 2.0)},
+        {"id": "beta", "E_cadherin": (True, 3), "INS": (True, 8)},
+        {"id": "alpha", "E_cadherin": (True, 3), "GCG": (True, 8)},
+        {"id": "delta", "E_cadherin": (True, 3), "SST": (True, 8)},
+        {"id": "iapp_only", "E_cadherin": (True, 3), "IAPP": (True, 8)},   # IAPP dropped 2026-07-10 -> hormone-neg
+        {"id": "exo", "E_cadherin": (True, 3)},
+        {"id": "ductal", "E_cadherin": (True, 3), "Keratin_5": (True, 4)},
     ]
     out = _assign(tmp_path, rows).set_index("object_id")
-    assert bool(out.loc["weak", "epi_default"]) is True
-    assert out.loc["weak", "broad_lineage"] == "Epithelial"
-    assert bool(out.loc["strongvim", "epi_default"]) is False
+    assert (out["compartment"] == "Epithelial").all()
+    assert out.loc["beta", "cell_type"] == "Endocrine-beta"
+    assert out.loc["alpha", "cell_type"] == "Endocrine-alpha"
+    assert out.loc["delta", "cell_type"] == "Endocrine-delta"
+    assert out.loc["iapp_only", "cell_type"] == "Exocrine"   # IAPP no longer an endocrine marker -> hormone-neg Epithelial
+    assert out.loc["exo", "cell_type"] == "Exocrine"
+    assert out.loc["ductal", "cell_type"] == "Exocrine-ductal"
+
+
+def test_immune_subtypes_incl_nk(tmp_path):
+    rows = [
+        {"id": "t", "CD3e": (True, 3)},
+        {"id": "b", "CD20": (True, 3)},
+        {"id": "mac", "CD68": (True, 3)},
+        {"id": "neut", "MPO": (True, 3)},
+        {"id": "dc", "CD11c": (True, 3)},
+        {"id": "nk", "CD56": (True, 3), "CD57": (True, 3)},              # CD3e- -> NK, must ENTER Immune
+    ]
+    out = _assign(tmp_path, rows).set_index("object_id")
+    assert (out["compartment"] == "Immune").all()
+    assert out.loc["t", "cell_type"] == "T"
+    assert out.loc["b", "cell_type"] == "B"
+    assert out.loc["mac", "cell_type"] == "Macrophage"
+    assert out.loc["neut", "cell_type"] == "Neutrophil"
+    assert out.loc["dc", "cell_type"] == "DC"
+    assert out.loc["nk", "cell_type"] == "NK"
+
+
+def test_mesenchymal_muscle_vs_fibroblast(tmp_path):
+    rows = [
+        {"id": "mus", "SMA": (True, 3)},
+        {"id": "fib", "Vimentin": (True, 3)},
+        {"id": "both", "SMA": (True, 3), "Vimentin": (True, 3)},         # SMA claimed first -> Muscle
+    ]
+    out = _assign(tmp_path, rows).set_index("object_id")
+    assert (out["compartment"] == "Mesenchymal").all()
+    assert out.loc["mus", "cell_type"] == "Muscle"
+    assert out.loc["fib", "cell_type"] == "Fibroblast"
+    assert out.loc["both", "cell_type"] == "Muscle"
 
 
 def test_long_labels_not_truncated(tmp_path):
-    """Guard the <U16 dtype bug: 'Endothelial' (11 chars) must survive intact."""
-    rows = [{"id": "v", "CD31": (True, 3.0)}]
-    out = _assign(tmp_path, rows).set_index("object_id")
-    assert out.loc["v", "broad_lineage"] == "Endothelial"    # not "Endothelia"
+    """Guard the fixed-width dtype: 'Endothelial'(11) compartment + 'Endothelial-lymphatic'(21) cell_type."""
+    out = _assign(tmp_path, [{"id": "l", "CD31": (True, 3), "Podoplanin": (True, 3)}]).set_index("object_id")
+    assert out.loc["l", "compartment"] == "Endothelial"
+    assert out.loc["l", "cell_type"] == "Endothelial-lymphatic"
 
 
-def test_score_columns_present(tmp_path):
-    """The 7 score_ columns exist; score_Neutrophil is absent (pipeline uses that to detect stale data)."""
-    out = _assign(tmp_path, [{"id": "e", "INS": (True, 5.0)}])
-    for L in LINEAGES:
-        assert f"score_{L}" in out.columns
-    assert "score_Neural" in out.columns
-    assert "score_Neutrophil" not in out.columns
+def test_output_schema(tmp_path):
+    """compartment + cell_type present; the old broad_lineage / score_ / epi_default are gone."""
+    out = _assign(tmp_path, [{"id": "e", "E_cadherin": (True, 3), "INS": (True, 5)}])
+    assert "compartment" in out.columns and "cell_type" in out.columns
+    assert "broad_lineage" not in out.columns
+    assert not any(c.startswith("score_") for c in out.columns)
+    assert "epi_default" not in out.columns

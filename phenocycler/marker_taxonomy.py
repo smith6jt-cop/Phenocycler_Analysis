@@ -12,8 +12,8 @@ of whatever type, never a cell type. So TYPE markers drive phenotyping and the i
 PROCESS markers drive within-lineage state axes (Phase 5) and are excluded from identity views.
 
 This module is the ONE place the TYPE/PROCESS split is defined so phenotyping and every plot agree.
-`DAPI` (nuclear stain — not a marker), `IAPP` (failed marker), and `Ker8_18`/`Keratin_5` (redundant
-epithelial keratins — `Pan_Cytokeratin` is the epithelial identity marker) are EXCLUDED from everything.
+`DAPI` (nuclear stain — not a marker) is EXCLUDED from everything. `Ker8_18`/`Keratin_5` (basal-ductal
+keratins) are now USED; `IAPP` FAILED (removed 2026-07-10 → EXCLUDED); `CD99` is a broad state marker (PROCESS), NOT a gate.
 
 NB: the *lineage-gate* set (the RESTORE-gated markers that actually drive ``lineage.py`` /
 ``assign_broad_lineage.py``) is a SUBSET of TYPE — e.g. FOXP3, Caveolin, CD66 are TYPE (shown in the
@@ -32,45 +32,39 @@ PROCESS = [
     "Beta_actin",                                               # housekeeping
     "CD44", "CD57",                                             # activation / senescence (weak identity)
     "CD38",                                                     # activation / plasma-cell state (batch-1 only)
+    "CD99",                                                     # broad (~96% detectable) — state marker, NOT a lineage gate
 ]
 
 # --- Never used for phenotyping OR any plot ---
-EXCLUDED = ["DAPI", "IAPP", "Ker8_18", "Keratin_5"]
+EXCLUDED = ["DAPI", "IAPP"]   # DAPI = nuclear stain; IAPP = failed marker (removed 2026-07-10). Ker8_18/Keratin_5 used; CD99 -> PROCESS
 
 # --- TYPE / lineage-identity markers: drive phenotyping and the identity heatmap ---
 # Ordered in CLASS BLOCKS following the heatmap row order (LIN_ORDER: Epithelial, Fibroblast, Muscle,
 # Neural, Endothelial, Endocrine, Immune) so the heatmap reads as a rough diagonal and
 # markers of the same class sit together (e.g. CD56 next to B3TUBB in the neural block).
+# Ordered in the 5 compartment blocks (Epithelial[+endocrine] / Endothelial / Neural / Immune / Mesenchymal)
+# so the identity heatmap reads as a rough diagonal.
 TYPE = [
-    # epithelial / exocrine (acinar + ductal)
-    "Pan_Cytokeratin", "EpCAM", "E_cadherin", "TP63", "CD66",
-    # fibroblast / mesenchyme
-    "Vimentin", "Collagen_IV",
-    # muscle / pericyte
-    "SMA",
-    # neural (CD56/NCAM groups with B3TUBB — both light up the Neural class)
-    "B3TUBB", "CD56",
-    # endothelial / vascular
+    # Epithelial — exocrine (acinar/ductal) incl. the basal-ductal keratins now in use
+    "E_cadherin", "Pan_Cytokeratin", "Ker8_18", "Keratin_5", "EpCAM", "TP63", "CD66",
+    #   endocrine sub-branch of Epithelial (hormones: beta INS, alpha GCG, delta SST; IAPP removed — failed)
+    "INS", "GCG", "SST",
+    # Endothelial / vascular (+ lymphatic Podoplanin, CD34)
     "CD31", "CD34", "Podoplanin", "Caveolin",
-    # endocrine
-    "INS", "GCG", "SST", "CD99",
-    # immune lineage / subtype (lymphoid then myeloid)
+    # Neural (CD56/NCAM groups with B3TUBB, but CD56 is promiscuous NK/neural/endocrine)
+    "B3TUBB", "CD56",
+    # Immune — lymphoid then myeloid then granulocyte
     "CD3e", "CD8", "CD4", "FOXP3", "CD20", "CD79a", "CD68", "CD163", "Iba1", "CD206",
-    "M2Gal3", "CD11c", "CD209", "CD11b",
-    # neutrophil / granulocyte (MPO — folded into the Immune class)
-    "MPO",
+    "M2Gal3", "CD11c", "CD209", "CD11b", "MPO",
+    # Mesenchymal / stromal
+    "SMA", "Vimentin", "Collagen_IV",
     # batch-2-only structural (present only in batch-2 donors; harmless if absent)
     "b_Catenin1",
 ]
 
-# CD99 is a lineage marker for Endocrine, but it is broadly expressed (~96% detectable), so the
-# standard RESTORE mean+3σ gate (CD99_norm ≥ 1) over-calls a spatially-diffuse, non-islet population.
-# CD99 marks the "other" endocrine cell types we lack specific markers for (PP/epsilon/EC), so we take
-# only BRIGHT CD99 = ≥ this multiple of the per-image RESTORE threshold. Validated (cohort-wide): at
-# ≥3× the hormone-negative CD99-bright cells are 36% islet-core / 42% core+peri — as islet-coherent as
-# INS/GCG/SST (37% core) and 11× enriched over baseline; the permissive ≥1 gate is 0.7× (diffuse).
-# NB: must equal PipelineConfig.cd99_bright (guarded by tests/test_config.py).
-CD99_BRIGHT = 3.0
+# CD99 is broadly expressed (~96% detectable) and NOT lineage-clean -> demoted to a state marker
+# (PROCESS above), no longer an Endocrine gate. Endocrine = E-cadherin+ epithelial that is hormone+
+# (INS/GCG/SST); the old bright-CD99 gate + CD99_BRIGHT constant are removed.
 
 _TYPE = set(TYPE)
 _PROCESS = set(PROCESS)
@@ -80,7 +74,7 @@ _EXCLUDED = set(EXCLUDED)
 def heatmap_markers(available):
     """Return the TYPE markers present in `available`, preserving TYPE order.
 
-    Drops PROCESS and EXCLUDED (DAPI/IAPP/Ker8_18/Keratin_5) markers. Warns about any available marker
+    Drops PROCESS and EXCLUDED (DAPI, IAPP) markers. Warns about any available marker
     that is not classified in TYPE/PROCESS/EXCLUDED, so a newly added panel channel is never silently
     shown.
     """

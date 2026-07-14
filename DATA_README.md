@@ -39,14 +39,12 @@ data/
 ├── cells_redsea/donor_id=<id>/data_0.parquet     # Step 2: REDSEA spillover-corrected means
 ├── restore_redsea/                               # Step 3: threshs.pkl, positive_fractions.csv, qc/
 ├── restore_thresholds_redsea.csv                 # Step 3: per-image KMeans/GMM/SSC thresholds (chosen flag)
-├── restore_gated_redsea/donor_id=<id>/data_0.parquet         # Step 3: {m}_pos/_norm/_log2r (10 markers)
-├── restore_gated_redsea_extra/donor_id=<id>/data_0.parquet   # Step 3 (extra): CD99/B3TUBB/MPO _pos/_norm
-├── restore_gated_redsea.pre_hormonefloor/                    # Step 4: un-floored backup, auto-created by hormone_floor on first run (rollback point)
+├── restore_gated_redsea/donor_id=<id>/data_0.parquet         # Step 3: {m}_pos/_norm/_log2r (all markers, one pass)
 ├── phenotype/
-│   ├── broad/donor_id=<id>/data_0.parquet        # Step 5: broad_lineage, assign_margin, epi_default, score_* (8)
-│   ├── broad_lineage_composition.png             # Step 5: composition + disease-trend figure
-│   ├── celltype_marker_dotplot.png / _heatmap.png# Step 7: identity QC figures
-│   └── qupath_class/pheno_class_<id>.csv         # Step 6: object_id, broad_lineage, image (for QuPath)
+│   ├── broad/donor_id=<id>/data_0.parquet        # Step 4: compartment (5 + Other), cell_type, object_id, donor_id
+│   ├── broad_lineage_composition.png             # Step 4: composition + disease-trend figure
+│   ├── celltype_marker_dotplot.png / _heatmap.png# Step 6: identity QC figures
+│   └── qupath_class/pheno_class_<id>.csv         # Step 5: object_id, compartment, cell_type, image (for QuPath)
 ├── redsea_reassess/                              # read-only acceptance-yardstick CSVs + figures
 └── redsea_scratch/
     ├── geojson/cells__<image>.geojson            # QuPath boundaries (input to REDSEA)

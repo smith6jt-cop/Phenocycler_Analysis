@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Orchestrator — run the full raw-data → 7-class broad-lineage pipeline end to end.
+Orchestrator — run the full raw-data → 5-compartment broad-phenotyping pipeline end to end.
 
 Idempotent ``run_step`` (skips a stage when its outputs already exist unless
 ``force=True``) + a final status table, in-process against the ``phenocycler``
-package.  Stage order (the two starred stages are the corrections the upstream
-notebook / earlier port OMITTED):
+package.  Stage order:
 
-    cells → redsea → restore → restore_extra* → hormone_floor* → lineage → qupath → figures
+    cells → redsea → restore → lineage → qupath → figures
 
-``hormone_floor`` (floors {INS,GCG,SST}_pos at K=5 AND {CD3e,CD20,CD163}_pos at K=2) MUST run before
-``lineage`` or the false-endocrine + false-immune over-calling returns; ``restore_extra`` gates
-B3TUBB/CD99/MPO for the Neural / Endocrine-CD99 / Immune-MPO markers.
+``restore`` thresholds every marker in ONE pass (curated directional pairs); ``lineage`` is the ordered
+residual gating tree (5 compartments + explicit ``Other``). The old ``restore_extra`` + ``hormone_floor``
+stages were removed with the curated multi-pair redesign.
 
     python -m phenocycler.pipeline                       # run every missing step
-    python -m phenocycler.pipeline --only hormone_floor lineage figures
+    python -m phenocycler.pipeline --only lineage figures
     python -m phenocycler.pipeline --force               # re-run everything
     python -m phenocycler.pipeline --status              # just print the status table
 """
@@ -24,6 +23,7 @@ from __future__ import annotations
 import argparse
 import glob
 import shutil
+import subprocess
 from pathlib import Path
 
 from .config import PipelineConfig, load_config
@@ -33,16 +33,14 @@ from .config import PipelineConfig, load_config
 STAGES = [
     ("cells", "cells/donor_id=*", "Raw cells (DuckDB)"),
     ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
-    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (10 markers)"),
-    ("restore_extra", "restore_gated_redsea_extra/donor_id=*", "RESTORE gated (extra 3)"),
-    ("hormone_floor", "restore_gated_redsea/donor_id=*", "Norm floor (hormone K5 + immune K2)"),
-    ("lineage", "phenotype/broad/donor_id=*", "Broad lineage (7-class)"),
+    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (all markers)"),
+    ("restore_diag", "restore_redsea/mxnorm/restore_mxnorm_efficacy.csv", "RESTORE efficacy (mxnorm)"),
+    ("lineage", "phenotype/broad/donor_id=*", "Compartments (5 + Other)"),
     ("qupath", "phenotype/qupath_class/pheno_class_*.csv", "QuPath CSVs"),
     ("figures", "phenotype/celltype_marker_dotplot.png", "Identity QC figures"),
 ]
 
-ORDER = ["cells", "redsea", "restore", "restore_extra", "hormone_floor",
-         "lineage", "qupath", "figures"]
+ORDER = ["cells", "redsea", "restore", "restore_diag", "lineage", "qupath", "figures"]
 
 
 def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
@@ -50,9 +48,9 @@ def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
 
 
 def _lineage_is_current(cfg: PipelineConfig) -> bool:
-    """True only if broad-lineage partitions exist AND carry the CURRENT 7-class score columns
-    (Neural present; Neutrophil folded into Immune -> absent). A stale 6-/8-class ``broad/`` therefore
-    counts as 'not done', so the lineage step re-runs.
+    """True only if broad partitions exist AND carry the CURRENT ordered-residual schema
+    (``compartment``/``cell_type``). A stale ``broad_lineage``/score_* ``broad/`` counts as 'not done',
+    so the lineage step re-runs.
     """
     files = sorted(glob.glob(str(cfg.broad_dir / "donor_id=*" / "*.parquet")))
     if not files:
@@ -62,7 +60,7 @@ def _lineage_is_current(cfg: PipelineConfig) -> bool:
         cols = set(pq.ParquetFile(files[0]).schema.names)
     except Exception:
         return False
-    return "score_Neural" in cols and "score_Neutrophil" not in cols
+    return "compartment" in cols and "cell_type" in cols
 
 
 def _run_step(cfg, name, func, pattern, checker, force) -> None:
@@ -80,9 +78,36 @@ def _run_step(cfg, name, func, pattern, checker, force) -> None:
     func()
 
 
+def _run_restore_diagnostic(cfg: PipelineConfig) -> None:
+    """Shell out to the mxnorm RESTORE before/after efficacy diagnostic (an R script).
+
+    Runs under **R 4.5.1** (``/usr/local/bin/Rscript``): the shared ``/usr/local/lib/R/site-library``
+    is built for R 4.6 and its ``rlang.so`` will not load under 4.5.1, whereas the 4.5 personal lib has
+    a working rlang + arrow/lme4/uwot + mxnorm (see ``scripts/R/install_mxnorm.R``). Reads the applied
+    per-(donor,marker) thresholds from ``restore_redsea/positive_fractions.csv``; writes the efficacy
+    CSV + figures under ``cfg.restore_mxnorm_dir``.
+    """
+    repo = cfg.data_dir.parent
+    # The R diagnostic ships INSIDE this submodule (self-contained); cwd stays at the data-dir parent so
+    # the script's relative --data fallbacks resolve there (all real inputs are passed as absolute paths).
+    script = Path(__file__).resolve().parents[1] / "scripts" / "R" / "restore_mxnorm_diagnostics.R"
+    rscript = "/usr/local/bin/Rscript" if Path("/usr/local/bin/Rscript").exists() else (shutil.which("Rscript") or "Rscript")
+    cmd = [
+        rscript, str(script),
+        "--threshold-csv", str(cfg.restore_dir / "positive_fractions.csv"),
+        "--cells-redsea-dir", str(cfg.cells_redsea_dir),
+        "--cells-dir", str(cfg.cells_dir),
+        "--donor-metadata", str(cfg.donor_metadata),
+        "--outdir", str(cfg.restore_mxnorm_dir),
+        "--subsample", str(cfg.restore_diag_subsample),
+        "--seed", str(cfg.restore_diag_seed),
+    ]
+    print("[restore_diag] " + " ".join(cmd))
+    subprocess.run(cmd, check=True, cwd=str(repo))
+
+
 def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
-    from . import (cells_parquet, redsea, restore, hormone_floor, lineage,
-                   qupath_export, figures)
+    from . import (cells_parquet, redsea, restore, lineage, qupath_export, figures)
 
     def _cells():
         cells_parquet.build_cells_parquet(cfg)
@@ -94,20 +119,8 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
     def _restore():
         restore.run_restore(cfg)
 
-    def _restore_extra():
-        restore.run_restore_extra(cfg)
-
-    def _hormone_floor():
-        # Guarantee a rollback point: if no pre-floor backup exists yet, snapshot the (un-floored)
-        # gated dir to restore_gated_redsea.pre_hormonefloor BEFORE flooring it in place. Then always
-        # floor FROM that backup so the result is reproducible from a clean RESTORE (idempotent — the
-        # floor only rewrites {INS,GCG,SST}+{CD3e,CD20,CD163}_pos; _norm is untouched).
-        prefloor = cfg.restore_gated_prefloor_dir
-        if not prefloor.exists() and cfg.restore_gated_dir.exists():
-            shutil.copytree(cfg.restore_gated_dir, prefloor)
-            print(f"[hormone_floor] backed up un-floored gates -> {prefloor}")
-        src = prefloor if prefloor.exists() else cfg.restore_gated_dir
-        hormone_floor.run_hormone_floor(cfg, gated_dir=src, out_dir=cfg.restore_gated_dir)
+    def _restore_diag():
+        _run_restore_diagnostic(cfg)
 
     def _lineage():
         lineage.run_lineage(cfg)
@@ -118,14 +131,12 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
     def _figures():
         figures.run_figures(cfg)
 
-    # (func, existence-pattern, column-checker). hormone_floor is idempotent -> never skipped on
-    # existence (pattern None, checker None) so it always re-applies when selected.
+    # (func, existence-pattern, column-checker).
     steps = {
         "cells": (_cells, "cells/donor_id=*", None),
         "redsea": (_redsea, "cells_redsea/donor_id=*", None),
         "restore": (_restore, "restore_gated_redsea/donor_id=*", None),
-        "restore_extra": (_restore_extra, "restore_gated_redsea_extra/donor_id=*", None),
-        "hormone_floor": (_hormone_floor, None, None),
+        "restore_diag": (_restore_diag, "restore_redsea/mxnorm/restore_mxnorm_efficacy.csv", None),
         "lineage": (_lineage, "phenotype/broad/donor_id=*", _lineage_is_current),
         "qupath": (_qupath, "phenotype/qupath_class/pheno_class_*.csv", None),
         "figures": (_figures, "phenotype/celltype_marker_dotplot.png", None),
@@ -146,9 +157,7 @@ def print_status(cfg: PipelineConfig) -> None:
     for name, pattern, label in STAGES:
         n = _has_outputs(cfg, pattern)
         if name == "lineage":
-            state = "OK (7-class)" if _lineage_is_current(cfg) else ("STALE (re-run)" if n else "MISSING")
-        elif name == "hormone_floor":
-            state = "OK" if n else "MISSING"   # in-place; presence of restore_gated is the proxy
+            state = "OK (5+Other)" if _lineage_is_current(cfg) else ("STALE (re-run)" if n else "MISSING")
         else:
             state = "OK" if n else "MISSING"
         print(f"{label:<30}{n:>10}   {state}")

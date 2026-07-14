@@ -1,12 +1,10 @@
-"""Unit tests for config loading, overrides, and derived paths (8-class pipeline)."""
+"""Unit tests for config loading, overrides, and derived paths (5-compartment pipeline)."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from phenocycler import load_config
-from phenocycler.config import (PipelineConfig, LINEAGES, STRUCT_LINEAGES,
-                                DEFAULT_MARKER_PAIRS, EXTRA_MARKER_PAIRS, EXTRA_MARKERS)
+from phenocycler.config import (COMPARTMENT_ORDER, COMPARTMENT_GATES, OTHER_LABEL,
+                                ENDOCRINE_MARKERS, MARKER_PAIRS, FUNCTIONAL_PAIRS)
 
 
 def test_defaults_and_derived_paths():
@@ -18,12 +16,6 @@ def test_defaults_and_derived_paths():
     assert cfg.restore_thresholds_csv == cfg.data_dir / "restore_thresholds_redsea.csv"
     assert cfg.broad_dir == cfg.data_dir / "phenotype" / "broad"
     assert cfg.qupath_class_dir == cfg.data_dir / "phenotype" / "qupath_class"
-    # 8-class additions
-    assert cfg.restore_gated_extra_dir == cfg.data_dir / "restore_gated_redsea_extra"
-    assert cfg.restore_redsea_extra_dir == cfg.data_dir / "restore_redsea_extra"
-    assert cfg.restore_thresholds_extra_csv == cfg.data_dir / "restore_thresholds_extra.csv"
-    assert cfg.restore_gated_prefloor_dir == cfg.data_dir / "restore_gated_redsea.pre_hormonefloor"
-    assert cfg.redsea_reassess_dir == cfg.data_dir / "redsea_reassess"
 
 
 def test_scientific_defaults():
@@ -35,9 +27,10 @@ def test_scientific_defaults():
     assert cfg.restore_robust is True
     assert cfg.restore_robust_factor == 3.0
     assert cfg.restore_min_cell_area == 5.0
-    # lineage knobs (the false-endocrine floor + CD99 bright gate)
-    assert cfg.hormone_min_norm == 5.0
-    assert cfg.cd99_bright == 3.0
+    # the former _norm-floor + CD99-bright knobs are removed in the curated redesign
+    assert not hasattr(cfg, "hormone_min_norm")
+    assert not hasattr(cfg, "immune_min_norm")
+    assert not hasattr(cfg, "cd99_bright")
 
 
 def test_keyword_override():
@@ -68,22 +61,12 @@ def test_absolute_paths_preserved(tmp_path):
     assert cfg.images_dir == abs_imgs
 
 
-def test_lineage_ini_section(tmp_path):
-    ini = tmp_path / "config.ini"
-    ini.write_text("[lineage]\nhormone_min_norm = 4\ncd99_bright = 2.5\n")
-    cfg = load_config(ini)
-    assert cfg.hormone_min_norm == 4.0
-    assert cfg.cd99_bright == 2.5
-
-
 def test_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("PHENOCYCLER_JOBS", "4")
     monkeypatch.setenv("PHENOCYCLER_DATA_DIR", str(tmp_path / "envdata"))
-    monkeypatch.setenv("PHENOCYCLER_HORMONE_MIN_NORM", "6")
     cfg = load_config()
     assert cfg.n_jobs == 4
     assert cfg.data_dir == tmp_path / "envdata"
-    assert cfg.hormone_min_norm == 6.0
 
 
 def test_discover_donors(tmp_path):
@@ -93,20 +76,34 @@ def test_discover_donors(tmp_path):
     assert cfg.discover_donors() == ["6414", "6450", "6539"]   # sorted
 
 
-def test_constants_shape():
-    assert len(LINEAGES) == 7
-    assert "Neural" in LINEAGES and "Neutrophil" not in LINEAGES   # Neutrophil folded into Immune
-    assert "CD99" in LINEAGES["Endocrine"]
-    assert "MPO" in LINEAGES["Immune"]                             # neutrophils (MPO) are Immune
-    assert LINEAGES["Neural"] == ["B3TUBB"]
-    assert set(STRUCT_LINEAGES) == {"Epithelial", "Fibroblast", "Muscle"}
-    assert len(DEFAULT_MARKER_PAIRS) == 10          # the validated 10-marker gates stay unchanged
-    assert len(EXTRA_MARKER_PAIRS) == 3
-    assert set(EXTRA_MARKERS) == {"CD99", "B3TUBB", "MPO"}
+def test_compartment_constants_shape():
+    assert COMPARTMENT_ORDER == ["Epithelial", "Endothelial", "Neural", "Immune", "Mesenchymal"]
+    assert OTHER_LABEL == "Other"
+    assert COMPARTMENT_GATES["Epithelial"] == ["E_cadherin"]      # E-cadherin anchor (stays + on endocrine)
+    assert COMPARTMENT_GATES["Endothelial"] == ["CD31"]
+    assert COMPARTMENT_GATES["Neural"] == ["B3TUBB"]
+    assert COMPARTMENT_GATES["Mesenchymal"] == ["SMA", "Vimentin"]   # ordered: SMA then Vimentin
+    assert {"CD3e", "CD20", "CD68", "MPO"}.issubset(set(COMPARTMENT_GATES["Immune"]))
+    assert ENDOCRINE_MARKERS == ["INS", "GCG", "SST"]      # IAPP removed 2026-07-10 (failed marker)
+
+
+def test_marker_pairs_directional_no_target_collision():
+    """RESTORE keys threshs on the TARGET only -> two pairs sharing a target silently overwrite."""
+    for pairs in (MARKER_PAIRS, FUNCTIONAL_PAIRS):
+        targets = [p[0] for p in pairs]
+        assert len(targets) == len(set(targets)), f"duplicate target in {pairs}"
+        assert all(len(p) == 2 for p in pairs)
+    pm = {t: r for t, r in MARKER_PAIRS}
+    assert pm["E_cadherin"] == "CD31"          # epithelial <- endothelial (spatially separated)
+    assert pm["B3TUBB"] == "CD3e"              # neural <- immune (TUBB3-negative)
+    assert ["INS", "GCG"] in MARKER_PAIRS and ["GCG", "INS"] in MARKER_PAIRS   # intra-islet reciprocal
 
 
 def test_config_matches_science_modules():
-    """Guard the two independent definitions against class-count / CD99 drift."""
+    """Guard the module-level constants against drift."""
     from phenocycler import lineage, marker_taxonomy
-    assert list(lineage.LNAMES) == list(LINEAGES)                 # lineage uses config's LINEAGES
-    assert load_config().cd99_bright == marker_taxonomy.CD99_BRIGHT
+    assert list(lineage.CLASSES) == COMPARTMENT_ORDER + [OTHER_LABEL]
+    assert not hasattr(marker_taxonomy, "CD99_BRIGHT")            # CD99 demoted to a state marker
+    for gates in COMPARTMENT_GATES.values():                     # gate markers must be TYPE (heatmap)
+        for m in gates:
+            assert m in marker_taxonomy.TYPE, f"gate marker {m} missing from marker_taxonomy.TYPE"
