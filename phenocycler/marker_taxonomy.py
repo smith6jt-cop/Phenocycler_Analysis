@@ -14,6 +14,9 @@ PROCESS markers drive within-lineage state axes (Phase 5) and are excluded from 
 This module is the ONE place the TYPE/PROCESS split is defined so phenotyping and every plot agree.
 `DAPI` (nuclear stain — not a marker) is EXCLUDED from everything. `Ker8_18`/`Keratin_5` (basal-ductal
 keratins) are now USED; `IAPP` FAILED (removed 2026-07-10 → EXCLUDED); `CD99` is a broad state marker (PROCESS), NOT a gate.
+`Collagen_IV` is a **MASK** (basement-membrane ECM, not a per-cell signal) — out of the identity heatmap.
+`Ki67`/`PCNA` (**PROLIFERATION**) are lineage-agnostic with no mutually-exclusive counterpart, so they are
+binarized by a standalone per-image bimodal fit (`restore.bimodal_thresh`) rather than a RESTORE pair.
 
 NB: the *lineage-gate* set (the RESTORE-gated markers that actually drive ``lineage.py`` /
 ``assign_broad_lineage.py``) is a SUBSET of TYPE — e.g. FOXP3, Caveolin, CD66 are TYPE (shown in the
@@ -38,6 +41,15 @@ PROCESS = [
 # --- Never used for phenotyping OR any plot ---
 EXCLUDED = ["DAPI", "IAPP"]   # DAPI = nuclear stain; IAPP = failed marker (removed 2026-07-10). Ker8_18/Keratin_5 used; CD99 -> PROCESS
 
+# --- MASK markers: basement-membrane / ECM, NOT a per-cell signal -> used as a spatial mask; kept OUT of
+#     the identity heatmap and phenotyping (per PhenotypingPlan.txt: "use as a mask"). ---
+MASK = ["Collagen_IV"]
+
+# --- PROLIFERATION markers: lineage-agnostic, no mutually-exclusive counterpart, so RESTORE pairing does
+#     not apply -> binarized by a STANDALONE per-image bimodal fit (restore.bimodal_thresh). They remain
+#     PROCESS/state markers (excluded from identity), but DO get a positivity call. ---
+PROLIFERATION = ["Ki67", "PCNA"]
+
 # --- TYPE / lineage-identity markers: drive phenotyping and the identity heatmap ---
 # Ordered in CLASS BLOCKS following the heatmap row order (LIN_ORDER: Epithelial, Fibroblast, Muscle,
 # Neural, Endothelial, Endocrine, Immune) so the heatmap reads as a rough diagonal and
@@ -56,8 +68,8 @@ TYPE = [
     # Immune — lymphoid then myeloid then granulocyte
     "CD3e", "CD8", "CD4", "FOXP3", "CD20", "CD79a", "CD68", "CD163", "Iba1", "CD206",
     "M2Gal3", "CD11c", "CD209", "CD11b", "MPO",
-    # Mesenchymal / stromal
-    "SMA", "Vimentin", "Collagen_IV",
+    # Mesenchymal / stromal  (Collagen_IV -> MASK, out of the identity heatmap)
+    "SMA", "Vimentin",
     # batch-2-only structural (present only in batch-2 donors; harmless if absent)
     "b_Catenin1",
 ]
@@ -69,6 +81,7 @@ TYPE = [
 _TYPE = set(TYPE)
 _PROCESS = set(PROCESS)
 _EXCLUDED = set(EXCLUDED)
+_MASK = set(MASK)
 
 
 def heatmap_markers(available):
@@ -79,7 +92,7 @@ def heatmap_markers(available):
     shown.
     """
     avail = set(available)
-    unknown = sorted(avail - _TYPE - _PROCESS - _EXCLUDED)
+    unknown = sorted(avail - _TYPE - _PROCESS - _EXCLUDED - _MASK)
     if unknown:
         print(f"[marker_taxonomy] WARNING: {len(unknown)} unclassified marker(s) hidden from heatmap "
               f"(add them to TYPE or PROCESS): {unknown}", flush=True)

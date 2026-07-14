@@ -34,13 +34,14 @@ STAGES = [
     ("cells", "cells/donor_id=*", "Raw cells (DuckDB)"),
     ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
     ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (all markers)"),
+    ("proliferation", "restore_gated_proliferation/donor_id=*", "Proliferation (Ki67/PCNA bimodal)"),
     ("restore_diag", "restore_redsea/mxnorm/restore_mxnorm_efficacy.csv", "RESTORE efficacy (mxnorm)"),
     ("lineage", "phenotype/broad/donor_id=*", "Compartments (5 + Other)"),
     ("qupath", "phenotype/qupath_class/pheno_class_*.csv", "QuPath CSVs"),
     ("figures", "phenotype/celltype_marker_dotplot.png", "Identity QC figures"),
 ]
 
-ORDER = ["cells", "redsea", "restore", "restore_diag", "lineage", "qupath", "figures"]
+ORDER = ["cells", "redsea", "restore", "proliferation", "restore_diag", "lineage", "qupath", "figures"]
 
 
 def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
@@ -119,6 +120,9 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
     def _restore():
         restore.run_restore(cfg)
 
+    def _proliferation():
+        restore.run_restore_proliferation(cfg)
+
     def _restore_diag():
         _run_restore_diagnostic(cfg)
 
@@ -136,6 +140,7 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
         "cells": (_cells, "cells/donor_id=*", None),
         "redsea": (_redsea, "cells_redsea/donor_id=*", None),
         "restore": (_restore, "restore_gated_redsea/donor_id=*", None),
+        "proliferation": (_proliferation, "restore_gated_proliferation/donor_id=*", None),
         "restore_diag": (_restore_diag, "restore_redsea/mxnorm/restore_mxnorm_efficacy.csv", None),
         "lineage": (_lineage, "phenotype/broad/donor_id=*", _lineage_is_current),
         "qupath": (_qupath, "phenotype/qupath_class/pheno_class_*.csv", None),

@@ -53,7 +53,8 @@ if not matplotlib.get_backend().startswith("module://"):  # keep a notebook's in
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .config import PipelineConfig, load_config, MARKER_PAIRS, FUNCTIONAL_PAIRS
+from .config import PipelineConfig, load_config, MARKER_PAIRS, FUNCTIONAL_PAIRS, ENDOCRINE_MARKERS
+from .marker_taxonomy import PROLIFERATION
 from .parallel import map_donors
 
 MODEL_COLORS = {"KMeans": "magenta", "GMM": "blue", "SSC": "green"}
@@ -235,8 +236,72 @@ def fit_clusters(cloud, model="SSC", subsample=15000, seed=0, ssc_vendor=None):
     return cloud, labels, neg
 
 
+def r_otsu(x):
+    """Pure Otsu valley on a 1-D array (``skimage.filters.threshold_otsu``); NaN if degenerate (<2 finite
+    values or a flat array). Compute it on ``log10(MFI+1)`` for the honest background<->signal boundary.
+    Lives here (not diagnostics.py) so the pipeline and ``phenocycler.diagnostics`` share one Otsu; the
+    latter re-exports it. Lazy skimage import so ``restore`` loads without skimage installed."""
+    from skimage.filters import threshold_otsu
+    x = np.asarray(x, float); x = x[np.isfinite(x)]
+    return np.nan if x.size < 2 or x.min() == x.max() else float(threshold_otsu(x))
+
+
+def bimodal_thresh(v, *, min_sep=2.0, min_frac_hi=0.02, min_n=200):
+    """Standalone bimodal positivity cutoff for a single marker (NO mutually-exclusive counterpart).
+
+    Fit a 2-component Gaussian on ``log10(v+1)`` of the NONZERO cells (drops the REDSEA zero-clip spike) and
+    cut at the between-component crossover -> raw-MFI threshold. Returns ``+inf`` (ABSENT / unimodal) when the
+    two components are not separated (``sep = |mu_hi - mu_lo| / pooled_sd < min_sep``), the positive component
+    is negligible (``w_hi < min_frac_hi``), or too few cells. Used for LINEAGE-AGNOSTIC markers that have no
+    RESTORE pair — proliferation (Ki67/PCNA) — and is the shared core of :func:`partner_low_thresh`."""
+    from sklearn.mixture import GaussianMixture
+    v = np.asarray(v, float); v = v[np.isfinite(v)]; v = v[v > 0]
+    if v.size < min_n:
+        return float("inf")
+    vlog = np.log10(v + 1.0).reshape(-1, 1)
+    g = GaussianMixture(2, n_init=3, random_state=0).fit(vlog)
+    mu = g.means_.ravel(); sd = np.sqrt(g.covariances_.ravel()); w = g.weights_
+    lo, hi = np.argsort(mu)
+    sep = float((mu[hi] - mu[lo]) / np.sqrt(0.5 * (sd[lo] ** 2 + sd[hi] ** 2)))
+    if sep < min_sep or w[hi] < min_frac_hi:                    # unimodal -> ABSENT (no manufactured cut)
+        return float("inf")
+    xs = np.linspace(mu[lo], mu[hi], 512)
+    d_lo = w[lo] * np.exp(-0.5 * ((xs - mu[lo]) / sd[lo]) ** 2) / sd[lo]
+    d_hi = w[hi] * np.exp(-0.5 * ((xs - mu[hi]) / sd[hi]) ** 2) / sd[hi]
+    return float(10 ** xs[np.argmin(np.abs(d_lo - d_hi))] - 1.0)  # between-component crossover -> raw MFI
+
+
+def logmean_ksigma(v, k=3.0, *, min_n=200):
+    """Robust per-image upper-tail cutoff for a GRADED marker with no clean bimodality (proliferation
+    Ki67/PCNA): ``mean + k*std`` of ``log10(nonzero+1)``, converted back to raw MFI. Per-donor adaptive
+    (no fixed-fraction assumption); isolates the bright proliferating tail. ``+inf`` if too few cells."""
+    v = np.asarray(v, float); v = v[np.isfinite(v)]; v = v[v > 0]
+    if v.size < min_n:
+        return float("inf")
+    lv = np.log10(v + 1.0)
+    return float(10 ** (lv.mean() + k * lv.std()) - 1.0)
+
+
+def partner_low_thresh(T, R, partner_low_q=0.5, *, islet=None, min_sep=3.0, min_frac_hi=0.03, min_n=200):
+    """Threshold the TARGET among cells LOW for the mutually-exclusive REFERENCE (ideally within islets).
+
+    For a directional ``[target, reference]`` pair (T=target, R=reference), among reference-LOW cells the
+    target separates into background vs signal — the double-positive / co-expressing confound (RESTORE's
+    problematic corner) is removed. This is the OPPOSITE conditioning to ``idx_select``'s negative arm
+    (reference-HIGH). Because the non-islet tissue background dominates whole-slide and is broad, pass
+    ``islet`` (a boolean mask of core/peri cells): within islets the reference-low target is cleanly bimodal.
+    Delegates to :func:`bimodal_thresh` on the reference-low(-islet) subpopulation; returns ``+inf`` (ABSENT)
+    when it is unimodal (e.g. a beta-loss donor's INS among GCG-low cells)."""
+    T = np.asarray(T, float); R = np.asarray(R, float)
+    sub = R <= np.quantile(R, partner_low_q)
+    if islet is not None:
+        sub = sub & np.asarray(islet, bool)
+    return bimodal_thresh(T[sub], min_sep=min_sep, min_frac_hi=min_frac_hi, min_n=min_n)
+
+
 def patch_restore_idx_floor(Normalization, neg_q=0.5, neg_stat_name="mean3sd",
-                            nonzero_q=0.0, presence_min_sep=0.0, subsample=15000, seed=0):
+                            nonzero_q=0.0, presence_min_sep=0.0, subsample=15000, seed=0,
+                            partner_low_q=0.0):
     """Replace RESTORE's CO-POSITIVE idx_select prefilter with the correct MUTUALLY-EXCLUSIVE
     single-positive selection for the directional ``[target, reference]`` pair.
 
@@ -277,6 +342,21 @@ def patch_restore_idx_floor(Normalization, neg_q=0.5, neg_stat_name="mean3sd",
                     self.threshs[batch][scene][xlabel][nm] = float("inf")
                 print(f"[presence] {scene} {xlabel}: sep={sep:.2f} < {presence_min_sep} -> absent (0 positives)")
                 return R.hv.Scatter(marker_pair_data), []
+        # Partner-low (opt-in, default off): threshold the TARGET from the reference-LOW subpopulation
+        # (where the target is cleanly bimodal, removing the double-positive confound), not the idx_select
+        # arms. Deterministic (Otsu) -> one cutoff stored for all 3 model keys. +inf -> absent (beta-loss).
+        # Partner-low is only valid where the reference-low target is cleanly bimodal WITHIN ISLETS, i.e.
+        # for ENDOCRINE targets (the user's INS/GCG case); non-endocrine markers live in exocrine/immune
+        # tissue, not islets, so they fall through to the normal negative-cluster threshold below.
+        if partner_low_q > 0 and xlabel in ENDOCRINE_MARKERS:
+            islet = (data["cell_region"].isin(("core", "peri")).to_numpy()
+                     if "cell_region" in getattr(data, "columns", ()) else None)
+            thr = partner_low_thresh(tmp[:, 0], tmp[:, 1], partner_low_q, islet=islet)
+            for nm in ("KMeans", "GMM", "SSC"):
+                self.threshs[batch][scene][xlabel][nm] = thr
+            reg = "islet" if islet is not None else "whole-tissue(NO cell_region)"
+            print(f"[partner-low] {scene} {xlabel}: ref-low q{partner_low_q} ({reg}) -> target thr={thr:.1f}")
+            return R.hv.Scatter(marker_pair_data), []
         models = (("KMeans", "magenta", R.cluster.KMeans(n_clusters=2)),
                   ("GMM", "blue", R.mixture.GaussianMixture(n_components=2, n_init=10)),
                   ("SSC", "green", R.sr.SparseSubspaceClusteringOMP(n_clusters=2)))
@@ -326,27 +406,39 @@ def donor_files(cells_dir, limit=None, donors=None):
     return pairs[:limit] if limit else pairs
 
 
-def build_restore_input(cells_dir, markers, subsample, seed, limit_scenes=None, donors=None):
+def build_restore_input(cells_dir, markers, subsample, seed, limit_scenes=None, donors=None, region_dir=None):
     """Per-image (per-donor) subsample of raw MFI for threshold estimation.
-    Returns a DataFrame with columns: scene (donor id), batch (0), + one per marker."""
+    Returns a DataFrame with columns: scene (donor id), batch (0), + one per marker. When ``region_dir`` is
+    given, also attaches ``cell_region`` (joined on ``object_id`` from ``region_dir``, e.g. ``cfg.cells_dir``)
+    so partner-low thresholding can restrict to islet (core/peri) cells."""
     rng = np.random.default_rng(seed)
     frames = []
+    read_cols = (["object_id"] + markers) if region_dir is not None else markers
     for donor, f in donor_files(cells_dir, limit_scenes, donors):
-        df = pd.read_parquet(f, columns=markers)
+        df = pd.read_parquet(f, columns=read_cols)
+        if region_dir is not None:
+            rf = glob.glob(str(Path(region_dir) / f"donor_id={donor}" / "*.parquet"))
+            reg = (pd.read_parquet(rf[0], columns=["object_id", "cell_region"]) if rf
+                   else pd.DataFrame({"object_id": [], "cell_region": []}))
+            df["object_id"] = df["object_id"].astype(str); reg["object_id"] = reg["object_id"].astype(str)
+            df = df.merge(reg, on="object_id", how="left").drop(columns="object_id")
         n_raw = len(df)
         # REDSEA leaves a few all-marker-NaN edge cells; RESTORE's np.quantile is not NaN-aware.
-        allnan = df.isna().all(axis=1)
-        partial = df.isna().any(axis=1) & ~allnan
+        allnan = df[markers].isna().all(axis=1)
+        partial = df[markers].isna().any(axis=1) & ~allnan
         if partial.any():
             print(f"[input] WARN {donor}: {int(partial.sum())} PARTIAL-NaN cells "
                   "(some markers valid) — dropped so the quantile stays finite")
-        df = df[~df.isna().any(axis=1)]
+        df = df[~df[markers].isna().any(axis=1)]
         n = len(df)
         if subsample and n > subsample:
             df = df.iloc[rng.choice(n, size=subsample, replace=False)]
-        df = df.astype("float64").reset_index(drop=True)
+        region_col = df["cell_region"].reset_index(drop=True) if region_dir is not None else None
+        df = df[markers].astype("float64").reset_index(drop=True)   # numeric markers only for the float cast
         df["scene"] = donor
         df["batch"] = 0
+        if region_col is not None:
+            df["cell_region"] = region_col
         frames.append(df)
         print(f"[input] image {donor}: {n_raw:,} cells ({n_raw - n:,} NaN dropped) -> {len(df):,} sampled")
     data = pd.concat(frames, ignore_index=True)
@@ -570,7 +662,7 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
                 reuse_threshs=False, ref_qc=True, seed=None, n_jobs=None,
                 out_dir: Optional[Path] = None, gated_dir: Optional[Path] = None,
                 thresh_csv: Optional[Path] = None, idx_floor_q=None,
-                neg_stat=None, presence_min_sep=None, idx_nonzero_q=None):
+                neg_stat=None, presence_min_sep=None, idx_nonzero_q=None, partner_low_q=None):
     """Run RESTORE fit + robust LUT + per-donor apply.  Reads the REDSEA-corrected
     cells by default; writes gated parquet + thresholds csv.
 
@@ -589,6 +681,7 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
     neg_stat_name = cfg.restore_neg_stat if neg_stat is None else neg_stat
     presence_min_sep = cfg.restore_presence_min_sep if presence_min_sep is None else presence_min_sep
     idx_nonzero_q = cfg.restore_idx_nonzero_q if idx_nonzero_q is None else idx_nonzero_q
+    partner_low_q = cfg.restore_partner_low_q if partner_low_q is None else partner_low_q
 
     pairs = marker_pairs or [list(p) for p in MARKER_PAIRS]
     markers = sorted({m for pair in pairs for m in pair})
@@ -606,12 +699,13 @@ def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=
         patch_restore_sigma(Normalization, marker_sigma)
     patch_restore_cluster_cap(Normalization, subsample, seed)
     patch_restore_no_kde(Normalization)
-    if idx_floor_q and idx_floor_q > 0:   # scale-invariant idx_select floor (vendored >50 is OHSU-calibrated)
-        patch_restore_idx_floor(Normalization, idx_floor_q, neg_stat_name, idx_nonzero_q,
-                                presence_min_sep, subsample, seed)
+    if (idx_floor_q and idx_floor_q > 0) or (partner_low_q and partner_low_q > 0):  # install the patch for
+        patch_restore_idx_floor(Normalization, idx_floor_q, neg_stat_name, idx_nonzero_q,  # idx-floor OR partner-low
+                                presence_min_sep, subsample, seed, partner_low_q)
 
     print("[step1] building RESTORE input (full images; idx_select runs on all cells) ...")
-    data = build_restore_input(cells_dir, markers, None, seed, limit_scenes, donors)
+    region_dir = cfg.cells_dir if (partner_low_q and partner_low_q > 0) else None   # islet mask for partner-low
+    data = build_restore_input(cells_dir, markers, None, seed, limit_scenes, donors, region_dir=region_dir)
 
     pkl = out_dir / "threshs.pkl"
     if reuse_threshs and pkl.exists():
@@ -680,6 +774,45 @@ def run_restore_functional(cfg: PipelineConfig, *, donors=None):
     )
 
 
+def run_restore_proliferation(cfg: PipelineConfig, *, markers=None, donors=None, n_jobs=None, k=None):
+    """STANDALONE binarization of lineage-agnostic PROLIFERATION markers (Ki67/PCNA). These have no
+    mutually-exclusive counterpart AND are GRADED (not bimodal — a zero spike + one broad mode + a right
+    tail, no valley), so RESTORE pairing / a bimodal cut do not apply. Instead take a robust per-image
+    upper-tail cutoff :func:`logmean_ksigma` (``mean + k*std`` of ``log10(nonzero+1)``, per-donor adaptive,
+    no fixed-fraction assumption), then apply ``raw >= thr`` to ALL cells and write ``{m}_pos/_norm/_log2r``
+    to ``cfg.restore_gated_proliferation_dir`` + a thresholds/fractions csv. STATE annotations (a
+    proliferating cell of whatever lineage), NOT a compartment call. ``k`` defaults to ``cfg.restore_proliferation_k``."""
+    import pyarrow.parquet as _pq
+    markers = list(markers or PROLIFERATION)
+    n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
+    k = cfg.restore_proliferation_k if k is None else k
+    cells_dir = cfg.cells_redsea_dir
+    files = list(donor_files(cells_dir, None, donors))
+    if not files:
+        print("[proliferation] no donor parquet found"); return {}
+    present = set(_pq.ParquetFile(files[0][1]).schema_arrow.names)
+    markers = [m for m in markers if m in present]
+    if not markers:
+        print(f"[proliferation] none of {list(PROLIFERATION)} present in {cells_dir} — skipped"); return {}
+    print(f"[proliferation] standalone log-mean+{k}sigma binarization (graded markers): {markers}")
+    lut, rows = {}, []
+    for donor, f in files:
+        df = pd.read_parquet(f, columns=markers)
+        for m in markers:
+            thr = logmean_ksigma(df[m].to_numpy(dtype="float64"), k)
+            lut[(donor, m)] = thr
+            rows.append({"image": donor, "marker": m, "threshold": float(thr)})
+            print(f"[proliferation] {donor} {m}: thr={thr:.1f}" + ("" if np.isfinite(thr) else "  (too few cells)"))
+    gated_dir = cfg.restore_gated_proliferation_dir
+    gated_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(cfg.data_dir / "restore_thresholds_proliferation.csv", index=False)
+    frac_df = apply_thresholds(cells_dir, markers, lut, {}, gated_dir, None, donors, n_jobs=n_jobs)
+    if len(frac_df):
+        frac_df.sort_values(["marker", "image"]).to_csv(gated_dir / "proliferation_fractions.csv", index=False)
+    print(f"[proliferation] wrote {gated_dir} (partitioned) + restore_thresholds_proliferation.csv")
+    return lut
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -711,10 +844,18 @@ def main(argv=None):
     ap.add_argument("--idx-nonzero-q", type=float, default=None,
                     help="opt-in REDSEA zero-clip guard: floor the idx_select OFF-marker ceiling at this "
                          "quantile of the marker's NONZERO cells (default cfg 0 == off)")
+    ap.add_argument("--partner-low-q", type=float, default=None,
+                    help="opt-in partner-low thresholding: set each target's cutoff from the Otsu valley "
+                         "among cells LOW for its mutually-exclusive reference (< this quantile of the "
+                         "reference); default cfg 0 == off (use the negative-cluster statistic)")
     ap.add_argument("--functional", action="store_true",
                     help="OPTIONAL second RESTORE pass for the functional / state markers "
                          "(FUNCTIONAL_PAIRS) into the *_extra dirs (robust off + ref-qc off); validate "
                          "the cutoffs before use (other pair/model/sigma flags are ignored)")
+    ap.add_argument("--proliferation", action="store_true",
+                    help="STANDALONE bimodal binarization of proliferation markers (Ki67/PCNA) — no "
+                         "mutually-exclusive pair; writes {m}_pos to restore_gated_proliferation "
+                         "(other pair/model/sigma flags are ignored)")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
@@ -722,6 +863,9 @@ def main(argv=None):
         cfg.n_jobs = a.jobs
     if a.functional:
         run_restore_functional(cfg, donors=a.donors)
+        return 0
+    if a.proliferation:
+        run_restore_proliferation(cfg, donors=a.donors)
         return 0
     pairs = ([p.split(":") for p in a.marker_pairs.split(",")] if a.marker_pairs else None)
     sigma = ({k: float(v) for k, v in (p.split(":") for p in a.marker_sigma.split(","))}
@@ -732,7 +876,7 @@ def main(argv=None):
                 robust_factor=a.robust_factor, reuse_threshs=a.reuse_threshs,
                 ref_qc=a.ref_qc, seed=a.seed, idx_floor_q=a.idx_floor_q,
                 neg_stat=a.neg_stat, presence_min_sep=a.presence_min_sep,
-                idx_nonzero_q=a.idx_nonzero_q)
+                idx_nonzero_q=a.idx_nonzero_q, partner_low_q=a.partner_low_q)
     return 0
 
 

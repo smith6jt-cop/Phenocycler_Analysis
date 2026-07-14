@@ -117,3 +117,70 @@ def test_fit_clusters_selects_reference_broad_negative(model):
     assert set(np.unique(labels)) <= {0, 1}
     # the chosen negative cluster should be the reference-broad one (higher mean reference)
     assert out_cloud[labels == negi][:, 1].mean() > out_cloud[labels != negi][:, 1].mean()
+
+
+# --------------------------------------------------------------------------- #
+# partner_low_thresh — threshold the target among reference-LOW cells (+ r_otsu relocation)
+# --------------------------------------------------------------------------- #
+def test_partner_low_thresh_valley_on_reference_low():
+    pytest.importorskip("skimage")
+    rng = np.random.default_rng(0)
+    n = 4000
+    # reference: half low (~5), half high (~300); target among reference-LOW is bimodal (background + β)
+    R = np.concatenate([rng.normal(5, 2, n), rng.normal(300, 40, n)])
+    T = np.concatenate([rng.normal(5, 2, n // 2), rng.normal(400, 60, n // 2),   # reference-low: bg + signal
+                        rng.normal(5, 2, n)])                                      # reference-high: target low
+    thr = restore.partner_low_thresh(T, R, 0.5)
+    assert np.isfinite(thr) and 5 < thr < 400   # valley lands between the background and signal modes
+
+
+def test_partner_low_thresh_absent_when_unimodal():
+    pytest.importorskip("skimage")
+    rng = np.random.default_rng(1)
+    n = 4000
+    R = np.concatenate([rng.normal(5, 2, n), rng.normal(300, 40, n)])
+    T = rng.normal(5, 2, 2 * n)                  # target is background everywhere (β-loss analogue)
+    assert not np.isfinite(restore.partner_low_thresh(T, R, 0.5))   # no valley -> +inf (absent)
+
+
+def test_partner_low_thresh_absent_when_too_few():
+    rng = np.random.default_rng(2)
+    R = rng.normal(300, 10, 500); T = rng.normal(400, 10, 500)
+    # partner_low_q=0.1 -> ~50 reference-low cells, below min_n
+    assert not np.isfinite(restore.partner_low_thresh(T, R, 0.1, min_n=200))
+
+
+def test_r_otsu_and_partner_low_reexported_from_diagnostics():
+    # relocated into restore.py; diagnostics must re-export the SAME objects (notebook import unchanged)
+    from phenocycler import diagnostics
+    assert diagnostics.r_otsu is restore.r_otsu
+    assert diagnostics.partner_low_thresh is restore.partner_low_thresh
+    assert diagnostics.bimodal_thresh is restore.bimodal_thresh
+
+
+# --------------------------------------------------------------------------- #
+# bimodal_thresh — standalone binarization (proliferation Ki67/PCNA)
+# --------------------------------------------------------------------------- #
+def test_bimodal_thresh_finds_crossover():
+    pytest.importorskip("sklearn")
+    rng = np.random.default_rng(0)
+    v = np.concatenate([rng.normal(5, 2, 3600), rng.normal(300, 40, 400)])   # negative bulk + 10% positive
+    thr = restore.bimodal_thresh(v)
+    assert np.isfinite(thr) and 5 < thr < 300
+
+
+def test_bimodal_thresh_absent_when_unimodal():
+    pytest.importorskip("sklearn")
+    rng = np.random.default_rng(1)
+    v = rng.normal(5, 2, 4000)                                               # single mode -> no proliferation
+    assert not np.isfinite(restore.bimodal_thresh(v))
+
+
+def test_logmean_ksigma_upper_tail():
+    # graded marker (proliferation): robust upper-tail cutoff isolates a small positive fraction
+    rng = np.random.default_rng(0)
+    v = np.clip(rng.lognormal(3.0, 0.6, 20000), 0, None)                     # broad graded, right tail
+    t3 = restore.logmean_ksigma(v, 3.0); t2 = restore.logmean_ksigma(v, 2.0)
+    assert np.isfinite(t3) and t3 > t2                                       # higher k => higher cutoff
+    assert 0 < (v >= t3).mean() < 0.05                                       # small proliferating fraction
+    assert not np.isfinite(restore.logmean_ksigma(v[:10]))                   # too few cells -> inf

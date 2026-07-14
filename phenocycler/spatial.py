@@ -43,6 +43,113 @@ _RC = {"font.size": 13, "axes.titlesize": 14, "axes.labelsize": 12, "figure.face
 
 
 # --------------------------------------------------------------------------- #
+# Mutually-exclusive pair point cloud (INS<->GCG etc): REDSEA before/after + thresholds + partner-low
+# --------------------------------------------------------------------------- #
+def _pair_frame(cfg, donor, target, reference):
+    """raw (cfg.cells_dir 'before') + REDSEA (cfg.cells_redsea_dir 'after') target/reference joined on
+    object_id, with cell_region (parent-object membership). Returns T_raw/R_raw/T/R/cell_region.
+    Uses DuckDB (a pandas string-KEY merge on millions of cells is pathologically slow — DuckDB ~0.8s)."""
+    import duckdb
+    ce = glob.glob(str(Path(cfg.data_dir) / "cells" / f"donor_id={donor}" / "*.parquet"))[0]
+    cr = glob.glob(str(Path(cfg.data_dir) / "cells_redsea" / f"donor_id={donor}" / "*.parquet"))[0]
+    q = (f'select c."{target}" as T_raw, c."{reference}" as R_raw, c.cell_region, '
+         f'r."{target}" as T, r."{reference}" as R '
+         f"from read_parquet('{ce}') c join read_parquet('{cr}') r using(object_id) "
+         f'where c."{target}" is not null and c."{reference}" is not null '
+         f'and r."{target}" is not null and r."{reference}" is not null')
+    return duckdb.query(q).to_df()
+
+
+def plot_pair_cloud(cfg, donor, target="INS", reference="GCG", *, thr_target=None, thr_ref=None,
+                    partner_low_q=0.5, out=None, sample=40000, seed=0):
+    """6-panel point cloud for a directional mutually-exclusive ``[target, reference]`` pair (e.g. INS<-GCG):
+    (1) BEFORE (raw QuPath) + Pearson r; (2) AFTER (REDSEA) + r; (3) AFTER colored by PARENT-OBJECT region
+    (core/peri/tissue — shows the central mass is non-islet background); (4) AFTER + the current RESTORE
+    thresholds (mutually-exclusive quadrants); (5) ISLET-only AFTER scatter; (6) the ISLET partner-low panel
+    — the reference-low INS distribution within islets with the 2-GMM crossover (``restore.partner_low_thresh``)
+    vs the current cut and the within-islet Otsu valley. ``before`` = ``cfg.cells_dir``; ``after`` =
+    ``cfg.cells_redsea_dir``; ``thr_target``/``thr_ref`` default to reading the chosen RESTORE thresholds csv."""
+    import pandas as pd
+    from sklearn.mixture import GaussianMixture
+    from .restore import partner_low_thresh, r_otsu
+    df = _pair_frame(cfg, donor, target, reference)
+    # NB df["T"], not df.T (that is the DataFrame transpose -> object-dtype on millions of rows = a hang)
+    Tr, Rr, Tc, Rc = df["T_raw"].values, df["R_raw"].values, df["T"].values, df["R"].values
+    reg = df["cell_region"].values
+    islet = np.isin(reg, ("core", "peri"))
+    if thr_target is None or thr_ref is None:
+        thr = pd.read_csv(cfg.restore_thresholds_csv)
+        thr = thr[thr.get("chosen", True) if "chosen" in thr else slice(None)]
+        pick = lambda m: float(thr[(thr.image.astype(str) == str(donor)) & (thr.marker == m)].threshold.iloc[0])
+        try:
+            thr_target = thr_target or pick(target); thr_ref = thr_ref or pick(reference)
+        except Exception:
+            thr_target, thr_ref = thr_target or np.nan, thr_ref or np.nan
+    rng = np.random.default_rng(seed)
+    pi = rng.choice(len(df), min(sample, len(df)), replace=False)
+    tx = np.log10((thr_target or 0) + 1); ty = np.log10((thr_ref or 0) + 1)
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(2, 3, figsize=(19, 12))
+        for a, (X, Y, r, lbl) in zip(ax[0, :2], [
+                (Tr, Rr, np.corrcoef(Tr, Rr)[0, 1], "BEFORE (raw QuPath)"),
+                (Tc, Rc, np.corrcoef(Tc, Rc)[0, 1], "AFTER (REDSEA-corrected)")]):
+            a.scatter(L(X[pi]), L(Y[pi]), s=2, c="0.5", alpha=.4)
+            a.set(xlabel=f"log10({target}+1)", ylabel=f"log10({reference}+1)")
+            a.set_title(f"{lbl}\nPearson r({target},{reference})={r:+.3f}")
+        # (3) region-colored
+        a = ax[0, 2]
+        for k, c in [("tissue", "0.75"), ("peri", "tab:orange"), ("core", "tab:blue")]:
+            m = (reg == k)[pi]
+            a.scatter(L(Tc[pi][m]), L(Rc[pi][m]), s=2, c=c, label=f"{k} {100*(reg==k).mean():.1f}%")
+        a.set(xlabel=f"log10({target}+1)", ylabel=f"log10({reference}+1)")
+        a.set_title("AFTER — colored by parent object (islet membership)")
+        a.legend(fontsize=9, markerscale=3, loc="upper right")
+        # (4) thresholds / quadrants
+        a = ax[1, 0]
+        Tp = Tc >= (thr_target or np.inf); Rp = Rc >= (thr_ref or np.inf)
+        quad = [("T+R- (signal)", Tp & ~Rp, "tab:blue"), ("R+T- (partner)", ~Tp & Rp, "tab:orange"),
+                ("double-neg", ~Tp & ~Rp, "0.8"), ("double-pos", Tp & Rp, "tab:red")]
+        for k, m, c in quad:
+            mm = m[pi]
+            a.scatter(L(Tc[pi][mm]), L(Rc[pi][mm]), s=2, c=c, label=f"{k} {100*m.mean():.1f}%")
+        a.axvline(tx, ls="--", c="k", lw=1.5); a.axhline(ty, ls="--", c="k", lw=1.5)
+        a.set(xlabel=f"log10({target}+1)", ylabel=f"log10({reference}+1)")
+        a.set_title(f"AFTER + RESTORE thresholds ({target}={thr_target:.0f}, {reference}={thr_ref:.0f})")
+        a.legend(fontsize=8, markerscale=3, loc="upper right")
+        # (5) islet-only AFTER
+        a = ax[1, 1]
+        a.scatter(L(Tc[pi][islet[pi]]), L(Rc[pi][islet[pi]]), s=3, c="tab:blue", alpha=.5)
+        a.axvline(tx, ls="--", c="k", lw=1); a.axhline(ty, ls="--", c="k", lw=1)
+        a.set(xlabel=f"log10({target}+1)", ylabel=f"log10({reference}+1)")
+        a.set_title(f"AFTER — islet cells only (core+peri, n={islet.sum():,})")
+        # (6) partner-low: reference-low INS within islets
+        a = ax[1, 2]
+        pl = partner_low_thresh(Tc, Rc, partner_low_q, islet=islet)
+        sub = islet & (Rc <= np.quantile(Rc, partner_low_q)) & (Tc > 0)
+        vlog = L(Tc[sub])
+        a.hist(vlog, bins=80, color="0.8", label=f"islet, {reference}-low, {target}>0 (n={sub.sum():,})")
+        valley = r_otsu(vlog); valley_raw = 10 ** valley - 1 if np.isfinite(valley) else np.nan
+        if np.isfinite(pl):
+            a.axvline(L(pl), c="tab:green", lw=2.5, label=f"partner-low GMM cross={pl:.0f} ({100*(Tc[islet]>=pl).mean():.0f}% islet⁺)")
+        else:
+            a.text(.5, .9, "partner-low: ABSENT (β-loss)", transform=a.transAxes, color="tab:red", ha="center")
+        a.axvline(tx, c="tab:red", lw=1.5, ls="--", label=f"current RESTORE={thr_target:.0f} ({100*(Tc[islet]>=(thr_target or np.inf)).mean():.0f}% islet⁺)")
+        if np.isfinite(valley_raw):
+            a.axvline(valley, c="k", lw=1.5, ls=":", label=f"within-islet Otsu valley={valley_raw:.0f}")
+        a.set(xlabel=f"log10({target}+1)", ylabel="cells")
+        a.set_title(f"Partner-low (islet, {reference}-low): where is the {target} cutoff?")
+        a.legend(fontsize=8, loc="upper right")
+        fig.suptitle(f"{donor} — {target}↔{reference} point cloud: REDSEA before/after + parent object + thresholds + partner-low", fontsize=15)
+        fig.tight_layout()
+        out = out or str(Path(cfg.data_dir).parent / "figures" / f"{donor}_{target}_{reference}_cloud.png")
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=125); plt.close(fig)
+    print(f"[pair-cloud] {donor} {target}<-{reference}: partner-low={pl if np.isfinite(pl) else 'ABSENT'} "
+          f"current={thr_target:.0f} valley={valley_raw:.0f} -> {out}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Image I/O — tiled OME reads + striped mask reads (importable, no globals)
 # --------------------------------------------------------------------------- #
 def ome_px_um(tf):

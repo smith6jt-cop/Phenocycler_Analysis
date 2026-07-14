@@ -32,11 +32,12 @@ import pyarrow.parquet as pq
 
 from .config import MARKER_PAIRS, COMPARTMENT_ORDER, OTHER_LABEL, STATUS_ORDER
 from .lineage import status_map
-from .restore import idx_select, neg_stat, fit_clusters
+from .restore import (idx_select, neg_stat, fit_clusters, r_otsu, partner_low_thresh, bimodal_thresh,
+                      logmean_ksigma)
 
 __all__ = [
     "read_donor", "r_otsu",
-    "idx_select", "neg_stat", "fit_clusters",
+    "idx_select", "neg_stat", "fit_clusters", "partner_low_thresh", "bimodal_thresh", "logmean_ksigma",
     "MARKER_PAIRS", "COMPARTMENT_ORDER", "OTHER_LABEL", "STATUS_ORDER", "status_map",
 ]
 
@@ -57,9 +58,5 @@ def read_donor(cfg, donor, markers):
     return df.merge(reg, on="object_id", how="left").dropna(subset=markers)
 
 
-def r_otsu(x):
-    """Pure Otsu valley on a 1-D array (``skimage.filters.threshold_otsu``); NaN if degenerate (<2 finite
-    values or a flat array). Compute it on ``log10(MFI+1)`` within the islet core for the honest boundary."""
-    from skimage.filters import threshold_otsu   # lazy: read_donor works without skimage installed
-    x = np.asarray(x, float); x = x[np.isfinite(x)]
-    return np.nan if x.size < 2 or x.min() == x.max() else float(threshold_otsu(x))
+# r_otsu + partner_low_thresh now live in phenocycler.restore (single source; re-exported above) so the
+# pipeline and this diagnostics module share one implementation. See restore.py.

@@ -140,6 +140,15 @@ class PipelineConfig:
     #   nonzero_q quantile of the marker's NONZERO cells (prevents ceiling collapse to 0 when >=50%
     #   of cells are REDSEA-clamped to zero). 0 == disabled (exact current math).
     restore_idx_nonzero_q: float = 0.0
+    # Partner-low thresholding (ENDOCRINE targets only — INS/GCG/SST): if >0, set the cutoff from a 2-GMM
+    #   crossover among ISLET cells that are LOW for the mutually-exclusive reference (reference <= this
+    #   quantile), where the target is cleanly bimodal (removes the double-positive + non-islet-background
+    #   confounds); +inf (absent) if not bimodal (e.g. beta-loss). Non-endocrine markers fall through to the
+    #   negative-cluster statistic. 0 == disabled. (Does NOT generalize beyond islet-resident markers.)
+    restore_partner_low_q: float = 0.0
+    # Proliferation (Ki67/PCNA) binarization: these are GRADED (not bimodal), so a robust per-donor upper-
+    #   tail cutoff = mean + k*std of log10(nonzero+1) (adaptive; no fixed-fraction assumption). k here:
+    restore_proliferation_k: float = 3.0
 
     # -- RESTORE efficacy diagnostic (scripts/R/restore_mxnorm_diagnostics.R via mxnorm) ---
     restore_diag_subsample: int = 20000   # cells/donor for the mxnorm diagnostic (stratified by cell_region)
@@ -196,6 +205,10 @@ class PipelineConfig:
     @property
     def restore_gated_extra_dir(self) -> Path:
         return self.data_dir / "restore_gated_redsea_extra"
+
+    @property
+    def restore_gated_proliferation_dir(self) -> Path:   # standalone-bimodal Ki67/PCNA positivity
+        return self.data_dir / "restore_gated_proliferation"
 
     @property
     def restore_thresholds_csv(self) -> Path:
@@ -272,6 +285,8 @@ _INI_SCHEMA = {
         "neg_stat": ("restore_neg_stat", str),
         "presence_min_sep": ("restore_presence_min_sep", float),
         "idx_nonzero_q": ("restore_idx_nonzero_q", float),
+        "partner_low_q": ("restore_partner_low_q", float),
+        "proliferation_k": ("restore_proliferation_k", float),
     },
     "restore_diag": {
         "subsample": ("restore_diag_subsample", int),
