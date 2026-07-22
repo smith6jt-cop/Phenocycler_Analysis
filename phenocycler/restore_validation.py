@@ -1963,12 +1963,14 @@ def evaluate_locked_pair(
                 **control_agreement,
             }
         )
-    # Re-seeding only perturbs an arm that was SUBSAMPLED. When the balanced draw took every cell an arm
-    # had, every seed fits identical rows and perfect agreement is arithmetic, not evidence. Say so
-    # explicitly rather than letting a Jaccard of 1.00 read as robustness.
+    # Re-seeding only perturbs an arm that was SUBSAMPLED. Because per_arm = min(|target|, |reference|,
+    # cap), the SMALLER arm is taken whole unless the cap binds -- so on almost every pair the seed sweep
+    # leaves one arm identical across seeds and min_control_jaccard structurally under-tests. It is
+    # "informative" only when neither arm is saturated; otherwise read probe_control_jaccard, which
+    # shrinks both arms and therefore actually perturbs the one the seed sweep cannot.
     target_arm_saturated = bool(primary["arm_counts"]["target_arm_saturated"])
     reference_arm_saturated = bool(primary["arm_counts"]["reference_arm_saturated"])
-    stability_informative = not (target_arm_saturated and reference_arm_saturated)
+    stability_informative = not (target_arm_saturated or reference_arm_saturated)
 
     # When either arm is saturated the seed sweep cannot perturb it, so run an extra probe that shrinks
     # both arms and re-measures agreement against the primary control set. Reported, never gated: acting
@@ -2336,6 +2338,8 @@ def evaluate_locked_pair(
         "reference_input_floor_linear_otsu": reference_floor_result.linear_otsu,
         "reference_input_floor_linear_triangle": reference_floor_result.linear_triangle,
         **primary["arm_counts"],
+        "target_arm_saturated": target_arm_saturated,
+        "reference_arm_saturated": reference_arm_saturated,
         "scale_bound_adapted": primary["scale_bound_adapted"],
         "scale_bound_lower_quantile": primary["scale_bound_lower_quantile"],
         "scale_bound_upper_quantile": primary["scale_bound_upper_quantile"],
@@ -2402,6 +2406,8 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "min_control_jaccard": evaluation["min_control_jaccard"],
         "stability_informative": evaluation["stability_informative"],
         "probe_control_jaccard": evaluation["probe_control_jaccard"],
+        "target_arm_saturated": evaluation["target_arm_saturated"],
+        "reference_arm_saturated": evaluation["reference_arm_saturated"],
         "scale_bound_adapted": evaluation["scale_bound_adapted"],
         "scale_bound_lower_quantile": evaluation["scale_bound_lower_quantile"],
         "scale_bound_upper_quantile": evaluation["scale_bound_upper_quantile"],

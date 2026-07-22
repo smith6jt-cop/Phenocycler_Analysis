@@ -1060,11 +1060,12 @@ def _draw_review_row(
     # panel. State how many, on each axis, so clipping is never silent.
     clipped_y = int(np.count_nonzero(target_scaled[cloud_visible] >= 1.0))
     clipped_x = int(np.count_nonzero(reference_scaled[cloud_visible] >= 1.0))
-    jaccard_note = (
-        f"control Jaccard {evaluation['min_control_jaccard']:.2f}"
-        if evaluation.get("stability_informative", True)
-        else f"control Jaccard {evaluation['min_control_jaccard']:.2f} (UNINFORMATIVE: arms saturated)"
-    )
+    # The seed sweep leaves the smaller arm identical across seeds on almost every pair, so quote the
+    # sub-sampled probe beside it -- that one actually perturbs the arm the seed sweep cannot.
+    probe = evaluation.get("probe_control_jaccard")
+    jaccard_note = f"control Jaccard {evaluation['min_control_jaccard']:.2f}"
+    if probe is not None and not evaluation.get("stability_informative", True):
+        jaccard_note += f" (probe {probe:.2f})"
     recovery = evaluation.get("anchor_recovery")
     recovery_note = "" if recovery is None else f" | anchor recovery {recovery:.2f}"
     cloud.set_title(

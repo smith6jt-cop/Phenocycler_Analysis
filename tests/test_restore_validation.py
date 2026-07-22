@@ -1255,6 +1255,39 @@ def test_sparse_arm_bounds_ignore_a_single_bright_outlier():
     assert len(fit_indices) == 2 * n_arm
 
 
+def test_stability_is_uninformative_whenever_either_arm_is_saturated():
+    """per_arm = min(|target|, |reference|, cap), so the smaller arm is normally taken whole and the
+    seed sweep cannot perturb it. The flag must therefore trip on OR, not AND, or it never fires."""
+    rng = np.random.default_rng(7)
+    target = np.r_[rng.normal(100, 2, 30), rng.normal(1, 0.05, 400)]
+    reference = np.r_[rng.normal(1, 0.05, 30), rng.normal(100, 2, 400)]
+    frame = pd.DataFrame(
+        {
+            "raw__E_cadherin": target,
+            "raw__CD31": reference,
+            "redsea__E_cadherin": np.clip(target - 0.2, 0, None),
+            "redsea__CD31": np.clip(reference - 0.2, 0, None),
+            rv.compartment_column("Membrane", "E_cadherin"): target * 0.9,
+            rv.compartment_column("Membrane", "CD31"): reference * 0.9,
+            rv.compartment_column("Cell", "E_cadherin"): target,
+            rv.compartment_column("Cell", "CD31"): reference,
+        }
+    )
+    result = rv.evaluate_locked_pair(
+        frame,
+        "synthetic",
+        "E_cadherin",
+        "CD31",
+        config=rv.PairValidationConfig(
+            fit_cap=1000, threshold_sample_sizes=(5, 10), threshold_resamples=10
+        ),
+    )
+    assert result["target_arm_saturated"] is True      # 30 of 30 taken
+    assert result["reference_arm_saturated"] is False  # 30 of 400
+    assert result["stability_informative"] is False    # one saturated arm is enough to under-test
+    assert result["probe_control_jaccard"] is not None
+
+
 def test_arm_saturation_is_reported_and_probe_fraction_shrinks_arms():
     target = np.array([10.0] * 5 + [1.0] * 500)
     reference = np.array([1.0] * 5 + [10.0] * 500)
