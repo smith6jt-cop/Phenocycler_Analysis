@@ -34,6 +34,9 @@ BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
     ("B3TUBB", "EpCAM"),
     ("Vimentin", "E_cadherin"),
 )
+# Pooled-immune comparator marker set: the minimum union that nets the immune populations present with
+# no CD45 in the panel. Used ONLY by evaluate_immune_joint, never by the locked pairwise path.
+IMMUNE_JOINT_MARKERS: tuple[str, ...] = ("CD3e", "CD20", "CD68", "CD11b")
 IMMUNE_REFERENCE_SCREEN_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD3e", "CD68"),
     ("CD3e", "CD163"),
@@ -141,6 +144,16 @@ class PairValidationConfig:
     min_reference_arm_fold: float = 2.0
     min_arm_n: int = 2
     min_control_jaccard: float = 0.90
+    # Minimum cells each robust min-max tail must span for the balanced fit sample to estimate the
+    # scaling bounds. Below it the quantile degenerates into an order statistic of a handful of cells
+    # (a sparse-marker arm), so bounds fall back to the input-QC-retained population instead.
+    min_quantile_support_cells: int = 1
+    # When the configured tails are degenerate, widen them on the same balanced sample until each spans
+    # this many cells (capped at the quartile). Chosen from the 22 affected pairs: 10 gave median anchor
+    # recovery 0.976 (min 0.787) against 0.938/0.730 at 5, while preserving the inverted pairs at 1.00.
+    degenerate_tail_support_cells: int = 10
+    # Arm shrinkage used ONLY by the saturated-arm stability probe (reported, never gated).
+    stability_probe_fraction: float = 0.8
 
     def __post_init__(self) -> None:
         if not self.feature_compartments:
@@ -186,6 +199,14 @@ class PairValidationConfig:
             raise ValueError("min_arm_n must be >= 2")
         if not 0 <= self.min_control_jaccard <= 1:
             raise ValueError("min_control_jaccard must be in [0, 1]")
+        if self.min_quantile_support_cells < 1:
+            raise ValueError("min_quantile_support_cells must be >= 1")
+        if self.degenerate_tail_support_cells < self.min_quantile_support_cells:
+            raise ValueError(
+                "degenerate_tail_support_cells must be >= min_quantile_support_cells"
+            )
+        if not 0 < self.stability_probe_fraction <= 1:
+            raise ValueError("stability_probe_fraction must be in (0, 1]")
 
     def specification(self) -> dict:
         """Return the complete machine-readable method and data-role contract."""
@@ -988,8 +1009,14 @@ def balanced_arm_fit_indices(
     fit_cap: int,
     seed: int,
     min_arm_n: int = 2,
+    probe_fraction: float | None = None,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    """Sample provisional exclusive arms equally for separator fitting."""
+    """Sample provisional exclusive arms equally for separator fitting.
+
+    ``probe_fraction`` (stability probing only, never the reported fit) shrinks each arm to that
+    fraction of the balanced size so a SATURATED arm -- one where the balanced draw would otherwise take
+    every cell it has, making re-seeding a no-op -- is actually perturbed between seeds.
+    """
     target_raw = np.asarray(target_raw, dtype=float)
     reference_raw = np.asarray(reference_raw, dtype=float)
     if target_raw.shape != reference_raw.shape:
@@ -1010,6 +1037,12 @@ def balanced_arm_fit_indices(
         raise ValueError(
             f"input QC retained fewer than {min_arm_n} cells in an exclusive arm"
         )
+    saturated_target = per_arm == len(target_only)
+    saturated_reference = per_arm == len(reference_only)
+    if probe_fraction is not None:
+        if not 0 < probe_fraction <= 1:
+            raise ValueError("probe_fraction must be in (0, 1]")
+        per_arm = max(min_arm_n, int(round(probe_fraction * per_arm)))
     rng = np.random.default_rng(seed)
     target_fit = rng.choice(target_only, size=per_arm, replace=False)
     reference_fit = rng.choice(reference_only, size=per_arm, replace=False)
@@ -1018,6 +1051,12 @@ def balanced_arm_fit_indices(
         "candidate_reference_n": int(len(reference_only)),
         "candidate_double_high_n": int(len(double_high)),
         "fit_per_arm": int(per_arm),
+        # An arm is SATURATED when the balanced sample takes every cell it has: the without-replacement
+        # draw is then a permutation, so re-seeding cannot perturb it. Seed agreement across a saturated
+        # arm is arithmetically guaranteed and is NOT evidence of robustness (see stability_informative).
+        # Reported for the UNPROBED balanced size, so a probe run still describes the real fit.
+        "target_arm_saturated": bool(saturated_target),
+        "reference_arm_saturated": bool(saturated_reference),
     }
 
 
@@ -1052,6 +1091,71 @@ def robust_minmax_scale(
         raise ValueError("robust min-max bounds must have positive ranges")
     scaled = np.clip((features - lower) / (upper - lower), 0.0, 1.0)
     return scaled, lower, upper
+
+
+def quantile_support_cells(
+    n: int, *, lower_quantile: float, upper_quantile: float
+) -> float:
+    """Cells spanned by the narrower robust min-max tail for a sample of ``n`` rows."""
+    if n < 0:
+        raise ValueError("n must be nonnegative")
+    if not 0 <= lower_quantile < upper_quantile <= 1:
+        raise ValueError("invalid robust min-max quantiles")
+    return float(min(lower_quantile * n, (1.0 - upper_quantile) * n))
+
+
+def adaptive_bound_quantiles(
+    n: int,
+    *,
+    lower_quantile: float,
+    upper_quantile: float,
+    min_support: int = 1,
+    repair_support: int = 10,
+    max_tail: float = 0.25,
+) -> tuple[float, float, bool, float]:
+    """Widen the robust min-max tails when ``n`` rows cannot estimate the configured pair.
+
+    A percentile is only robust if the sample spans it. A sparse marker's exclusive arm can hold a few
+    dozen cells, and ``per_arm`` caps the balanced sample at the SMALLER arm, so the configured 0.5%
+    tail can work out to well under one cell -- ``np.quantile`` then interpolates between the two most
+    extreme values and a single bright cell sets the scale for every feature.
+
+    The repair widens the tails on the SAME balanced sample rather than estimating them from a larger
+    but unbalanced population. Balance is what keeps either marker from dominating the Frobenius loss,
+    and dropping it simply moves the domination to the other marker: measured on the 22 affected donor
+    pairs, re-estimating bounds from the input-QC-retained population raised anchor recovery to 1.00 on
+    the 18 sparse-target rows but collapsed it (1.00 -> 0.10) on the 4 inverted rows, where the target
+    arm is abundant and the REFERENCE arm is the small one.
+
+    ``max_tail`` stops the widening from becoming meaningless on a very small sample: a tail can never
+    exceed the quartile. Returns ``(lower, upper, adapted, support_cells)``.
+    """
+    if n < 0:
+        raise ValueError("n must be nonnegative")
+    if not 0 <= lower_quantile < upper_quantile <= 1:
+        raise ValueError("invalid robust min-max quantiles")
+    if min_support < 1 or repair_support < min_support:
+        raise ValueError("require 1 <= min_support <= repair_support")
+    if not 0 < max_tail < 0.5:
+        raise ValueError("max_tail must be in (0, 0.5)")
+
+    support = quantile_support_cells(
+        n, lower_quantile=lower_quantile, upper_quantile=upper_quantile
+    )
+    if support >= min_support or n == 0:
+        return lower_quantile, upper_quantile, False, support
+
+    tail = min(repair_support / n, max_tail)
+    lower = max(lower_quantile, tail)
+    upper = min(upper_quantile, 1.0 - tail)
+    if lower >= upper:  # degenerate sample -- keep the configured pair rather than invert it
+        return lower_quantile, upper_quantile, False, support
+    return (
+        lower,
+        upper,
+        True,
+        quantile_support_cells(n, lower_quantile=lower, upper_quantile=upper),
+    )
 
 
 def resampled_negative_control_statistics(
@@ -1653,6 +1757,7 @@ def _locked_fit_once(
     *,
     config: PairValidationConfig,
     seed: int,
+    probe_fraction: float | None = None,
 ) -> dict:
     fit_indices, arm_counts = balanced_arm_fit_indices(
         target_raw,
@@ -1662,12 +1767,20 @@ def _locked_fit_once(
         fit_cap=config.fit_cap,
         seed=seed,
         min_arm_n=config.min_arm_n,
+        probe_fraction=probe_fraction,
+    )
+    bound_lower_q, bound_upper_q, bound_adapted, bound_support = adaptive_bound_quantiles(
+        len(fit_indices),
+        lower_quantile=config.scale_lower_quantile,
+        upper_quantile=config.scale_upper_quantile,
+        min_support=config.min_quantile_support_cells,
+        repair_support=config.degenerate_tail_support_cells,
     )
     scaled, scale_lower, scale_upper = robust_minmax_scale(
         features,
         fit_indices,
-        lower_quantile=config.scale_lower_quantile,
-        upper_quantile=config.scale_upper_quantile,
+        lower_quantile=bound_lower_q,
+        upper_quantile=bound_upper_q,
     )
     labels, components, metadata = fit_nnmf_predict(
         scaled,
@@ -1691,6 +1804,11 @@ def _locked_fit_once(
         "direction": direction,
         "scale_lower": scale_lower,
         "scale_upper": scale_upper,
+        "scale_bound_adapted": bound_adapted,
+        "scale_bound_lower_quantile": bound_lower_q,
+        "scale_bound_upper_quantile": bound_upper_q,
+        "scale_bound_n": int(len(fit_indices)),
+        "scale_bound_support_cells": bound_support,
     }
 
 
@@ -1837,9 +1955,61 @@ def evaluate_locked_pair(
                 "converged": bool(fit["metadata"]["converged"]),
                 "component_jaccard": component_agreement["control_jaccard"],
                 "component_binary_ari": component_agreement["binary_ari"],
+                "scale_bound_adapted": fit["scale_bound_adapted"],
                 **control_agreement,
             }
         )
+    # Re-seeding only perturbs an arm that was SUBSAMPLED. When the balanced draw took every cell an arm
+    # had, every seed fits identical rows and perfect agreement is arithmetic, not evidence. Say so
+    # explicitly rather than letting a Jaccard of 1.00 read as robustness.
+    target_arm_saturated = bool(primary["arm_counts"]["target_arm_saturated"])
+    reference_arm_saturated = bool(primary["arm_counts"]["reference_arm_saturated"])
+    stability_informative = not (target_arm_saturated and reference_arm_saturated)
+
+    # When either arm is saturated the seed sweep cannot perturb it, so run an extra probe that shrinks
+    # both arms and re-measures agreement against the primary control set. Reported, never gated: acting
+    # on it would move rows into MODEL_UNSTABLE, which is an acceptance decision for the pair review.
+    # (Sub-sampling, not resampling with replacement -- fit_nnmf_predict requires unique fit rows.)
+    probe_control_jaccard = None
+    if target_arm_saturated or reference_arm_saturated:
+        probe_values = []
+        for seed in config.seeds[1:]:
+            try:
+                probe = _locked_fit_once(
+                    features,
+                    target_raw,
+                    reference_raw,
+                    qc_retained,
+                    target_floor,
+                    reference_floor,
+                    config=config,
+                    seed=seed,
+                    probe_fraction=config.stability_probe_fraction,
+                )
+                probe_direction: DirectionalGroups = probe["direction"]
+                probe_controls = ordered_control_groups(
+                    target_raw,
+                    reference_raw,
+                    target_redsea,
+                    reference_redsea,
+                    probe["labels"],
+                    qc_retained,
+                    target_group=probe_direction.target_group,
+                    reference_group=probe_direction.reference_group,
+                    target_floor=target_floor,
+                    reference_floor=reference_floor,
+                )
+            except (ValueError, AssertionError):
+                probe_values.append(0.0)
+                continue
+            probe_values.append(
+                _binary_agreement(
+                    primary_control,
+                    probe_controls.reference_control.astype(np.int8),
+                )["control_jaccard"]
+            )
+        if probe_values:
+            probe_control_jaccard = float(min(probe_values))
     min_jaccard = float(
         min(row["control_jaccard"] for row in stability_rows)
     )
@@ -1961,13 +2131,36 @@ def evaluate_locked_pair(
         technical_error=background_error,
     )
 
+    # Display bounds are estimated from the input-QC-retained population, NOT the balanced fit sample.
+    # The reviewer's job is to judge the Step 1 separator and the Step 2 divisor, and a bound taken from
+    # a handful of arm cells is set by the single brightest one -- which pushed the whole control region
+    # into the bottom few percent of the axis. The divisor is then forced on-canvas so it can never be
+    # clipped out of the panel it defines. Axes stay raw-linear (no log transform).
     display = np.column_stack([target_redsea, reference_redsea])
-    _, display_lower, display_upper = robust_minmax_scale(
-        display,
-        primary["fit_indices"],
+    display_bound_rows = np.flatnonzero(qc_retained)
+    if not len(display_bound_rows):
+        display_bound_rows = primary["fit_indices"]
+    display_lower_q, display_upper_q, _adapted, _support = adaptive_bound_quantiles(
+        len(display_bound_rows),
         lower_quantile=config.scale_lower_quantile,
         upper_quantile=config.scale_upper_quantile,
+        min_support=config.min_quantile_support_cells,
+        repair_support=config.degenerate_tail_support_cells,
     )
+    _, display_lower, display_upper = robust_minmax_scale(
+        display,
+        display_bound_rows,
+        lower_quantile=display_lower_q,
+        upper_quantile=display_upper_q,
+    )
+    if target_full_stats is not None:
+        display_upper[0] = max(
+            float(display_upper[0]), 1.05 * float(target_full_stats["maximum"])
+        )
+    if controls.reference_separator is not None:
+        display_upper[1] = max(
+            float(display_upper[1]), 1.05 * float(controls.reference_separator)
+        )
     full_labels = np.full(len(donor_df), -1, dtype=np.int16)
     full_labels[valid_idx] = primary["labels"]
     full_qc_retained = np.zeros(len(donor_df), dtype=bool)
@@ -2139,6 +2332,21 @@ def evaluate_locked_pair(
         "reference_input_floor_linear_otsu": reference_floor_result.linear_otsu,
         "reference_input_floor_linear_triangle": reference_floor_result.linear_triangle,
         **primary["arm_counts"],
+        "scale_bound_adapted": primary["scale_bound_adapted"],
+        "scale_bound_lower_quantile": primary["scale_bound_lower_quantile"],
+        "scale_bound_upper_quantile": primary["scale_bound_upper_quantile"],
+        "scale_bound_n": primary["scale_bound_n"],
+        "scale_bound_support_cells": primary["scale_bound_support_cells"],
+        "stability_informative": stability_informative,
+        "probe_control_jaccard": probe_control_jaccard,
+        # Fraction of the unambiguous raw target arm the model actually places in the target component.
+        # ~0.98 on healthy fits; it collapses when a degenerate scaling bound lets the reference marker
+        # dominate the factorization. Reported only -- no threshold gates on it yet.
+        "anchor_recovery": (
+            float(int(target_population.sum()) / int(primary["arm_counts"]["candidate_target_n"]))
+            if int(primary["arm_counts"]["candidate_target_n"]) > 0
+            else None
+        ),
         "double_high_fraction": float(
             (
                 (target_raw[qc_retained] > target_floor)
@@ -2188,6 +2396,14 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "converged": evaluation["converged"],
         "stable": evaluation["stable"],
         "min_control_jaccard": evaluation["min_control_jaccard"],
+        "stability_informative": evaluation["stability_informative"],
+        "probe_control_jaccard": evaluation["probe_control_jaccard"],
+        "scale_bound_adapted": evaluation["scale_bound_adapted"],
+        "scale_bound_lower_quantile": evaluation["scale_bound_lower_quantile"],
+        "scale_bound_upper_quantile": evaluation["scale_bound_upper_quantile"],
+        "scale_bound_n": evaluation["scale_bound_n"],
+        "scale_bound_support_cells": evaluation["scale_bound_support_cells"],
+        "anchor_recovery": evaluation["anchor_recovery"],
         "target_fold": evaluation["target_fold"],
         "reference_fold": evaluation["reference_fold"],
         "n_input": evaluation["n_input"],
@@ -2389,6 +2605,133 @@ def evaluate_locked_cohort(
         raise
 
 
+def evaluate_immune_joint(
+    donor_df: pd.DataFrame,
+    donor: str,
+    *,
+    fit_cap: int,
+    seeds: Sequence[int],
+    markers: Sequence[str] = IMMUNE_JOINT_MARKERS,
+    compartments: Sequence[str] = LOCKED_FEATURE_COMPARTMENTS,
+    n_components: Sequence[int] = (4, 5),
+    scale_lower_quantile: float = 0.005,
+    scale_upper_quantile: float = 0.995,
+) -> list[dict]:
+    """COMPARATOR ONLY -- fit one joint NNMF over the immune markers instead of one per pair.
+
+    The pairwise fit takes ``per_arm = min(|target_only|, |reference_only|)`` cells, which for a sparse
+    marker such as CD20 can be a few dozen; the arm is then too small for the robust scaling quantiles
+    and the factorization is led by the abundant reference. Pooling defines the fitting set as the union
+    of cells positive for ANY immune marker, which is two to three orders of magnitude larger, and lets
+    one model describe all four targets consistently instead of refitting each target against every
+    candidate reference.
+
+    This writes comparator rows only. It does NOT emit a divisor or a call: RESTORE's divisor is defined
+    per target against a mutually-exclusive negative population, and generalizing that (plus a
+    directionality rule valid for more than two groups) is a method decision for the pair review, not a
+    refactor. The locked production path is untouched and still requires exactly two components.
+    """
+    donor = ensure_eligible_donors(
+        [donor], context="RESTORE immune-joint comparator"
+    )[0]
+    markers = list(markers)
+    feature_cols = [
+        compartment_column(compartment, marker)
+        for compartment in compartments
+        for marker in markers
+    ]
+    raw_cols = [f"raw__{marker}" for marker in markers]
+    missing = set(feature_cols + raw_cols).difference(donor_df.columns)
+    if missing:
+        raise ValueError(f"donor {donor}: missing immune-joint columns {sorted(missing)}")
+
+    matrix = donor_df[feature_cols].to_numpy(float)
+    raw = donor_df[raw_cols].to_numpy(float)
+    valid = np.isfinite(matrix).all(axis=1) & (matrix >= 0).all(axis=1) & np.isfinite(raw).all(axis=1)
+    valid_idx = np.flatnonzero(valid)
+    if not len(valid_idx):
+        raise ValueError(f"donor {donor}: no projectable cells for the immune-joint comparator")
+    matrix = matrix[valid_idx]
+    raw = raw[valid_idx]
+
+    floors = {
+        marker: estimate_marker_input_floor(raw[:, j], marker).value
+        for j, marker in enumerate(markers)
+    }
+    above = np.column_stack([raw[:, j] > floors[m] for j, m in enumerate(markers)])
+    immune_any = above.any(axis=1)
+    # "Exclusive arm" for a target: positive for it and negative for every other pooled marker. This is
+    # the same unambiguous population the pairwise anchor uses, so anchor recovery is comparable.
+    exclusive = {
+        marker: above[:, j] & ~np.delete(above, j, axis=1).any(axis=1)
+        for j, marker in enumerate(markers)
+    }
+
+    rows: list[dict] = []
+    fit_pool = np.flatnonzero(immune_any)
+    if len(fit_pool) < max(n_components) or not immune_any.any():
+        return rows
+
+    for k in n_components:
+        for seed in seeds:
+            fit_idx = _fit_indices(len(fit_pool), fit_cap, seed)
+            fit_rows = np.sort(fit_pool[fit_idx])
+            scaled, _lower, _upper = robust_minmax_scale(
+                matrix,
+                fit_rows,
+                lower_quantile=scale_lower_quantile,
+                upper_quantile=scale_upper_quantile,
+            )
+            try:
+                labels, _components, metadata = fit_nnmf_predict(
+                    scaled, n_components=k, seed=seed, fit_cap=None, fit_indices=fit_rows
+                )
+            except ValueError as exc:
+                rows.append(
+                    {"donor": donor, "method": "nnmf_immune_joint", "n_components": k,
+                     "seed": seed, "target": None, "error": str(exc)}
+                )
+                continue
+            # Assign each target the component with the highest mean raw intensity for that marker; a
+            # component may win more than one marker, which is exactly the non-exclusivity this
+            # comparator is meant to expose (CD11b spans myeloid subsets, CD163 overlaps CD68).
+            comp_of = {}
+            for j, marker in enumerate(markers):
+                means = [
+                    raw[labels == c, j].mean() if np.any(labels == c) else -np.inf
+                    for c in range(k)
+                ]
+                comp_of[marker] = int(np.argmax(means))
+            for j, marker in enumerate(markers):
+                arm = exclusive[marker]
+                recovery = (
+                    float((labels[arm] == comp_of[marker]).mean()) if arm.any() else None
+                )
+                rows.append(
+                    {
+                        "donor": donor,
+                        "method": "nnmf_immune_joint",
+                        "n_components": k,
+                        "seed": seed,
+                        "target": marker,
+                        "markers": "+".join(markers),
+                        "n_fit": int(len(fit_rows)),
+                        "n_immune_any": int(immune_any.sum()),
+                        "exclusive_arm_n": int(arm.sum()),
+                        "target_component": comp_of[marker],
+                        "component_shared_with": ";".join(
+                            other for other in markers
+                            if other != marker and comp_of[other] == comp_of[marker]
+                        ),
+                        "anchor_recovery": recovery,
+                        "target_input_floor": floors[marker],
+                        "converged": bool(metadata["converged"]),
+                        "error": None,
+                    }
+                )
+    return rows
+
+
 def evaluate_donor(
     donor_df: pd.DataFrame,
     donor: str,
@@ -2568,6 +2911,7 @@ def evaluate_cohort(
     groups: list[dict] = []
     pairs: list[dict] = []
     stability: list[dict] = []
+    immune_joint: list[dict] = []
     try:
         for donor in donors:
             donor_df, audit = load_validation_sample(
@@ -2581,6 +2925,9 @@ def evaluate_cohort(
             groups.extend(donor_groups)
             pairs.extend(donor_pairs)
             stability.extend(donor_stability)
+            immune_joint.extend(
+                evaluate_immune_joint(donor_df, donor, fit_cap=fit_cap, seeds=seeds)
+            )
             print(
                 f"[evaluate] donor {donor}: {len(donor_df):,} cells, "
                 f"{len(donor_runs)} model runs",
@@ -2593,6 +2940,7 @@ def evaluate_cohort(
             "model_runs": pd.DataFrame(runs),
             "group_metrics": pd.DataFrame(groups),
             "stability": pd.DataFrame(stability),
+            "immune_joint_comparator": pd.DataFrame(immune_joint),
         }
         for name, table in tables.items():
             table.to_csv(temp_dir / f"{name}.csv", index=False)

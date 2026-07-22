@@ -1056,16 +1056,32 @@ def _draw_review_row(
         fontsize=PDF_AXIS_LABEL_FONT_SIZE,
         labelpad=10,
     )
+    # Axes are bounded to make the Step 1 / Step 2 structure legible, so bright cells can sit above the
+    # panel. State how many, on each axis, so clipping is never silent.
+    clipped_y = int(np.count_nonzero(target_scaled[cloud_visible] >= 1.0))
+    clipped_x = int(np.count_nonzero(reference_scaled[cloud_visible] >= 1.0))
+    jaccard_note = (
+        f"control Jaccard {evaluation['min_control_jaccard']:.2f}"
+        if evaluation.get("stability_informative", True)
+        else f"control Jaccard {evaluation['min_control_jaccard']:.2f} (UNINFORMATIVE: arms saturated)"
+    )
+    recovery = evaluation.get("anchor_recovery")
+    recovery_note = "" if recovery is None else f" | anchor recovery {recovery:.2f}"
     cloud.set_title(
         (
             f"{evaluation['state']}\nTarget/reference fold "
             f"{evaluation['target_fold']:.2f}/{evaluation['reference_fold']:.2f} | "
-            f"control Jaccard {evaluation['min_control_jaccard']:.2f}\n"
+            f"{jaccard_note}{recovery_note}\n"
             f"High-confidence anchor n={evaluation['target_anchor_n']:,} | "
             "input-QC-retained lower-confidence target "
             f"n={evaluation['target_supported_additional_n']:,}\n"
             "Lower-confidence at/below Step 2 "
-            f"n={evaluation['target_supported_additional_below_divisor_n']:,}"
+            f"n={evaluation['target_supported_additional_below_divisor_n']:,}\n"
+            f"Scale tails {'WIDENED' if evaluation.get('scale_bound_adapted') else 'as configured'} "
+            f"({evaluation.get('scale_bound_lower_quantile', 0.005):.3f}-"
+            f"{evaluation.get('scale_bound_upper_quantile', 0.995):.3f} on n="
+            f"{evaluation.get('scale_bound_n', 0):,}) | "
+            f"above axis: {clipped_y:,} target, {clipped_x:,} reference"
         ),
         fontsize=PDF_ROW_TITLE_FONT_SIZE,
         pad=10,

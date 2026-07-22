@@ -474,6 +474,9 @@ def test_balanced_arm_fit_sampling_equalizes_exclusive_arms():
         "candidate_reference_n": 5,
         "candidate_double_high_n": 1,
         "fit_per_arm": 4,
+        # fit_cap//2 = 4 caps both arms below their candidate counts, so neither is saturated
+        "target_arm_saturated": False,
+        "reference_arm_saturated": False,
     }
     assert len(indices) == 8
     assert 11 not in indices
@@ -1190,3 +1193,113 @@ def test_review_bundle_removes_temporary_output_after_failure(
         )
     assert not output.exists()
     assert not output.with_name("review.tmp").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Scaling-bound support: a robust quantile is only robust if the sample can
+# span it. A sparse marker arm cannot, and one bright cell then sets the scale.
+# --------------------------------------------------------------------------- #
+def test_quantile_support_cells_uses_the_narrower_tail():
+    assert rv.quantile_support_cells(144, lower_quantile=0.005, upper_quantile=0.995) == pytest.approx(0.72)
+    assert rv.quantile_support_cells(200, lower_quantile=0.005, upper_quantile=0.995) == pytest.approx(1.0)
+    assert rv.quantile_support_cells(4752, lower_quantile=0.005, upper_quantile=0.995) == pytest.approx(23.76)
+
+
+def test_adaptive_bound_quantiles_widen_only_below_the_support_boundary():
+    # n = 200 is exactly one cell per tail at the shipped quantiles -> keep them as configured.
+    lower, upper, adapted, support = rv.adaptive_bound_quantiles(
+        200, lower_quantile=0.005, upper_quantile=0.995, min_support=1, repair_support=10
+    )
+    assert (lower, upper, adapted) == (0.005, 0.995, False)
+    assert support == pytest.approx(1.0)
+    # One row fewer cannot span a tail -> widen until each tail spans repair_support cells.
+    lower, upper, adapted, support = rv.adaptive_bound_quantiles(
+        199, lower_quantile=0.005, upper_quantile=0.995, min_support=1, repair_support=10
+    )
+    assert adapted and lower == pytest.approx(10 / 199) and upper == pytest.approx(1 - 10 / 199)
+    assert support == pytest.approx(10.0)
+
+
+def test_adaptive_bound_quantiles_never_exceed_the_quartile():
+    # 28 rows: 10/28 would be a 36% tail, which is no longer a tail. Cap at the quartile.
+    lower, upper, adapted, support = rv.adaptive_bound_quantiles(
+        28, lower_quantile=0.005, upper_quantile=0.995, min_support=1, repair_support=10
+    )
+    assert adapted and lower == pytest.approx(0.25) and upper == pytest.approx(0.75)
+    assert support == pytest.approx(7.0)
+
+
+def test_sparse_arm_bounds_ignore_a_single_bright_outlier():
+    """The defect this fixes: with a tiny arm, p99.5 interpolates between the top two cells."""
+    rng = np.random.default_rng(0)
+    n_arm = 60
+    feature = np.r_[rng.normal(400, 30, n_arm), rng.normal(20, 3, n_arm)]
+    feature[0] = 11_551.0  # the outlier that set the 6476 CD20 bound
+    features = np.column_stack([feature, feature * 0.9])
+    fit_indices = np.arange(2 * n_arm)          # a 120-row balanced sample
+
+    configured = np.quantile(features[fit_indices], 0.995, axis=0)
+    lower_q, upper_q, adapted, _support = rv.adaptive_bound_quantiles(
+        len(fit_indices), lower_quantile=0.005, upper_quantile=0.995,
+        min_support=1, repair_support=10,
+    )
+    assert adapted
+    _scaled, _lower, upper = rv.robust_minmax_scale(
+        features, fit_indices, lower_quantile=lower_q, upper_quantile=upper_q
+    )
+    # The configured bound is dragged far above the population it must describe; the widened one is not.
+    assert configured[0] > 5 * upper[0]
+    assert upper[0] < 1_000.0
+    # Crucially the bounds still come from the BALANCED sample -- swapping populations instead would
+    # re-create the same domination with the two markers' roles reversed.
+    assert len(fit_indices) == 2 * n_arm
+
+
+def test_arm_saturation_is_reported_and_probe_fraction_shrinks_arms():
+    target = np.array([10.0] * 5 + [1.0] * 500)
+    reference = np.array([1.0] * 5 + [10.0] * 500)
+    _idx, counts = rv.balanced_arm_fit_indices(
+        target, reference, 5.0, 5.0, fit_cap=1000, seed=0
+    )
+    # The 5-cell target arm is taken whole, so re-seeding cannot perturb it.
+    assert counts["target_arm_saturated"] is True
+    assert counts["reference_arm_saturated"] is False
+    assert counts["fit_per_arm"] == 5
+
+    probe_idx, probe_counts = rv.balanced_arm_fit_indices(
+        target, reference, 5.0, 5.0, fit_cap=1000, seed=0, probe_fraction=0.8
+    )
+    assert len(probe_idx) == 8                      # 4 per arm
+    # Saturation is reported for the real balanced size, not the shrunken probe size.
+    assert probe_counts["target_arm_saturated"] is True
+
+
+def test_immune_joint_comparator_pools_arms_and_emits_no_calls():
+    rng = np.random.default_rng(3)
+    n = 600
+    frame = {}
+    # Four disjoint immune populations plus a large negative bulk.
+    blocks = {m: slice(i * 40, (i + 1) * 40) for i, m in enumerate(rv.IMMUNE_JOINT_MARKERS)}
+    for marker in rv.IMMUNE_JOINT_MARKERS:
+        values = rng.normal(5.0, 0.5, n)
+        values[blocks[marker]] = rng.normal(300.0, 10.0, 40)
+        frame[f"raw__{marker}"] = values
+        for compartment in ("Membrane", "Cell"):
+            frame[rv.compartment_column(compartment, marker)] = values * (
+                0.9 if compartment == "Membrane" else 1.0
+            )
+    rows = rv.evaluate_immune_joint(
+        pd.DataFrame(frame), "synthetic", fit_cap=500, seeds=(0,), n_components=(4,)
+    )
+    assert rows and {r["target"] for r in rows} == set(rv.IMMUNE_JOINT_MARKERS)
+    # The pooled fitting set is the union of immune-positive cells, far larger than any single arm.
+    assert all(r["n_immune_any"] >= 4 * 40 * 0.9 for r in rows)
+    assert all(r["exclusive_arm_n"] > 0 for r in rows)
+    # Comparator only: it reports recovery, never a divisor or a positivity call.
+    assert all("divisor" not in r and "normalized" not in r for r in rows)
+    assert all(r["anchor_recovery"] is not None for r in rows)
+
+
+def test_locked_path_still_requires_exactly_two_components():
+    with pytest.raises(ValueError, match="two NNMF components"):
+        rv.PairValidationConfig(n_components=4)
