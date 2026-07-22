@@ -72,6 +72,10 @@ is larger (~59-plex); only these gate the broad lineage.
 ## Storage & reproducibility
 
 - The full cohort (~15–22 donors, ~23M cells) is tens of GB; `data/` is git-ignored.
+- Donor 6457 and 6579 raw/REDSEA files may remain for provenance, but neither may
+  be included in analysis. Donor 6457 had inaccurate channel registration after
+  poor DAPI staining; donor 6579 is excluded by maintainer decision as a
+  pancreatitis outlier. The pipeline enforces both exclusions centrally.
 - Keep raw `.qptiff` and `Cellmeasurements.csv` as the source of truth — every
   `data/` artifact is regenerable from them via `python -m phenocycler.pipeline`.
 - For human tissue: ensure IRB approval, de-identification, and secure storage.

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
+from .cohort import filter_eligible_donors
+
 # --------------------------------------------------------------------------- #
 # Scientific constants (faithful to Islet-Explorer-Senior; not usually tuned)
 # --------------------------------------------------------------------------- #
@@ -241,9 +243,12 @@ class PipelineConfig:
 
     # ---- helpers -----------------------------------------------------------
     def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
-        """Donor ids by globbing ``<dir>/donor_id=*`` (defaults to cells_dir)."""
+        """Discover donor partitions while enforcing central cohort exclusions."""
         base = Path(from_dir) if from_dir is not None else self.cells_dir
-        return sorted(p.name.split("=", 1)[1] for p in base.glob("donor_id=*"))
+        discovered = sorted(
+            p.name.split("=", 1)[1] for p in base.glob("donor_id=*")
+        )
+        return filter_eligible_donors(discovered)
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.geojson_dir, self.mask_dir, self.inter_dir):

@@ -190,9 +190,15 @@ def _assign_and_write(donor: str, gated_dir: str, cells_dir: str, out_dir: str) 
 
 def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFrame:
     """Assign compartments for all donors (parallel), write partitions + composition figure."""
+    from .cohort import ensure_eligible_donors
+
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
     cfg.broad_dir.mkdir(parents=True, exist_ok=True)
-    donor_ids = donors or cfg.discover_donors(cfg.restore_gated_dir)
+    donor_ids = (
+        list(ensure_eligible_donors(donors, context="lineage analysis"))
+        if donors
+        else cfg.discover_donors(cfg.restore_gated_dir)
+    )
     if not donor_ids:
         raise SystemExit(f"[err] no gated donors under {cfg.restore_gated_dir}")
 

@@ -160,10 +160,28 @@ notebooks/              thin step notebooks + orchestrator
 scripts/groovy/         QuPath export/import Groovy scripts
 scripts/R/              RESTORE efficacy diagnostic (mxnorm) + its installer (R 4.5.1)
 scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
+docs/RESTORE_PAIR_REVIEW_WORKFLOW.txt
+                        authoritative human pair-review workflow copied into each bundle
 tests/                  pytest: REDSEA math, RESTORE guard, ordered-residual lineage invariants
 config.ini              paths + tunables
 pyproject.toml          editable-install metadata (pip install -e .)
 ```
+
+Generated RESTORE review bundles must be entered through
+`START_HERE_RESTORE_REVIEW.txt`. Reviewers record decisions only in
+`review_decisions.csv`; the larger queue and manifest tables are provenance. The
+Step 2 horizontal line is the RESTORE divisor, not an exclusion boundary:
+input-QC-retained NNMF target-component cells at or left of the Step 1 reference
+separator remain target lineage evidence even when their normalized target value is at
+or below one. Cells below both raw input floors remain double-low and cannot be rescued
+by component assignment.
+
+Donors **6457 and 6579 are excluded until further notice from every analysis
+stage**. Donor 6457 had poor DAPI staining that prevented accurate Phenocycler
+channel registration; donor 6579 is excluded by maintainer decision as a
+pancreatitis outlier. Raw and REDSEA files may be retained for provenance, but
+automatic donor discovery filters both donors and explicit API/CLI analysis
+requests containing either donor fail closed.
 
 ## Testing
 

@@ -398,11 +398,18 @@ def import_restore(vendor: Path):
 # Data
 # --------------------------------------------------------------------------- #
 def donor_files(cells_dir, limit=None, donors=None):
+    from .cohort import ensure_eligible_donors, filter_eligible_donors
+
     files = sorted(glob.glob(str(Path(cells_dir) / "donor_id=*" / "*.parquet")))
     pairs = [(re.search(r"donor_id=([^/]+)", f).group(1), f) for f in files]
     if donors:
-        keep = {str(d) for d in donors}
+        keep = set(
+            ensure_eligible_donors(donors, context="RESTORE analysis")
+        )
         pairs = [p for p in pairs if p[0] in keep]
+    else:
+        eligible = set(filter_eligible_donors(donor for donor, _ in pairs))
+        pairs = [pair for pair in pairs if pair[0] in eligible]
     return pairs[:limit] if limit else pairs
 
 

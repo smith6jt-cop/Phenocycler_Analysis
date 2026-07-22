@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
+import pytest
 import scipy.sparse as sp
 
 from phenocycler import redsea
@@ -110,3 +113,73 @@ def test_redsea_params_from_config_preserves_defaults():
     assert p.alpha == 1.0
     assert p.edge_radius == 0          # 1-px band
     assert p.gap_bridge == 1
+
+
+def _redsea_io_config(tmp_path):
+    return SimpleNamespace(
+        cells_dir=tmp_path / "cells",
+        cells_redsea_dir=tmp_path / "cells_redsea",
+    )
+
+
+def _write_raw_ids(cfg, donor, ids):
+    path = cfg.cells_dir / f"donor_id={donor}"
+    path.mkdir(parents=True)
+    pd.DataFrame({"object_id": ids}).to_parquet(path / "data_0.parquet", index=False)
+
+
+def test_write_corrected_persists_only_canonical_raw_cells(tmp_path):
+    cfg = _redsea_io_config(tmp_path)
+    _write_raw_ids(cfg, "1", ["cell-b", "cell-a"])
+
+    redsea.write_corrected(
+        cfg,
+        "1",
+        ["cell-a", "tiny-fragment", "cell-b"],
+        ["CD3e"],
+        np.array([[10.0], [20.0], [30.0]]),
+        np.array([5.0, 1.0, 6.0]),
+    )
+
+    out = pd.read_parquet(cfg.cells_redsea_dir / "donor_id=1" / "data_0.parquet")
+    assert out["object_id"].tolist() == ["cell-a", "cell-b"]
+    assert out["CD3e"].tolist() == [10.0, 30.0]
+    assert out["cell_area_px"].tolist() == [5.0, 6.0]
+
+
+def test_write_corrected_fails_when_canonical_cell_is_missing(tmp_path):
+    cfg = _redsea_io_config(tmp_path)
+    _write_raw_ids(cfg, "1", ["cell-a", "missing-cell"])
+
+    with pytest.raises(ValueError, match="canonical raw cells are missing"):
+        redsea.write_corrected(
+            cfg,
+            "1",
+            ["cell-a", "tiny-fragment"],
+            ["CD3e"],
+            np.array([[10.0], [20.0]]),
+            np.array([5.0, 1.0]),
+        )
+
+
+def test_reconcile_existing_redsea_is_exact_and_schema_preserving(tmp_path):
+    cfg = _redsea_io_config(tmp_path)
+    _write_raw_ids(cfg, "1", ["cell-a", "cell-b"])
+    path = cfg.cells_redsea_dir / "donor_id=1"
+    path.mkdir(parents=True)
+    before = pd.DataFrame(
+        {
+            "object_id": ["cell-a", "tiny-fragment", "cell-b"],
+            "donor_id": ["1", "1", "1"],
+            "cell_area_px": np.array([5.0, 1.0, 6.0], dtype=np.float64),
+            "CD3e": np.array([10.0, 20.0, 30.0], dtype=np.float64),
+        }
+    )
+    before.to_parquet(path / "data_0.parquet", index=False)
+
+    redsea.reconcile_existing_donor("1", cfg)
+
+    out = pd.read_parquet(path / "data_0.parquet")
+    assert out["object_id"].tolist() == ["cell-a", "cell-b"]
+    assert out["CD3e"].tolist() == [10.0, 30.0]
+    assert out.dtypes.to_dict() == before.dtypes.to_dict()

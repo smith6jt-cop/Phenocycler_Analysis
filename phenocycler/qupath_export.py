@@ -28,8 +28,13 @@ def export_qupath_classes(cfg: PipelineConfig) -> Path:
     out = cfg.qupath_class_dir
     out.mkdir(parents=True, exist_ok=True)
     total = 0
-    for bf in sorted(glob.glob(str(cfg.broad_dir / "donor_id=*" / "*.parquet"))):
-        donor = bf.split("donor_id=")[1].split("/")[0]
+    for donor in cfg.discover_donors(cfg.broad_dir):
+        broad_files = sorted(
+            glob.glob(str(cfg.broad_dir / f"donor_id={donor}" / "*.parquet"))
+        )
+        if not broad_files:
+            continue
+        bf = broad_files[0]
         b = pd.read_parquet(bf, columns=["object_id", "compartment", "cell_type"])
         cells = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
         if not cells:

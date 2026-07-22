@@ -1,0 +1,140 @@
+RESTORE PAIR REVIEW - START HERE
+================================
+
+Purpose
+-------
+Decide whether each proposed target <- reference pair identifies:
+
+1. a real target-positive/reference-negative population, and
+2. a real reference-positive/target-negative negative-control population.
+
+This review does not accept a RESTORE divisor, call a phenotype, or rebuild any
+downstream data. Computational success is not biological acceptance.
+
+
+Use only these four surfaces
+----------------------------
+1. START_HERE_RESTORE_REVIEW.txt
+   The authoritative workflow.
+
+2. review_decisions.csv
+   The only file to edit. It has one row per donor shown in the PDFs.
+
+3. spatial_review/<target>_from_<reference>.pdf
+   The primary review surface. Complete the PDF review first.
+
+4. import_restore_pair_review.groovy
+   Use in QuPath only when a PDF row needs closer spatial inspection.
+   The script detects the open image and presents only valid pairs in a dialog.
+
+pair_summary.csv, review_queue.csv, review_manifest.json, and qupath_review/
+are provenance or importer inputs. They are not the operating checklist.
+
+
+Raw arm-floor provenance
+------------------------
+Each PDF title states the donor-local raw arm-floor method for both markers. CD3e and
+CD20 use max(raw-linear Otsu, raw-linear Triangle); every other currently screened
+marker uses its explicit raw-linear Otsu policy. There is no silent fallback.
+
+These floors define provisional NNMF fitting arms, the high-confidence Step 1 anchor,
+and the input-QC-retained set eligible for target-component support. A valid cell below
+both floors remains double-low and cannot be overwritten by NNMF component assignment.
+The floors are not RESTORE divisors and are not production positivity thresholds. The
+Step 2 horizontal line remains the candidate RESTORE divisor described below.
+
+
+One-pass workflow
+-----------------
+Work through review_decisions.csv in pair_order, one PDF at a time.
+
+For each donor row:
+
+A. Review Step 1 target separation in the left expression panel.
+   - The vermillion high-confidence target anchor sets the dashed vertical green
+     separator.
+   - Purple cells are input-QC-retained lower-confidence NNMF target-component cells
+     that are reference-negative by that separator. They remain target lineage evidence
+     even below Step 2. Cells below both raw floors stay double-low. Vermillion and
+     purple are deliberately high-contrast colors.
+   - Confirm that the dashed line separates the intended target component from the
+     reference-positive population before reviewing any divisor.
+   - The anchor itself should be a plausible target-high/reference-low arm and must lie
+     on the low-reference side of the dashed line.
+   - Record PASS, FAIL, ABSENT, or UNCERTAIN in step1_target_separation.
+   - ABSENT means the target is genuinely absent in that donor; it does not mean
+     that the pair failed.
+
+B. Review Step 2 reference controls in the left expression panel.
+   - Reference controls are blue.
+   - They must be plausible reference-positive/target-negative cells.
+   - They must lie strictly to the right of the dashed vertical line.
+   - The solid horizontal green line is the maximum target intensity among only
+     those blue controls. Check that it is not set by a biologically target-positive
+     contaminant or an obvious artifact.
+   - This horizontal line is the RESTORE normalization divisor. It does not exclude
+     vermillion or purple target-component cells below it.
+   - Record PASS, FAIL, or UNCERTAIN in step2_reference_controls.
+
+C. Review spatial coherence in the large representative close-up panel.
+   - The small inset is the whole-tissue context; its box locates the main zoom.
+   - Vermillion, purple, and blue cells should have plausible morphology and
+     localization for that donor and marker pair.
+   - Do not require a particular abundance, uniformity, or cohort-like pattern.
+   - Record PASS, FAIL, UNCERTAIN, or NOT_REVIEWED in spatial_coherence.
+
+D. Enter one donor_disposition:
+   - SUPPORTED: Steps 1 and 2 pass and spatial review does not fail.
+   - TARGET_ABSENT: the target is genuinely absent; the pair is not penalized.
+   - PAIR_FAILED: wrong populations, contaminated controls, invalid separation,
+     or spatially incoherent assignments.
+   - UNRESOLVED: evidence is insufficient or contradictory.
+
+Add a short note whenever the disposition is not SUPPORTED.
+
+
+QuPath only when needed
+-----------------------
+1. Open the exact donor image named in review_decisions.csv.
+2. Run import_restore_pair_review.groovy from this bundle.
+3. Choose the target <- reference pair in the dialog. No filename editing is needed.
+4. Toggle the target-anchor, additional retained target-component, reference-control,
+   double-high, and other-retained classes individually while inspecting marker signal
+   and morphology.
+5. Rerun the same script to select another pair. Prior RESTORE review classes are
+   replaced. Before the first overlay, the script stores every original PathClass in
+   per-object metadata so existing classifications can be restored exactly.
+6. When finished with an image, rerun the script and choose
+   "[Clear temporary RESTORE review classes]". This restores the saved original
+   PathClasses, including Unclassified.
+
+Every canonical cell whose centroid lies inside the representative image crop receives
+a review label. There is no plotting or category subsampling in the crop. Cells outside
+the crop retain their existing PathClasses.
+
+
+Non-negotiable review rules
+---------------------------
+- Judge each donor against its own raw/REDSEA signal, morphology, and spatial pattern.
+- Never reject or adjust a pair because a donor differs from cohort frequency.
+- Donor 6476 is not a pancreatitis donor and must not be described as one.
+- Donor 6457 is excluded from this and every other analysis until further notice
+  because poor DAPI staining prevented accurate channel registration.
+- Donor 6579 is excluded from this and every other analysis until further notice
+  by maintainer decision because it is the pancreatitis outlier.
+- Donor 6539 has independently confirmed CD20 absence.
+- Cells displayed as double-high, double-low, other-retained, or unavailable set
+  neither line.
+- Input-QC-retained, reference-negative NNMF target-component cells remain target
+  lineage evidence even below the horizontal divisor; double-low cells do not. Only
+  the high-confidence anchor sets Step 1.
+- Do not move a green line manually or calculate a divisor during this review.
+- If target absence and pair failure cannot be distinguished, record UNRESOLVED.
+
+
+Completion
+----------
+The review phase is complete when every row in review_decisions.csv has a
+donor_disposition and explanatory notes for every non-SUPPORTED row. Return that
+single CSV for pair-level adjudication. No production RESTORE or phenotyping step
+should run before the pair-level decisions are explicitly approved.

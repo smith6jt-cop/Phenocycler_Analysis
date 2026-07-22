@@ -65,7 +65,13 @@ def run_figures(cfg: PipelineConfig, *, donors=None) -> dict:
     Streams one donor at a time (memory released each iteration), accumulating EXACT NaN-safe per-cell_type
     sums. Returns the two output PNG paths. ``donors`` restricts the run (defaults to every donor under
     ``cfg.broad_dir``)."""
-    donors = list(donors) if donors else cfg.discover_donors(cfg.broad_dir)
+    from .cohort import ensure_eligible_donors
+
+    donors = (
+        list(ensure_eligible_donors(donors, context="phenotype figures"))
+        if donors
+        else cfg.discover_donors(cfg.broad_dir)
+    )
     if not donors:
         raise SystemExit(f"no broad output under {cfg.broad_dir} — run phenocycler.lineage first")
 

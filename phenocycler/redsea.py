@@ -30,6 +30,8 @@ Additions vs. upstream:
     python -m phenocycler.redsea --donor 6539            # smoke test (smallest)
     python -m phenocycler.redsea --all --jobs 4          # 4 donors in parallel
     python -m phenocycler.redsea --all --gpu             # CuPy accumulation/matmul
+    python -m phenocycler.redsea --all --reconcile-existing
+                                                            # filter existing outputs to raw-cell IDs
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import argparse
 import functools
 import glob
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -404,14 +407,175 @@ def bandcount_from_mask(mask, n, edge_radius):
     return np.bincount(mask.ravel()[np.flatnonzero(band.ravel())], minlength=n + 1)[1:].astype(np.float64)
 
 
+def canonical_cell_mask(cfg: PipelineConfig, donor: str, oids) -> np.ndarray:
+    """Return the GeoJSON rows that belong to the canonical raw-cell table.
+
+    REDSEA must retain every GeoJSON object while building the mask and contact graph,
+    including tiny segmentation fragments excluded from ``data/cells``. Persisting
+    those fragments is unsafe, though: they have no canonical morphology or spatial
+    metadata and create a larger downstream cell universe. Every canonical raw cell
+    must occur exactly once in the GeoJSON; GeoJSON-only rows are deliberately omitted
+    only when writing the corrected parquet.
+    """
+    files = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
+    if len(files) != 1:
+        raise ValueError(
+            f"expected one canonical raw parquet for donor {donor}, found {len(files)}"
+        )
+
+    canonical_values = pd.read_parquet(files[0], columns=["object_id"])["object_id"]
+    geojson_values = pd.Series(oids, dtype="string")
+    if canonical_values.isna().any() or geojson_values.isna().any():
+        raise ValueError(f"donor {donor}: null object_id in canonical raw or GeoJSON cells")
+    canonical = pd.Index(canonical_values.astype(str), name="object_id")
+    geojson_ids = pd.Index(geojson_values.astype(str), name="object_id")
+    if not canonical.is_unique:
+        raise ValueError(f"donor {donor}: duplicate object_id in canonical raw cells")
+    if not geojson_ids.is_unique:
+        raise ValueError(f"donor {donor}: duplicate object_id in GeoJSON cells")
+
+    missing = canonical.difference(geojson_ids, sort=False)
+    if len(missing):
+        preview = ", ".join(map(str, missing[:5]))
+        raise ValueError(
+            f"donor {donor}: {len(missing):,} canonical raw cells are missing from "
+            f"the REDSEA GeoJSON ({preview})"
+        )
+
+    keep = geojson_ids.isin(canonical)
+    n_extra = int((~keep).sum())
+    if n_extra:
+        log(
+            f"[{donor}] output key reconciliation: retaining {int(keep.sum()):,} "
+            f"canonical cells; omitting {n_extra:,} GeoJSON-only fragments"
+        )
+    return np.asarray(keep, dtype=bool)
+
+
 def write_corrected(cfg: PipelineConfig, donor, oids, cols, corrected, sizes):
-    out = pd.DataFrame({"object_id": oids, "donor_id": donor, "cell_area_px": sizes})
+    keep = canonical_cell_mask(cfg, str(donor), oids)
+    object_ids = np.asarray(oids, dtype=object)[keep]
+    corrected = np.asarray(corrected)[keep]
+    sizes = np.asarray(sizes)[keep]
+
+    out = pd.DataFrame({"object_id": object_ids, "donor_id": donor, "cell_area_px": sizes})
     for k, c in enumerate(cols):
         out[c] = corrected[:, k]
     out_dir = cfg.cells_redsea_dir / f"donor_id={donor}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_dir / "data_0.parquet", index=False)
     log(f"[{donor}] wrote {out_dir/'data_0.parquet'} ({len(out):,} rows)")
+
+
+def reconcile_existing_donor(donor: str, cfg: PipelineConfig) -> str:
+    """Atomically restrict an existing REDSEA parquet to canonical raw object IDs."""
+    import duckdb
+    import pyarrow.parquet as pq
+
+    raw_files = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
+    redsea_files = sorted(
+        glob.glob(str(cfg.cells_redsea_dir / f"donor_id={donor}" / "*.parquet"))
+    )
+    if len(raw_files) != 1 or len(redsea_files) != 1:
+        raise ValueError(
+            f"donor {donor}: expected one raw and one REDSEA parquet; found "
+            f"{len(raw_files)} raw and {len(redsea_files)} REDSEA"
+        )
+
+    raw_path = Path(raw_files[0])
+    redsea_path = Path(redsea_files[0])
+    temp_path = redsea_path.with_name(f".{redsea_path.stem}.reconciled.parquet")
+    temp_path.unlink(missing_ok=True)
+    original_schema = pq.ParquetFile(redsea_path).schema_arrow
+
+    def sql_path(path: Path) -> str:
+        return str(path).replace("'", "''")
+
+    con = duckdb.connect()
+    try:
+        raw_q = sql_path(raw_path)
+        redsea_q = sql_path(redsea_path)
+        temp_q = sql_path(temp_path)
+        stats = con.execute(
+            f"""
+            WITH raw AS (
+              SELECT CAST(object_id AS VARCHAR) AS object_id
+              FROM read_parquet('{raw_q}', hive_partitioning=false)
+            ), redsea AS (
+              SELECT CAST(object_id AS VARCHAR) AS object_id
+              FROM read_parquet('{redsea_q}', hive_partitioning=false)
+            )
+            SELECT
+              (SELECT count(*) FROM raw),
+              (SELECT count(DISTINCT object_id) FROM raw),
+              (SELECT count(*) FROM raw WHERE object_id IS NULL),
+              (SELECT count(*) FROM redsea),
+              (SELECT count(DISTINCT object_id) FROM redsea),
+              (SELECT count(*) FROM redsea WHERE object_id IS NULL),
+              (SELECT count(*) FROM raw ANTI JOIN redsea USING (object_id))
+            """
+        ).fetchone()
+        raw_n, raw_unique, raw_null, redsea_n, redsea_unique, redsea_null, raw_missing = stats
+        if raw_null or redsea_null or raw_unique != raw_n or redsea_unique != redsea_n:
+            raise ValueError(
+                f"donor {donor}: object_id must be non-null and unique "
+                f"(raw {raw_unique:,}/{raw_n:,}, REDSEA {redsea_unique:,}/{redsea_n:,})"
+            )
+        if raw_missing:
+            raise ValueError(
+                f"donor {donor}: {raw_missing:,} canonical raw cells are missing from REDSEA"
+            )
+        if raw_n == redsea_n:
+            log(f"[{donor}] existing REDSEA keys already match {raw_n:,} canonical cells")
+            return donor
+
+        con.execute("SET preserve_insertion_order=true")
+        con.execute(
+            f"""
+            COPY (
+              SELECT redsea.*
+              FROM read_parquet('{redsea_q}', hive_partitioning=false) AS redsea
+              SEMI JOIN (
+                SELECT CAST(object_id AS VARCHAR) AS object_id
+                FROM read_parquet('{raw_q}', hive_partitioning=false)
+              ) AS raw
+              ON CAST(redsea.object_id AS VARCHAR) = raw.object_id
+            ) TO '{temp_q}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        reconciled_n, reconciled_unique = con.execute(
+            f"""
+            SELECT count(*), count(DISTINCT CAST(object_id AS VARCHAR))
+            FROM read_parquet('{temp_q}', hive_partitioning=false)
+            """
+        ).fetchone()
+        if reconciled_n != raw_n or reconciled_unique != raw_n:
+            raise ValueError(
+                f"donor {donor}: reconciled REDSEA has {reconciled_n:,} rows / "
+                f"{reconciled_unique:,} IDs; expected {raw_n:,}"
+            )
+        if not pq.ParquetFile(temp_path).schema_arrow.equals(original_schema):
+            raise ValueError(f"donor {donor}: reconciliation changed the REDSEA schema")
+        os.replace(temp_path, redsea_path)
+        log(
+            f"[{donor}] reconciled existing REDSEA: {redsea_n:,} -> {raw_n:,} "
+            f"canonical rows"
+        )
+        return donor
+    finally:
+        con.close()
+        temp_path.unlink(missing_ok=True)
+
+
+def reconcile_existing(cfg: PipelineConfig, donors: list[str], *, n_jobs: int = 1) -> list:
+    """Reconcile retained REDSEA outputs in parallel, one atomic file replacement per donor."""
+    from .cohort import ensure_eligible_donors
+
+    donors = list(
+        ensure_eligible_donors(donors, context="REDSEA reconciliation")
+    )
+    fn = functools.partial(reconcile_existing_donor, cfg=cfg)
+    return map_donors(fn, donors, n_jobs=n_jobs, ordered=True, on_error="raise")
 
 
 # --------------------------------------------------------------------------- per donor
@@ -569,6 +733,9 @@ def recompensate_from_intermediates(donor: str, cfg: PipelineConfig, params: Red
 def run_redsea(cfg: PipelineConfig, donors: list[str], params: RedseaParams,
                *, from_intermediates: bool = False, n_jobs: int = 1) -> list:
     """Run REDSEA over a list of donors, optionally across processes."""
+    from .cohort import ensure_eligible_donors
+
+    donors = list(ensure_eligible_donors(donors, context="REDSEA analysis"))
     worker = recompensate_from_intermediates if from_intermediates else process_donor
     fn = functools.partial(_safe_worker, worker=worker, cfg=cfg, params=params)
     return map_donors(fn, donors, n_jobs=n_jobs, ordered=True, on_error="log")
@@ -616,6 +783,9 @@ def main(argv=None):
                     help="dump data/edge/sizes/contact for fast --from-intermediates re-runs")
     ap.add_argument("--from-intermediates", action="store_true",
                     help="skip raster+channels; reload saved intermediates and just (re)compensate")
+    ap.add_argument("--reconcile-existing", action="store_true",
+                    help="atomically filter retained REDSEA parquets to canonical data/cells object IDs; "
+                         "does not recompute REDSEA")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
@@ -639,18 +809,28 @@ def main(argv=None):
     if a.all:
         donors = cfg.discover_donors()
     elif a.donor:
-        donors = [a.donor]
+        from .cohort import ensure_eligible_donors
+
+        donors = list(
+            ensure_eligible_donors([a.donor], context="REDSEA analysis")
+        )
     else:
         raise SystemExit("specify --donor <id> or --all")
 
-    # GPU + a local process pool would contend on one device; force serial with GPU.
+    # GPU + a local process pool would contend on one device during REDSEA
+    # computation. Existing-file reconciliation is CPU/I/O-only and remains parallel.
     n_jobs = cfg.n_jobs
-    if params.use_gpu and n_jobs != 1:
+    if not a.reconcile_existing and params.use_gpu and n_jobs != 1:
         log("[warn] --gpu with --jobs>1 would contend on one device; forcing jobs=1 "
             "(use a SLURM array for GPU cohort parallelism)")
         n_jobs = 1
 
-    run_redsea(cfg, donors, params, from_intermediates=a.from_intermediates, n_jobs=n_jobs)
+    if a.reconcile_existing:
+        if a.from_intermediates:
+            raise SystemExit("--reconcile-existing cannot be combined with --from-intermediates")
+        reconcile_existing(cfg, donors, n_jobs=n_jobs)
+    else:
+        run_redsea(cfg, donors, params, from_intermediates=a.from_intermediates, n_jobs=n_jobs)
     return 0
 
 

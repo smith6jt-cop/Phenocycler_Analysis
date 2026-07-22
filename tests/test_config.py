@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from phenocycler import load_config
+from phenocycler.cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 from phenocycler.config import (COMPARTMENT_ORDER, COMPARTMENT_GATES, OTHER_LABEL,
                                 ENDOCRINE_MARKERS, MARKER_PAIRS, FUNCTIONAL_PAIRS)
 
@@ -71,9 +72,19 @@ def test_env_override(monkeypatch, tmp_path):
 
 def test_discover_donors(tmp_path):
     cfg = load_config(data_dir=tmp_path)
-    for d in ("6539", "6450", "6414"):
+    for d in ("6579", "6539", "6457", "6450", "6414"):
         (tmp_path / "cells" / f"donor_id={d}").mkdir(parents=True)
     assert cfg.discover_donors() == ["6414", "6450", "6539"]   # sorted
+
+
+def test_excluded_donors_fail_closed_when_requested_explicitly():
+    import pytest
+
+    assert "channel registration" in DONOR_EXCLUSIONS["6457"]
+    assert "pancreatitis outlier" in DONOR_EXCLUSIONS["6579"]
+    for donor in DONOR_EXCLUSIONS:
+        with pytest.raises(ValueError, match=rf"excluded donor.*{donor}"):
+            ensure_eligible_donors(["6539", donor], context="test analysis")
 
 
 def test_compartment_constants_shape():
