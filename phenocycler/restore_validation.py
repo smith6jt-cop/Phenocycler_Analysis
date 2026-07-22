@@ -23,7 +23,11 @@ import pandas as pd
 from .cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 
 
-METHOD_VERSION = "restore-pair-validation-v5"
+# v6: robust min-max tails adapt when the balanced fit sample cannot span the configured pair, so a
+# single bright cell in a sparse arm no longer sets the feature scale (22 of 600 screened rows, all with
+# immune targets). Adds anchor_recovery, arm-saturation/stability_informative reporting, and a
+# saturated-arm probe Jaccard. v5 artifacts were produced under the degenerate bound rule.
+METHOD_VERSION = "restore-pair-validation-v6"
 BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
     ("E_cadherin", "CD31"),
     ("CD31", "E_cadherin"),
