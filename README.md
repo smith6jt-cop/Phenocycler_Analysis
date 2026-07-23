@@ -54,13 +54,22 @@ subclustering, and the interactive R Shiny app.
   applies `corrected = clip(data − α·(F @ edge))` (subtract-only, α=1, 1-px band by
   default).
 - **RESTORE** (Chang et al., *Commun. Biol.* 2020) normalizes per-image intensity using
-  mutually-exclusive marker pairs. `phenocycler/restore.py` drives the **vendored**
+  mutually-exclusive marker pairs. **RETIRED 2026-07-23 — the paired driver
+  (`restore.run_restore`) and its curated web (`MARKER_PAIRS` / `FUNCTIONAL_PAIRS`) are
+  deleted**, and the pipeline's `restore` stage now raises: ten of those pairs referenced
+  CD20, which is too sparse in pancreas to define a negative control, and there is no
+  mechanical substitute. The manuscript-faithful replacement uses an **NNMF separator** and
+  a divisor equal to the **MAXIMUM** target intensity among the accepted target-negative
+  controls — `phenocycler/restore_validation.py`, entry point
+  `python -m phenocycler.restore_validation evaluate-locked`. Nothing is accepted yet
+  (Gate 2 of 7); see `docs/restore_faithful_rebuild_plan.md` in the parent repo.
+  *Retired description, kept for context:* `phenocycler/restore.py` drove the **vendored**
   RESTORE (`external/RESTORE`, git submodule) headlessly, fitting KMeans/GMM/**SSC**
-  per image × pair (SSC is the default), with a robust cohort-median guard on degenerate
-  thresholds. The pairs are a **curated directional web** (`MARKER_PAIRS` in `config.py`):
-  each `[target, counterpart]` thresholds the target against a biologically mutually-exclusive
+  per image × pair (SSC the default), with a robust cohort-median guard on degenerate
+  thresholds; the pairs were a **curated directional web** in which each
+  `[target, counterpart]` thresholded the target against a biologically mutually-exclusive
   counterpart (e.g. `E_cadherin ← CD31`, `B3TUBB ← CD3e`, intra-islet `INS ↔ GCG`) — not a
-  single universal reference. All markers are thresholded in ONE pass.
+  single universal reference, all markers thresholded in ONE pass.
 - **Broad phenotyping** (`lineage.py`) assigns each cell by an **ordered residual gating tree**:
   Epithelial (E-cadherin) → Endothelial (CD31) → Neural (B3TUBB) → Immune (marker union + NK) →
   Mesenchymal (SMA then Vimentin), each gate on the residual of the prior; cells failing every

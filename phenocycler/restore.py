@@ -2,6 +2,17 @@
 """
 Step 3 — RESTORE per-image intensity normalization of mutually-exclusive markers.
 
+RETIRED 2026-07-23 — the paired driver described below (``run_restore`` /
+``run_restore_functional``) is DELETED along with the curated pair webs it consumed
+(``MARKER_PAIRS`` / ``FUNCTIONAL_PAIRS``, see the tombstone in ``config.py``); ten of
+those pairs referenced CD20, which is too sparse in pancreas to define a negative
+control.  This module now serves only ``run_restore_proliferation`` plus the reusable
+machinery below (``idx_select``, ``neg_stat``, ``fit_clusters``, the threshold LUT and
+apply helpers, the QC plots), which the manuscript-faithful method reuses.  For Gate 2
+use ``python -m phenocycler.restore_validation evaluate-locked``; see
+``docs/restore_faithful_rebuild_plan.md``.  Everything from here to the Pipeline block
+describes the RETIRED paired path and is kept for context only.
+
 Applies RESTORE (Chang Lab / OHSU; vendored under ``external/RESTORE``) to the
 REDSEA-corrected single-cell data.  Marker thresholds come from a curated web of
 DIRECTIONAL mutually-exclusive pairs (``MARKER_PAIRS`` in ``config.py``): each pair
