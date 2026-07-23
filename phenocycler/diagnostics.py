@@ -16,7 +16,7 @@ drift:
     fit_clusters  RESTORE 2-cluster negative-population fit (SSC/GMM/KMeans) (re-exported from restore)
 
 Also re-exports the production constants/mappings the tracing reuses (so the notebook does not hardcode
-them): ``MARKER_PAIRS``, ``COMPARTMENT_ORDER``, ``OTHER_LABEL``, ``STATUS_ORDER`` and ``status_map(cfg)``.
+them): ``COMPARTMENT_ORDER``, ``OTHER_LABEL``, ``STATUS_ORDER`` and ``status_map(cfg)``.
 
 NB: importing this module imports ``phenocycler.restore``, which sets the matplotlib ``Agg`` backend — in a
 notebook, re-assert ``%matplotlib inline`` in the cell AFTER importing, so the tracing figures render inline.
@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd  # noqa: F401  (re-exported convenience for notebook cells)
 import pyarrow.parquet as pq
 
-from .config import MARKER_PAIRS, COMPARTMENT_ORDER, OTHER_LABEL, STATUS_ORDER
+from .config import COMPARTMENT_ORDER, OTHER_LABEL, STATUS_ORDER
 from .lineage import status_map
 from .restore import (idx_select, neg_stat, fit_clusters, r_otsu, partner_low_thresh, bimodal_thresh,
                       logmean_ksigma)
@@ -38,7 +38,7 @@ from .restore import (idx_select, neg_stat, fit_clusters, r_otsu, partner_low_th
 __all__ = [
     "read_donor", "r_otsu",
     "idx_select", "neg_stat", "fit_clusters", "partner_low_thresh", "bimodal_thresh", "logmean_ksigma",
-    "MARKER_PAIRS", "COMPARTMENT_ORDER", "OTHER_LABEL", "STATUS_ORDER", "status_map",
+    "COMPARTMENT_ORDER", "OTHER_LABEL", "STATUS_ORDER", "status_map",
 ]
 
 

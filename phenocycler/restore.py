@@ -53,7 +53,7 @@ if not matplotlib.get_backend().startswith("module://"):  # keep a notebook's in
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .config import PipelineConfig, load_config, MARKER_PAIRS, FUNCTIONAL_PAIRS, ENDOCRINE_MARKERS
+from .config import PipelineConfig, load_config, ENDOCRINE_MARKERS
 from .marker_taxonomy import PROLIFERATION
 from .parallel import map_donors
 
@@ -663,122 +663,13 @@ def qc_positive_fractions(frac_df, markers, qc_dir):
 # --------------------------------------------------------------------------- #
 # Driver + Main
 # --------------------------------------------------------------------------- #
-def run_restore(cfg: PipelineConfig, *, cells_dir: Optional[Path] = None, model=None,
-                subsample=None, marker_pairs=None, marker_sigma=None, limit_scenes=None,
-                donors=None, skip_apply=False, robust=None, robust_factor=None,
-                reuse_threshs=False, ref_qc=True, seed=None, n_jobs=None,
-                out_dir: Optional[Path] = None, gated_dir: Optional[Path] = None,
-                thresh_csv: Optional[Path] = None, idx_floor_q=None,
-                neg_stat=None, presence_min_sep=None, idx_nonzero_q=None, partner_low_q=None):
-    """Run RESTORE fit + robust LUT + per-donor apply.  Reads the REDSEA-corrected
-    cells by default; writes gated parquet + thresholds csv.
-
-    ``out_dir`` / ``gated_dir`` / ``thresh_csv`` default (``None``) to the canonical
-    ``cfg.restore_dir`` / ``cfg.restore_gated_dir`` / ``cfg.restore_thresholds_csv``;
-    :func:`run_restore_functional` overrides them to run the OPTIONAL functional-marker pass into the
-    ``*_extra`` dirs without touching the main gates."""
-    cells_dir = Path(cells_dir) if cells_dir is not None else cfg.cells_redsea_dir
-    model = model or cfg.restore_model
-    subsample = cfg.restore_subsample if subsample is None else subsample
-    robust = cfg.restore_robust if robust is None else robust
-    robust_factor = cfg.restore_robust_factor if robust_factor is None else robust_factor
-    seed = cfg.restore_seed if seed is None else seed
-    n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
-    idx_floor_q = cfg.restore_idx_floor_q if idx_floor_q is None else idx_floor_q
-    neg_stat_name = cfg.restore_neg_stat if neg_stat is None else neg_stat
-    presence_min_sep = cfg.restore_presence_min_sep if presence_min_sep is None else presence_min_sep
-    idx_nonzero_q = cfg.restore_idx_nonzero_q if idx_nonzero_q is None else idx_nonzero_q
-    partner_low_q = cfg.restore_partner_low_q if partner_low_q is None else partner_low_q
-
-    pairs = marker_pairs or [list(p) for p in MARKER_PAIRS]
-    markers = sorted({m for pair in pairs for m in pair})
-    print(f"[config] pairs (target<-reference): {pairs}")
-    print(f"[config] markers={markers}  chosen_model={model}  subsample={subsample}  cells_dir={cells_dir}")
-
-    out_dir = cfg.restore_dir if out_dir is None else Path(out_dir)
-    gated_dir = cfg.restore_gated_dir if gated_dir is None else Path(gated_dir)
-    thresh_csv = cfg.restore_thresholds_csv if thresh_csv is None else Path(thresh_csv)
-    qc_dir = out_dir / "qc"
-    qc_dir.mkdir(parents=True, exist_ok=True)
-
-    Normalization, _ = import_restore(cfg.restore_vendor)
-    if marker_sigma:
-        patch_restore_sigma(Normalization, marker_sigma)
-    patch_restore_cluster_cap(Normalization, subsample, seed)
-    patch_restore_no_kde(Normalization)
-    if (idx_floor_q and idx_floor_q > 0) or (partner_low_q and partner_low_q > 0):  # install the patch for
-        patch_restore_idx_floor(Normalization, idx_floor_q, neg_stat_name, idx_nonzero_q,  # idx-floor OR partner-low
-                                presence_min_sep, subsample, seed, partner_low_q)
-
-    print("[step1] building RESTORE input (full images; idx_select runs on all cells) ...")
-    region_dir = cfg.cells_dir if (partner_low_q and partner_low_q > 0) else None   # islet mask for partner-low
-    data = build_restore_input(cells_dir, markers, None, seed, limit_scenes, donors, region_dir=region_dir)
-
-    pkl = out_dir / "threshs.pkl"
-    if reuse_threshs and pkl.exists():
-        print(f"[step2] --reuse-threshs: loading existing {pkl}")
-    else:
-        print("[step2] running RESTORE (KMeans + GMM + SSC, save_figs=False) ...")
-        norm = Normalization(data, pairs, save_dir=str(out_dir), save_figs=False)
-        norm.run()
-        print(f"[step2] wrote {pkl}")
-
-    with open(pkl, "rb") as fh:
-        threshs = pickle.load(fh)
-    thr_df = flatten_threshs(threshs)
-    thr_df["chosen"] = thr_df["model"] == model
-    thr_df.sort_values(["marker", "image", "model"]).to_csv(thresh_csv, index=False)
-    print(f"[step3] wrote {thresh_csv}  ({len(thr_df)} rows)")
-
-    print("[step4] QC plots ...")
-    qc_histograms(data, thr_df, markers, qc_dir)
-    qc_threshold_heatmap(thr_df, markers, model, qc_dir)
-    if ref_qc:
-        print("[step4] reference-exclusivity audit ...")
-        reference_exclusivity_qc(cfg, cells_dir, pairs, subsample, seed, out_dir, donors)
-    print(f"[step4] wrote QC -> {qc_dir}")
-
-    if skip_apply:
-        print("[done] --skip-apply: thresholds + QC only")
-        return thr_df
-
-    chosen_lut, imputed = build_chosen_lut(thr_df, model, robust, robust_factor)
-    if imputed:
-        print(f"[robust] imputed {len(imputed)} degenerate {model} thresholds "
-              f"(>{robust_factor}x cohort median) with the cohort median:")
-        for (img, mk), (orig, med) in sorted(imputed.items()):
-            print(f"  image {img} {mk}: {orig:.0f} -> {med:.0f}")
-    elif robust:
-        print(f"[robust] no outlier {model} thresholds to impute")
-
-    print(f"[step5] applying thresholds to ALL cells (n_jobs={n_jobs}) ...")
-    frac_df = apply_thresholds(cells_dir, markers, chosen_lut, imputed, gated_dir,
-                               limit_scenes, donors, n_jobs=n_jobs)
-    frac_df.sort_values(["marker", "image"]).to_csv(out_dir / "positive_fractions.csv", index=False)
-    qc_positive_fractions(frac_df, markers, qc_dir)
-    print(f"[step5] wrote {gated_dir} (partitioned) + {out_dir}/positive_fractions.csv")
-    print("[done]")
-    return thr_df
-
-
-def run_restore_functional(cfg: PipelineConfig, *, donors=None):
-    """OPTIONAL second RESTORE pass for the functional / state markers (``FUNCTIONAL_PAIRS`` in
-    ``config.py`` — activation / exhaustion / IFN-driven). RESTORE's reliably-negative-lineage
-    assumption is weaker here, so it runs with ``robust=False`` / ``ref_qc=False`` into the ``*_extra``
-    dirs; VALIDATE the cutoffs before use. These are STATE annotations, not compartments, and are NOT
-    part of the default pipeline. NB ``CD38`` is batch-1 only (missing in batch-2 donors)."""
-    pairs = [list(p) for p in FUNCTIONAL_PAIRS]
-    return run_restore(
-        cfg,
-        cells_dir=cfg.cells_redsea_dir,
-        marker_pairs=pairs,
-        donors=donors,
-        robust=False,
-        ref_qc=False,
-        out_dir=cfg.restore_redsea_extra_dir,
-        gated_dir=cfg.restore_gated_extra_dir,
-        thresh_csv=cfg.restore_thresholds_extra_csv,
-    )
+# RETIRED 2026-07-23 — `run_restore` and `run_restore_functional` are deleted with the curated pair webs
+# they consumed (MARKER_PAIRS / FUNCTIONAL_PAIRS, see config.py). Ten of those pairs referenced CD20,
+# which is too sparse in pancreas to define a negative-control population, and there is no mechanical
+# substitute. The manuscript-faithful replacement lives in `restore_validation.py`; Gate 4 of
+# docs/restore_faithful_rebuild_plan.md wires it into production. Everything above this banner --
+# idx_select, neg_stat, fit_clusters, the threshold LUT and apply helpers, the QC plots -- is reusable
+# machinery and stays.
 
 
 def run_restore_proliferation(cfg: PipelineConfig, *, markers=None, donors=None, n_jobs=None, k=None):
@@ -821,69 +712,29 @@ def run_restore_proliferation(cfg: PipelineConfig, *, markers=None, donors=None,
 
 
 def main(argv=None):
+    """CLI for the surviving standalone pass. The paired RESTORE driver was retired with its curated
+    pair web (see the banner above); the manuscript-faithful replacement is
+    ``python -m phenocycler.restore_validation evaluate-locked``."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=None)
-    ap.add_argument("--cells-dir", type=Path, default=None,
-                    help="input cells (default: the REDSEA-corrected cells_redsea)")
     ap.add_argument("--jobs", type=int, default=None, help="per-donor apply pool size")
-    ap.add_argument("--subsample", type=int, default=None)
-    ap.add_argument("--model", default=None, choices=["GMM", "KMeans", "SSC"])
-    ap.add_argument("--marker-pairs", default=None, help="override pairs, e.g. 'CD3e:CD20,INS:GCG'")
-    ap.add_argument("--marker-sigma", default=None, help="per-target sigma, e.g. 'Pan_Cytokeratin:1.0'")
-    ap.add_argument("--limit-scenes", type=int, default=None)
     ap.add_argument("--donors", nargs="*", default=None)
-    ap.add_argument("--skip-apply", action="store_true")
-    ap.add_argument("--robust", action=argparse.BooleanOptionalAction, default=None)
-    ap.add_argument("--robust-factor", type=float, default=None)
-    ap.add_argument("--reuse-threshs", action="store_true")
-    ap.add_argument("--ref-qc", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--idx-floor-q", type=float, default=None,
-                    help="per-(image,marker) quantile floor for idx_select (default cfg 0.5; "
-                         "0 reverts to RESTORE's hardcoded >50)")
-    ap.add_argument("--neg-stat", default=None, choices=["mean3sd", "mad", "logmad", "pctile"],
-                    help="negative-cluster threshold statistic (default cfg mean3sd == vendored mu+3sigma; "
-                         "mad/logmad/pctile are opt-in robust variants — evaluate per-donor first)")
-    ap.add_argument("--presence-min-sep", type=float, default=None,
-                    help="opt-in per-image signal-presence guard: call a marker ABSENT (0 positives) if its "
-                         "idx_select cloud shows cluster separation < this many neg-sigma (default cfg 0 == off)")
-    ap.add_argument("--idx-nonzero-q", type=float, default=None,
-                    help="opt-in REDSEA zero-clip guard: floor the idx_select OFF-marker ceiling at this "
-                         "quantile of the marker's NONZERO cells (default cfg 0 == off)")
-    ap.add_argument("--partner-low-q", type=float, default=None,
-                    help="opt-in partner-low thresholding: set each target's cutoff from the Otsu valley "
-                         "among cells LOW for its mutually-exclusive reference (< this quantile of the "
-                         "reference); default cfg 0 == off (use the negative-cluster statistic)")
-    ap.add_argument("--functional", action="store_true",
-                    help="OPTIONAL second RESTORE pass for the functional / state markers "
-                         "(FUNCTIONAL_PAIRS) into the *_extra dirs (robust off + ref-qc off); validate "
-                         "the cutoffs before use (other pair/model/sigma flags are ignored)")
     ap.add_argument("--proliferation", action="store_true",
-                    help="STANDALONE bimodal binarization of proliferation markers (Ki67/PCNA) — no "
-                         "mutually-exclusive pair; writes {m}_pos to restore_gated_proliferation "
-                         "(other pair/model/sigma flags are ignored)")
+                    help="STANDALONE binarization of proliferation markers (Ki67/PCNA) — no "
+                         "mutually-exclusive pair; writes {m}_pos to restore_gated_proliferation")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
     if a.jobs is not None:
         cfg.n_jobs = a.jobs
-    if a.functional:
-        run_restore_functional(cfg, donors=a.donors)
-        return 0
-    if a.proliferation:
-        run_restore_proliferation(cfg, donors=a.donors)
-        return 0
-    pairs = ([p.split(":") for p in a.marker_pairs.split(",")] if a.marker_pairs else None)
-    sigma = ({k: float(v) for k, v in (p.split(":") for p in a.marker_sigma.split(","))}
-             if a.marker_sigma else None)
-    run_restore(cfg, cells_dir=a.cells_dir, model=a.model, subsample=a.subsample,
-                marker_pairs=pairs, marker_sigma=sigma, limit_scenes=a.limit_scenes,
-                donors=a.donors, skip_apply=a.skip_apply, robust=a.robust,
-                robust_factor=a.robust_factor, reuse_threshs=a.reuse_threshs,
-                ref_qc=a.ref_qc, seed=a.seed, idx_floor_q=a.idx_floor_q,
-                neg_stat=a.neg_stat, presence_min_sep=a.presence_min_sep,
-                idx_nonzero_q=a.idx_nonzero_q, partner_low_q=a.partner_low_q)
+    if not a.proliferation:
+        ap.error(
+            "the paired RESTORE driver was retired with MARKER_PAIRS/FUNCTIONAL_PAIRS; "
+            "use `python -m phenocycler.restore_validation evaluate-locked` for pair validation, "
+            "or pass --proliferation for the standalone Ki67/PCNA pass"
+        )
+    run_restore_proliferation(cfg, donors=a.donors)
     return 0
 
 

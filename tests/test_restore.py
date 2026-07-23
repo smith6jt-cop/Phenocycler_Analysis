@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import pandas as pd
 
 from phenocycler import restore
@@ -63,16 +64,11 @@ def test_flatten_threshs_drops_global_batch():
     assert np.isclose(row.threshold.iloc[0], 120.0)
 
 
-def test_marker_pairs_curated_directional():
-    """Curated directional [target, counterpart] web (no universal reference); targets unique."""
-    from phenocycler.config import MARKER_PAIRS
-    targets = [p[0] for p in MARKER_PAIRS]
-    assert len(targets) == len(set(targets))            # RESTORE keys on target -> no silent overwrite
-    pairs = {t: r for t, r in MARKER_PAIRS}
-    assert pairs["E_cadherin"] == "CD31"                # epithelial anchor <- endothelial
-    assert pairs["CD31"] == "E_cadherin"                # reciprocal
-    assert pairs["B3TUBB"] == "CD3e"                    # neural <- immune (TUBB3-negative)
-    assert ["INS", "GCG"] in MARKER_PAIRS and ["GCG", "INS"] in MARKER_PAIRS   # intra-islet reciprocal
+def test_paired_restore_cli_directs_to_the_replacement():
+    """The paired driver is gone; the CLI must say so instead of failing obscurely."""
+    with pytest.raises(SystemExit):
+        restore.main([])          # no --proliferation -> argparse error
+    assert not hasattr(restore, "run_restore")
 
 
 def test_headless_stubs_importable():

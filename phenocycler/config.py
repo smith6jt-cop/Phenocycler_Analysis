@@ -42,7 +42,12 @@ COMPARTMENT_GATES: dict[str, list[str]] = {
     "Epithelial":  ["E_cadherin"],          # only epithelial marker that stays + on endocrine
     "Endothelial": ["CD31"],
     "Neural":      ["B3TUBB"],               # residual (after epithelial) so islet TUBB3 is gone
-    "Immune":      ["CD3e", "CD20", "CD79a", "CD68", "CD163", "CD206", "Iba1", "CD11b", "CD11c", "MPO"],
+    # CD20 is NOT a compartment anchor: B cells are sparse in pancreas, so a lone CD20 call is far more
+    # likely to be stray signal on an abundant cell than a real B cell, and an any-positive union would
+    # let it pull that cell into Immune before a more frequent compartment could claim it. B cells still
+    # reach Immune via CD79a and are sub-typed "B" there (see lineage._cell_types, where B/Plasma also
+    # gate at the lowest precedence so more frequent immune types resolve first).
+    "Immune":      ["CD3e", "CD79a", "CD68", "CD163", "CD206", "Iba1", "CD11b", "CD11c", "MPO"],
     "Mesenchymal": ["SMA", "Vimentin"],
 }
 
@@ -61,37 +66,20 @@ COMPARTMENT_ABBR: dict[str, str] = {
 }
 STATUS_ORDER: list[str] = ["ND", "AAB", "T1D"]
 
-# RESTORE mutually-exclusive pairs, DIRECTIONAL: [target, counterpart] — [0] is thresholded, [1] is the
-# mutually-exclusive counterpart that defines the negative population (RESTORE keys threshs on the TARGET
-# only, so reciprocals like INS<->GCG / CD3e<->CD20 are separate entries). ONE RESTORE pass over all
-# markers (the old separate "extra" pass is folded in). Counterparts are biologically curated (user).
-MARKER_PAIRS: list[list[str]] = [
-    # Epithelial (<- CD31: spatially-separated exclusive negative, avoids intraepithelial-lymphocyte leak)
-    ["E_cadherin", "CD31"], ["Pan_Cytokeratin", "CD31"], ["Ker8_18", "CD31"], ["EpCAM", "CD31"],
-    ["Keratin_5", "CD31"], ["TP63", "CD31"],
-    # Endothelial / stroma (<- E_cadherin: epithelium = dominant negative mass)
-    ["CD31", "E_cadherin"], ["CD34", "E_cadherin"], ["Podoplanin", "E_cadherin"], ["SMA", "E_cadherin"],
-    ["Vimentin", "E_cadherin"],                 # Vimentin only ever a TARGET, never a counterpart
-    # Neural (<- CD3e: TUBB3-negative & non-epithelial; endocrine co-expresses TUBB3)
-    ["B3TUBB", "CD3e"],
-    # Endocrine, intra-islet reciprocal (negative sits in the target's microenvironment)
-    ["INS", "GCG"], ["GCG", "INS"], ["SST", "INS"],   # IAPP removed 2026-07-10 — failed marker
-    # Immune (co-localized immune counterparts = shared autofluorescence context)
-    ["CD3e", "CD20"], ["CD20", "CD3e"], ["CD79a", "CD3e"],
-    ["CD4", "CD20"], ["CD8", "CD20"], ["FOXP3", "CD20"],
-    ["CD68", "CD3e"], ["CD163", "CD3e"], ["CD206", "CD3e"], ["Iba1", "CD3e"], ["CD11b", "CD3e"],
-    ["CD11c", "CD3e"], ["CD209", "CD3e"], ["MPO", "CD3e"],
-    ["Granzyme_B", "CD20"], ["CD57", "CD20"], ["CD56", "CD20"],   # CD56/CD57 for NK; never a counterpart
-]
-
-# Optional functional/state markers (activation/exhaustion/IFN-driven) — RESTORE's reliably-negative-
-# lineage assumption is weaker here; run separately and validate the cutoffs. These are STATE
-# annotations, not compartments. NB: CD38 is batch-1 only (b_Catenin1 replaces it in batch-2).
-FUNCTIONAL_PAIRS: list[list[str]] = [
-    ["PD_1", "E_cadherin"], ["LAG3", "E_cadherin"], ["TOX", "E_cadherin"], ["TCF_1", "CD68"],
-    ["ICOS", "E_cadherin"], ["VISTA", "E_cadherin"], ["CD39", "E_cadherin"], ["CD38", "E_cadherin"],
-    ["PD_L1", "CD20"], ["IDO1", "CD20"], ["iNOS", "CD20"], ["HLA_DR", "CD3e"],
-]
+# RETIRED 2026-07-23 — MARKER_PAIRS and FUNCTIONAL_PAIRS (the curated web fed to the vendored-SSC
+# `restore.run_restore` / `run_restore_functional`) are deleted along with those entry points, rather
+# than repaired. Two reasons:
+#   1. Seven MARKER_PAIRS and three FUNCTIONAL_PAIRS used CD20 as the reference (CD3e, CD4, CD8, FOXP3,
+#      Granzyme_B, CD57, CD56, PD_L1, IDO1, iNOS). A reference's positive cells ARE the target's
+#      negative control, and B cells are sparse in pancreas even under inflammation or disease, so CD20
+#      cannot define one. There is no mechanical substitute either: CD3e is invalid for the T-subset
+#      targets (CD4/CD8/FOXP3 cells are CD3e+), and epithelium expresses PD-L1 and IDO1.
+#   2. The pair web is being rebuilt from the manuscript in `restore_validation.py` (NNMF separator,
+#      maximum-negative-control divisor, per-pair acceptance state), and Gate 4 of
+#      docs/restore_faithful_rebuild_plan.md replaces the production wiring outright. Maintaining a
+#      second, known-wrong web until then is a hazard, not a fallback.
+# The reusable RESTORE machinery in restore.py (idx_select, neg_stat, fit_clusters, threshold LUT and
+# apply helpers, the proliferation pass) is untouched.
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INI = _REPO_ROOT / "config.ini"

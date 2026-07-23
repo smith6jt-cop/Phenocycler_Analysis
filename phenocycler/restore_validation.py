@@ -3035,6 +3035,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="baseline",
         help="predeclared candidate pair set to evaluate",
     )
+
+    joint = sub.add_parser(
+        "immune-joint",
+        help="COMPARATOR: one pooled NNMF per donor over the immune markers (emits no divisor or call)",
+    )
+    joint.add_argument("--sample", type=Path, required=True)
+    joint.add_argument("--raw-cells", type=Path, required=True)
+    joint.add_argument("--redsea-cells", type=Path, required=True)
+    joint.add_argument("--output", type=Path, required=True)
+    joint.add_argument("--donor", action="append", required=True)
+    joint.add_argument("--fit-cap", type=int, default=50_000)
+    joint.add_argument("--seed", type=int, action="append", default=None)
+    joint.add_argument("--n-components", type=int, action="append", default=None)
     return parser.parse_args(argv)
 
 
@@ -3062,6 +3075,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             seeds=tuple(args.seed or [0]),
         )
         print(tables["method_summary"].to_string(index=False))
+        return 0
+    if args.command == "immune-joint":
+        donors = ensure_eligible_donors(args.donor, context="immune-joint comparator")
+        rows: list[dict] = []
+        for donor in donors:
+            donor_df, _audit = load_validation_sample(
+                args.sample, args.raw_cells, args.redsea_cells, donor
+            )
+            donor_rows = evaluate_immune_joint(
+                donor_df,
+                donor,
+                fit_cap=args.fit_cap,
+                seeds=tuple(args.seed or [0, 1, 2]),
+                n_components=tuple(args.n_components or (4, 5)),
+            )
+            rows.extend(donor_rows)
+            print(f"[immune-joint] donor {donor}: {len(donor_rows)} comparator rows", flush=True)
+        table = pd.DataFrame(rows)
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(out, index=False)
+        print(f"[immune-joint] wrote {out} ({len(table)} rows)")
+        ok = table[table["anchor_recovery"].notna()]
+        if len(ok):
+            print(
+                ok.groupby(["n_components", "target"])["anchor_recovery"]
+                .agg(["count", "median", "min"])
+                .round(3)
+                .to_string()
+            )
         return 0
     if args.command == "evaluate-locked":
         tables = evaluate_locked_cohort(

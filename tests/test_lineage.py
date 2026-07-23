@@ -91,7 +91,7 @@ def test_endocrine_vs_exocrine_subsplit(tmp_path):
 def test_immune_subtypes_incl_nk(tmp_path):
     rows = [
         {"id": "t", "CD3e": (True, 3)},
-        {"id": "b", "CD20": (True, 3)},
+        {"id": "b", "CD79a": (True, 3)},          # CD20 is no longer a compartment anchor
         {"id": "mac", "CD68": (True, 3)},
         {"id": "neut", "MPO": (True, 3)},
         {"id": "dc", "CD11c": (True, 3)},
@@ -140,7 +140,7 @@ def test_frequent_immune_types_outrank_sparse_b_cells(tmp_path):
     """CD20 is the least reliable immune marker and B cells are sparse in pancreas, so a more frequent
     co-positive identity must win. Previously B was written last and overwrote macrophages."""
     rows = [
-        {"id": "b_only", "CD20": (True, 3)},
+        {"id": "cd20_only", "CD20": (True, 3)},
         {"id": "b_cd79a", "CD79a": (True, 3)},
         {"id": "b_vs_mac", "CD20": (True, 9), "CD68": (True, 3)},     # -> Macrophage, not B
         {"id": "b_vs_dc", "CD20": (True, 9), "CD11c": (True, 3)},     # -> DC, not B
@@ -148,9 +148,10 @@ def test_frequent_immune_types_outrank_sparse_b_cells(tmp_path):
         {"id": "b_vs_t", "CD20": (True, 9), "CD3e": (True, 3)},       # -> T, not B
     ]
     out = _assign(tmp_path, rows).set_index("object_id")
-    assert (out["compartment"] == "Immune").all()
-    # A cell with no competing immune marker is still B.
-    assert out.loc["b_only", "cell_type"] == "B"
+    # CD20 alone no longer admits a cell to Immune at all -- it is not a compartment anchor, so a lone
+    # CD20 call cannot claim an abundant cell. B cells enter via CD79a and are sub-typed there.
+    assert out.loc["cd20_only", "compartment"] == "Other"
+    assert (out.drop(index="cd20_only")["compartment"] == "Immune").all()
     assert out.loc["b_cd79a", "cell_type"] == "B"
     # Every more frequent immune identity now outranks it, regardless of relative intensity.
     assert out.loc["b_vs_mac", "cell_type"] == "Macrophage"

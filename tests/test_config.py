@@ -5,7 +5,7 @@ from __future__ import annotations
 from phenocycler import load_config
 from phenocycler.cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 from phenocycler.config import (COMPARTMENT_ORDER, COMPARTMENT_GATES, OTHER_LABEL,
-                                ENDOCRINE_MARKERS, MARKER_PAIRS, FUNCTIONAL_PAIRS)
+                                ENDOCRINE_MARKERS)
 
 
 def test_defaults_and_derived_paths():
@@ -94,20 +94,27 @@ def test_compartment_constants_shape():
     assert COMPARTMENT_GATES["Endothelial"] == ["CD31"]
     assert COMPARTMENT_GATES["Neural"] == ["B3TUBB"]
     assert COMPARTMENT_GATES["Mesenchymal"] == ["SMA", "Vimentin"]   # ordered: SMA then Vimentin
-    assert {"CD3e", "CD20", "CD68", "MPO"}.issubset(set(COMPARTMENT_GATES["Immune"]))
+    assert {"CD3e", "CD68", "MPO"}.issubset(set(COMPARTMENT_GATES["Immune"]))
+    # CD20 is deliberately NOT a compartment anchor: B cells are sparse in pancreas, so a lone CD20
+    # call would more often be stray signal pulling an abundant cell into Immune than a real B cell.
+    assert "CD20" not in COMPARTMENT_GATES["Immune"]
+    assert "CD79a" in COMPARTMENT_GATES["Immune"]       # B cells still reach Immune via CD79a
     assert ENDOCRINE_MARKERS == ["INS", "GCG", "SST"]      # IAPP removed 2026-07-10 (failed marker)
 
 
-def test_marker_pairs_directional_no_target_collision():
-    """RESTORE keys threshs on the TARGET only -> two pairs sharing a target silently overwrite."""
-    for pairs in (MARKER_PAIRS, FUNCTIONAL_PAIRS):
-        targets = [p[0] for p in pairs]
-        assert len(targets) == len(set(targets)), f"duplicate target in {pairs}"
-        assert all(len(p) == 2 for p in pairs)
-    pm = {t: r for t, r in MARKER_PAIRS}
-    assert pm["E_cadherin"] == "CD31"          # epithelial <- endothelial (spatially separated)
-    assert pm["B3TUBB"] == "CD3e"              # neural <- immune (TUBB3-negative)
-    assert ["INS", "GCG"] in MARKER_PAIRS and ["GCG", "INS"] in MARKER_PAIRS   # intra-islet reciprocal
+def test_legacy_pair_webs_are_retired():
+    """MARKER_PAIRS / FUNCTIONAL_PAIRS were deleted with the vendored-SSC driver: ten of their pairs
+    referenced CD20, which is too sparse in pancreas to define a negative control, and the method is
+    being rebuilt in restore_validation.py. Nothing may quietly resurrect them."""
+    import phenocycler
+    from phenocycler import config as cfg_mod
+    for name in ("MARKER_PAIRS", "FUNCTIONAL_PAIRS"):
+        assert not hasattr(cfg_mod, name), f"{name} was retired; do not reintroduce it"
+        assert not hasattr(phenocycler, name)
+    from phenocycler import restore
+    for name in ("run_restore", "run_restore_functional"):
+        assert not hasattr(restore, name), f"restore.{name} was retired with the pair web"
+    assert hasattr(restore, "run_restore_proliferation")   # the standalone pass survives
 
 
 def test_config_matches_science_modules():
