@@ -47,8 +47,6 @@ SHORTLIST_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD3e", "E_cadherin"),
     ("CD3e", "CD68"),
     ("CD3e", "CD163"),
-    ("CD20", "CD68"),
-    ("CD20", "CD163"),
     ("CD68", "EpCAM"),
     ("CD68", "CD3e"),
     ("CD11b", "Pan_Cytokeratin"),
@@ -63,8 +61,6 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
     ("CD3e", "E_cadherin"): "best fixed-reference availability; epithelial adjacency risk",
     ("CD3e", "CD68"): "literature-supported T/myeloid exclusion; weak target separation in many donors",
     ("CD3e", "CD163"): "literature-supported T/macrophage exclusion; reference absent in some donors",
-    ("CD20", "CD68"): "strongest fixed B-cell/myeloid candidate in the expanded screen",
-    ("CD20", "CD163"): "B-cell/macrophage alternative; reference absent in some donors",
     ("CD68", "EpCAM"): "strongest computational CD68 candidate; epithelial adjacency risk",
     ("CD68", "CD3e"): "lymphoid reference replacing CD20, which is too sparse to be a negative control",
     ("CD11b", "Pan_Cytokeratin"): "best fixed-reference availability; epithelial adjacency risk",
@@ -299,8 +295,8 @@ def select_review_queue(
             .iloc[0]["donor"]
         )
         add(str(median_donor), "median target-arm fold")
-        if target == "CD20":
-            add("6539", "maintainer-confirmed target absence")
+        # (a CD20 stress case pinning donor 6539's maintainer-confirmed absence lived here; CD20 is
+        #  excluded from RESTORE in both roles as of 2026-07-23, so no CD20 pair reaches selection)
         if target == "B3TUBB":
             arm_fraction = pair_rows["target_n"] / pair_rows["n_assigned"]
             add(
@@ -1707,11 +1703,13 @@ def build_review_bundle(
             ),
             "marker_input_floor_methods": MARKER_INPUT_FLOOR_METHODS,
             "input_floor_review_policy": (
-                "CD3e and CD20 use the donor-local maximum of raw-linear Otsu and "
-                "raw-linear Triangle. This requires both criteria to classify an arm "
-                "cell as high. Other screened markers use their explicitly configured "
-                "raw-linear Otsu policy. Component statistics and final floors are "
-                "recorded in the review queue and QuPath export manifest."
+                "CD3e uses the donor-local maximum of raw-linear Otsu and raw-linear "
+                "Triangle. This requires both criteria to classify an arm cell as high. "
+                "Other screened markers use their explicitly configured raw-linear Otsu "
+                "policy. CD20 carries the same reviewer-validated maximum policy but is "
+                "not screened: it is excluded from RESTORE in both roles and deferred to "
+                "a second pass. Component statistics and final floors are recorded in the "
+                "review queue and QuPath export manifest."
             ),
             "selection_policy": (
                 "For each fixed shortlisted pair: lowest target/reference fold, lowest "

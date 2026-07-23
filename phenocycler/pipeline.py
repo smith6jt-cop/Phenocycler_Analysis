@@ -124,10 +124,12 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
             "[restore] the paired RESTORE driver was retired with its curated pair web: ten of those\n"
             "          pairs used CD20 as a reference, which is too sparse in pancreas to define a\n"
             "          negative control, and the method is being rebuilt from the manuscript.\n"
+            "          CD20 is now excluded from RESTORE in BOTH roles and deferred to a second pass\n"
+            "          after the broad cell types are settled, so no CD20 threshold will be produced.\n"
             "          There is no accepted pair, divisor, or gated output yet -- that is Gate 2/4 of\n"
             "          docs/restore_faithful_rebuild_plan.md, and it needs the human pair review.\n"
             "          Screen:  python -m phenocycler.restore_validation evaluate-locked ...\n"
-            "          Review:  data/restore_pair_validation/expanded_review_v9/START_HERE_RESTORE_REVIEW.txt"
+            "          Review:  data/restore_pair_validation/expanded_review_v10/START_HERE_RESTORE_REVIEW.txt"
         )
 
     def _proliferation():

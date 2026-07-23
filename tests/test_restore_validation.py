@@ -12,23 +12,22 @@ from phenocycler import restore_pair_review as rpr
 
 
 def test_candidate_pairs_match_revised_first_pass():
+    # BroadLineageRevised.md lists 8 first-pass pairs; CD20 <- E_cadherin was the eighth and is gone
+    # with CD20's exclusion from RESTORE (see test_cd20_takes_no_part_in_restore).
     assert rv.BASELINE_PAIRS == (
         ("E_cadherin", "CD31"),
         ("CD31", "E_cadherin"),
         ("CD3e", "E_cadherin"),
-        ("CD20", "E_cadherin"),
         ("CD68", "E_cadherin"),
         ("CD11b", "E_cadherin"),
         ("B3TUBB", "EpCAM"),
         ("Vimentin", "E_cadherin"),
     )
     assert ("CD3e", "CD163") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
-    assert ("CD20", "CD68") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
     assert ("CD68", "CD3e") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
     # CD11b <- CD20 was retired: CD20 is too sparse in pancreas to define a negative control,
-    # so CD3e is the immune reference (see test_cd20_is_never_a_reference_marker).
+    # so CD3e is the immune reference (see test_cd20_takes_no_part_in_restore).
     assert ("CD11b", "CD3e") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
-    assert ("CD20", "Pan_Cytokeratin") in rv.CANDIDATE_PAIRS
     assert rv.QUPATH_MARKERS["Pan_Cytokeratin"] == "Pan-Cytokeratin"
     assert rv.QUPATH_MARKERS["Ker8_18"] == "Ker8-18"
     assert set(rv.MARKER_INPUT_FLOOR_METHODS) == set(rv.QUPATH_MARKERS)
@@ -714,8 +713,8 @@ def test_review_queue_selects_extremes_without_frequency_acceptance():
         rows.append(
             {
                 "donor": donor,
-                "target": "CD20",
-                "reference": "CD68",
+                "target": "CD68",
+                "reference": "CD3e",
                 "target_fold": target_fold,
                 "reference_fold": reference_fold,
                 "min_control_jaccard": jaccard,
@@ -728,19 +727,21 @@ def test_review_queue_selects_extremes_without_frequency_acceptance():
             }
         )
     queue = rpr.select_review_queue(
-        pd.DataFrame(rows), pairs=(("CD20", "CD68"),)
+        pd.DataFrame(rows), pairs=(("CD68", "CD3e"),)
     )
     by_donor = queue.set_index("donor")["selection_reasons"]
     assert "lowest seed stability" in by_donor["6476"]
     assert "pancreatitis" not in "; ".join(by_donor)
-    assert "maintainer-confirmed target absence" in by_donor["6539"]
     assert "lowest target-arm fold" in by_donor["1"]
     assert "lowest reference-arm fold" in by_donor["2"]
+    # The CD20-only "maintainer-confirmed target absence" stress case (donor 6539) went with CD20's
+    # exclusion from RESTORE; selection is now driven purely by the evidence columns.
+    assert "maintainer-confirmed target absence" not in "; ".join(by_donor)
     shuffled = pd.DataFrame(rows).sample(frac=1, random_state=19)
     pd.testing.assert_frame_equal(
         queue,
         rpr.select_review_queue(
-            shuffled, pairs=(("CD20", "CD68"),)
+            shuffled, pairs=(("CD68", "CD3e"),)
         ),
     )
 
@@ -1040,7 +1041,7 @@ def test_review_figure_uses_large_fonts_and_nonoverlapping_legend_band():
 
 
 def test_review_shortlist_has_one_rationale_per_unique_pair():
-    assert len(rpr.SHORTLIST_PAIRS) == 13
+    assert len(rpr.SHORTLIST_PAIRS) == 11
     assert len(set(rpr.SHORTLIST_PAIRS)) == len(rpr.SHORTLIST_PAIRS)
     assert set(rpr.SHORTLIST_PAIRS) == set(rpr.PAIR_RATIONALE)
 
@@ -1346,20 +1347,35 @@ def test_review_shortlist_only_names_pairs_the_screen_produces():
     retired as a reference)."""
     missing = [p for p in rpr.SHORTLIST_PAIRS if p not in rv.CANDIDATE_PAIRS]
     assert not missing, f"shortlist pairs absent from CANDIDATE_PAIRS: {missing}"
-    assert all(reference != "CD20" for _t, reference in rpr.SHORTLIST_PAIRS)
+    assert not [p for p in rpr.SHORTLIST_PAIRS if "CD20" in p]
 
 
-def test_cd20_is_never_a_reference_marker():
-    """A reference's positive cells ARE the negative control, so it must label a population big enough
-    to estimate a background from. B cells are sparse in pancreas; CD20 is a target only."""
-    assert "CD20" in rv.INVALID_REFERENCE_MARKERS
+def test_cd20_takes_no_part_in_restore():
+    """Maintainer decision 2026-07-23: CD20 is excluded from RESTORE in BOTH roles and deferred to a
+    second pass after the broad cell types are settled. As a reference its positive cells would BE the
+    negative control and its arm is far too small; as a target its Step 1 anchor bottomed out at 14
+    cells, and reviewer inspection of the CD20 PDFs found overcalling with both qptiff channels
+    stretched from near-background into block artifacts."""
+    assert "CD20" in rv.RESTORE_EXCLUDED_MARKERS
     for pairs in (rv.BASELINE_PAIRS, rv.IMMUNE_REFERENCE_SCREEN_PAIRS,
                   rv.EPITHELIAL_REFERENCE_COMPARATOR_PAIRS, rv.CANDIDATE_PAIRS):
-        assert all(reference != "CD20" for _target, reference in pairs)
-    # CD20 remains a legitimate TARGET, thresholded against reliable references.
-    assert ("CD20", "CD3e") in rv.CANDIDATE_PAIRS
-    # The immune targets that used to lean on CD20 now use CD3e, which was already their alternative.
+        assert not [p for p in pairs if "CD20" in p], "CD20 must appear in neither role"
+    # The immune targets that used to lean on CD20 use CD3e, which was already their alternative.
     assert ("CD68", "CD3e") in rv.CANDIDATE_PAIRS
     assert ("CD11b", "CD3e") in rv.CANDIDATE_PAIRS
+    # Excluded from the pair web, but still EXTRACTED and still carrying its reviewer-validated input
+    # floor policy, so the deferred second pass needs no QuPath re-export.
+    assert "CD20" in rv.QUPATH_MARKERS
+    assert "CD20" in rv.DEFERRED_EXTRACTION_MARKERS
+    assert rv.MARKER_INPUT_FLOOR_METHODS["CD20"] == rv.MAX_LINEAR_OTSU_TRIANGLE_FLOOR
     # No marker may reference itself.
     assert all(t != r for t, r in rv.CANDIDATE_PAIRS)
+
+
+def test_excluded_marker_cannot_be_reintroduced_in_either_role():
+    """The import-time guard is the enforcement point: rebuilding CANDIDATE_PAIRS with a CD20 pair in
+    either direction must fail loudly rather than silently re-screening it."""
+    for pair in (("CD20", "CD3e"), ("CD11b", "CD20")):
+        target, reference = pair
+        offenders = [m for m in pair if m in rv.RESTORE_EXCLUDED_MARKERS]
+        assert offenders, f"{target} <- {reference} should name an excluded marker"

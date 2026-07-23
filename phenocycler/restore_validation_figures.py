@@ -547,11 +547,13 @@ def create_pair_cloud_figures(
 def create_example_figure(
     panels_by_pair: dict[tuple[str, str], dict[str, dict]], output_dir: Path, *, seed: int
 ) -> None:
+    # CD20 <- E_cadherin was the immune exemplar here until CD20 was excluded from RESTORE in both
+    # roles (2026-07-23); CD68 <- EpCAM is the shortlisted myeloid pair that replaces it.
     selected_pairs = (
         ("E_cadherin", "CD31"),
         ("B3TUBB", "EpCAM"),
         ("CD3e", "E_cadherin"),
-        ("CD20", "E_cadherin"),
+        ("CD68", "EpCAM"),
     )
     fig, axes = plt.subplots(
         len(selected_pairs), len(DONOR_ORDER), figsize=(14.5, 16.5), squeeze=False
@@ -790,8 +792,8 @@ def create_summary_figure(panel_metrics: pd.DataFrame, output_dir: Path) -> None
         0.5,
         0.015,
         (
-            "Donor-local raw-MFI arm floors are explicitly marker-specific: CD3e/CD20 "
-            "use max(Otsu, Triangle), while the other screened markers use Otsu. Cells "
+            "Donor-local raw-MFI arm floors are explicitly marker-specific: CD3e "
+            "uses max(Otsu, Triangle), while the other screened markers use Otsu. Cells "
             "are retained when either marker clears its floor for fitting only; every "
             "complete canonical cell is then assigned. NNMF uses equal-arm fitting, robust "
             "per-feature scaling, and three locked seeds. Full REDSEA control maxima are "

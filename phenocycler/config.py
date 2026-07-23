@@ -47,6 +47,8 @@ COMPARTMENT_GATES: dict[str, list[str]] = {
     # let it pull that cell into Immune before a more frequent compartment could claim it. B cells still
     # reach Immune via CD79a and are sub-typed "B" there (see lineage._cell_types, where B/Plasma also
     # gate at the lowest precedence so more frequent immune types resolve first).
+    # Stronger as of 2026-07-23: CD20 is excluded from RESTORE in BOTH roles and deferred to a second
+    # pass (restore_validation.RESTORE_EXCLUDED_MARKERS), so it has no threshold to gate on at all.
     "Immune":      ["CD3e", "CD79a", "CD68", "CD163", "CD206", "Iba1", "CD11b", "CD11c", "MPO"],
     "Mesenchymal": ["SMA", "Vimentin"],
 }

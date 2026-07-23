@@ -28,11 +28,12 @@ from .cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 # immune targets). Adds anchor_recovery, arm-saturation/stability_informative reporting, and a
 # saturated-arm probe Jaccard. v5 artifacts were produced under the degenerate bound rule.
 METHOD_VERSION = "restore-pair-validation-v6"
+# NB: ``BroadLineageRevised.md`` lists 8 first-pass pairs.  ``CD20 <- E_cadherin`` was the eighth and
+# is deliberately absent — CD20 is deferred out of RESTORE entirely (see RESTORE_EXCLUDED_MARKERS).
 BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
     ("E_cadherin", "CD31"),
     ("CD31", "E_cadherin"),
     ("CD3e", "E_cadherin"),
-    ("CD20", "E_cadherin"),
     ("CD68", "E_cadherin"),
     ("CD11b", "E_cadherin"),
     ("B3TUBB", "EpCAM"),
@@ -40,31 +41,40 @@ BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
 )
 # Pooled-immune comparator marker set: the minimum union that nets the immune populations present with
 # no CD45 in the panel. Used ONLY by evaluate_immune_joint, never by the locked pairwise path.
+# CD20 is retained HERE ONLY, as a diagnostic co-factor of the joint fit — dropping it would change the
+# fit for the other three and make the comparator non-comparable with the run already on record. The
+# comparator emits no divisor and no call, and its finding that pooling lifts CD20's worst-case anchor
+# recovery (0.217 -> 0.968) does NOT license reintroducing CD20: it is excluded from RESTORE by
+# maintainer decision on separate grounds (RESTORE_EXCLUDED_MARKERS), which the guard above enforces.
 IMMUNE_JOINT_MARKERS: tuple[str, ...] = ("CD3e", "CD20", "CD68", "CD11b")
-# A reference marker's positive cells ARE the target's negative control, so a reference must label a
-# population large enough to estimate a background from. B cells are sparse in pancreas even under
-# inflammation and disease, so CD20 cannot serve that role: its exclusive arm ran to 41-2,026 cells per
-# donor against 2,206-50,000 for the structural markers, it was the limiting arm in every degenerate
-# screen row, and it produced the inverted fits where an abundant target was thresholded against a
-# handful of reference cells. CD20 remains a TARGET; CD3e is the immune reference in its place.
-INVALID_REFERENCE_MARKERS: dict[str, str] = {
+# Markers held out of the RESTORE pair web in BOTH roles — neither target nor reference.  This is
+# stronger than "cannot be a reference": such a marker gets no threshold, no divisor and no positivity
+# call from this method, and is deferred to a validated second pass once the broad cell types are
+# settled.  Its compartment means are still extracted (DEFERRED_EXTRACTION_MARKERS below) so that pass
+# needs no re-extraction, and its input-floor policy entry is retained for the same reason.
+RESTORE_EXCLUDED_MARKERS: dict[str, str] = {
     "CD20": (
-        "B cells are sparse in pancreas even with inflammation or disease, so CD20-positive cells "
-        "cannot define a negative-control population; use CD3e as the immune reference."
+        "B cells are sparse in pancreas even with inflammation or disease, and CD20 is the weakest "
+        "channel in the panel after CD163 (display ceiling median ~503 counts vs ~6,800 for "
+        "E-cadherin). As a REFERENCE its positive cells would BE the negative control, and its "
+        "exclusive arm ran 41-2,026 cells per donor against 2,206-50,000 for the structural markers, "
+        "producing inverted fits (6591 CD11b <- CD20: 50 reference cells thresholding 30,507 target "
+        "cells). As a TARGET its Step 1 anchor bottomed out at 14 cells with anchor recovery down to "
+        "0.217, and reviewer inspection of the CD20 review PDFs found overcalling throughout with "
+        "both qptiff channels stretched from near-background into block-like tile artifacts. "
+        "Maintainer decision 2026-07-23: CD20 takes no part in RESTORE; add it after the broad cell "
+        "types are worked out."
     ),
 }
 IMMUNE_REFERENCE_SCREEN_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD3e", "CD68"),
     ("CD3e", "CD163"),
-    ("CD20", "CD3e"),
-    ("CD20", "CD68"),
-    ("CD20", "CD163"),
     ("CD68", "CD3e"),
     ("CD11b", "CD3e"),
 )
 EPITHELIAL_REFERENCE_COMPARATOR_PAIRS: tuple[tuple[str, str], ...] = tuple(
     (target, reference)
-    for target in ("CD3e", "CD20", "CD68", "CD11b")
+    for target in ("CD3e", "CD68", "CD11b")
     for reference in ("Pan_Cytokeratin", "Ker8_18", "EpCAM")
 )
 CANDIDATE_PAIRS: tuple[tuple[str, str], ...] = tuple(
@@ -75,13 +85,15 @@ CANDIDATE_PAIRS: tuple[tuple[str, str], ...] = tuple(
     )
 )
 for _target, _reference in CANDIDATE_PAIRS:  # fail at import, not mid-screen
-    if _reference in INVALID_REFERENCE_MARKERS:
-        raise ValueError(
-            f"{_target} <- {_reference}: {INVALID_REFERENCE_MARKERS[_reference]}"
-        )
+    for _marker, _role in ((_target, "target"), (_reference, "reference")):
+        if _marker in RESTORE_EXCLUDED_MARKERS:
+            raise ValueError(
+                f"{_target} <- {_reference}: {_marker} is excluded from RESTORE in both roles "
+                f"(here as the {_role}). {RESTORE_EXCLUDED_MARKERS[_marker]}"
+            )
     if _target == _reference:
         raise ValueError(f"{_target} cannot be its own reference")
-del _target, _reference
+del _target, _reference, _marker, _role
 PAIR_SETS: dict[str, tuple[tuple[str, str], ...]] = {
     "baseline": BASELINE_PAIRS,
     "immune-screen": IMMUNE_REFERENCE_SCREEN_PAIRS,
@@ -94,10 +106,14 @@ QUPATH_MARKER_ALIASES = {
     "Pan_Cytokeratin": "Pan-Cytokeratin",
     "Ker8_18": "Ker8-18",
 }
+# Markers extracted from QuPath but NOT screened: they take no part in the pair web, yet their
+# compartment means ride along so the deferred second pass (and any re-extraction) needs no rerun of
+# the expensive QuPath export.  Keeping CD20 here also keeps the extracted sample schema-identical to
+# the files already under qupath_compartment_*_20donor/.
+DEFERRED_EXTRACTION_MARKERS: tuple[str, ...] = tuple(RESTORE_EXCLUDED_MARKERS)
 QUPATH_MARKERS: dict[str, str] = {
     marker: QUPATH_MARKER_ALIASES.get(marker, marker)
-    for pair in CANDIDATE_PAIRS
-    for marker in pair
+    for marker in [m for pair in CANDIDATE_PAIRS for m in pair] + list(DEFERRED_EXTRACTION_MARKERS)
 }
 LINEAR_OTSU_FLOOR = "linear_otsu"
 MAX_LINEAR_OTSU_TRIANGLE_FLOOR = "max_linear_otsu_triangle"

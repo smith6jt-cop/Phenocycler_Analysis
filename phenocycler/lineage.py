@@ -120,6 +120,12 @@ def _cell_types(compartment: np.ndarray, pos, norm) -> np.ndarray:
     # macrophage or T cell picking up stray CD20 outnumbers the real B cells it would be confused with.
     # Gating B last (highest precedence, as it was) inverted that -- it let the rare, least reliable
     # marker overwrite the abundant, well-supported ones. A genuine CD20+CD68+ cell is now Macrophage.
+    #
+    # As of 2026-07-23 CD20 is excluded from RESTORE in BOTH roles (restore_validation
+    # .RESTORE_EXCLUDED_MARKERS) and deferred to a second pass, so no CD20_pos column is produced and
+    # pos("CD20") is all-False. The CD20 term is kept so the deferred pass needs no edit here. CD79a is
+    # likewise not screened, so until that pass lands the B/Plasma branch yields nothing and its cells
+    # remain "Immune-other" -- a deliberate abstention, not a silent negative call.
     imm = compartment == "Immune"
     ct[imm] = "Immune-other"
     b = imm & (pos("CD20") | pos("CD79a"))
