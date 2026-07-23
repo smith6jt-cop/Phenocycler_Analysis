@@ -41,16 +41,25 @@ BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
 # Pooled-immune comparator marker set: the minimum union that nets the immune populations present with
 # no CD45 in the panel. Used ONLY by evaluate_immune_joint, never by the locked pairwise path.
 IMMUNE_JOINT_MARKERS: tuple[str, ...] = ("CD3e", "CD20", "CD68", "CD11b")
+# A reference marker's positive cells ARE the target's negative control, so a reference must label a
+# population large enough to estimate a background from. B cells are sparse in pancreas even under
+# inflammation and disease, so CD20 cannot serve that role: its exclusive arm ran to 41-2,026 cells per
+# donor against 2,206-50,000 for the structural markers, it was the limiting arm in every degenerate
+# screen row, and it produced the inverted fits where an abundant target was thresholded against a
+# handful of reference cells. CD20 remains a TARGET; CD3e is the immune reference in its place.
+INVALID_REFERENCE_MARKERS: dict[str, str] = {
+    "CD20": (
+        "B cells are sparse in pancreas even with inflammation or disease, so CD20-positive cells "
+        "cannot define a negative-control population; use CD3e as the immune reference."
+    ),
+}
 IMMUNE_REFERENCE_SCREEN_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD3e", "CD68"),
     ("CD3e", "CD163"),
-    ("CD3e", "CD20"),
     ("CD20", "CD3e"),
     ("CD20", "CD68"),
     ("CD20", "CD163"),
     ("CD68", "CD3e"),
-    ("CD68", "CD20"),
-    ("CD11b", "CD20"),
     ("CD11b", "CD3e"),
 )
 EPITHELIAL_REFERENCE_COMPARATOR_PAIRS: tuple[tuple[str, str], ...] = tuple(
@@ -65,6 +74,14 @@ CANDIDATE_PAIRS: tuple[tuple[str, str], ...] = tuple(
         + EPITHELIAL_REFERENCE_COMPARATOR_PAIRS
     )
 )
+for _target, _reference in CANDIDATE_PAIRS:  # fail at import, not mid-screen
+    if _reference in INVALID_REFERENCE_MARKERS:
+        raise ValueError(
+            f"{_target} <- {_reference}: {INVALID_REFERENCE_MARKERS[_reference]}"
+        )
+    if _target == _reference:
+        raise ValueError(f"{_target} cannot be its own reference")
+del _target, _reference
 PAIR_SETS: dict[str, tuple[tuple[str, str], ...]] = {
     "baseline": BASELINE_PAIRS,
     "immune-screen": IMMUNE_REFERENCE_SCREEN_PAIRS,

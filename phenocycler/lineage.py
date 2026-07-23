@@ -13,7 +13,8 @@ Priority high->low:
   2. Endothelial <- CD31_pos            (sub: lymphatic Podoplanin+, else vascular)
   3. Neural      <- B3TUBB_pos          (residual, after epithelial -> islet TUBB3 co-expression removed)
   4. Immune      <- ANY(CD3e/CD20/CD79a/CD68/CD163/CD206/Iba1/CD11b/CD11c/MPO)_pos
-                     sub: T / B / Plasma / Neutrophil / Macrophage / DC / NK / Immune-other
+                     sub, LOWEST->HIGHEST precedence: B / Plasma -> DC -> Macrophage -> Neutrophil
+                     -> NK -> T (B is sparse in pancreas, so frequent types claim their cells first)
   5. Mesenchymal <- SMA_pos (Muscle), then Vimentin_pos in the SMA-neg residual (Fibroblast)
   6. Other       <- failed every gate
 
@@ -112,15 +113,21 @@ def _cell_types(compartment: np.ndarray, pos, norm) -> np.ndarray:
     # --- Neural ---
     ct[compartment == "Neural"] = "Neural"
 
-    # --- Immune (last-write-wins precedence: myeloid -> B/Plasma -> NK -> T, so lymphoid identity wins) ---
+    # --- Immune (last-write-wins precedence: B/Plasma -> DC -> Macrophage -> Neutrophil -> NK -> T) ---
+    # B/Plasma are written FIRST, i.e. at the LOWEST precedence, so every more frequent immune type
+    # claims its cells before a B call is allowed to stand. B cells are sparse in pancreas even with
+    # inflammation or disease, so a CD20 call carries the most risk of the three error directions: a
+    # macrophage or T cell picking up stray CD20 outnumbers the real B cells it would be confused with.
+    # Gating B last (highest precedence, as it was) inverted that -- it let the rare, least reliable
+    # marker overwrite the abundant, well-supported ones. A genuine CD20+CD68+ cell is now Macrophage.
     imm = compartment == "Immune"
     ct[imm] = "Immune-other"
-    ct[imm & (pos("CD11c") | pos("CD209"))] = "DC"
-    ct[imm & (pos("CD68") | pos("CD163") | pos("CD206") | pos("Iba1"))] = "Macrophage"
-    ct[imm & pos("MPO")] = "Neutrophil"
     b = imm & (pos("CD20") | pos("CD79a"))
     ct[b] = "B"
     ct[b & pos("CD38")] = "Plasma"                                   # CD38 is batch-1 only -> no Plasma in batch-2
+    ct[imm & (pos("CD11c") | pos("CD209"))] = "DC"
+    ct[imm & (pos("CD68") | pos("CD163") | pos("CD206") | pos("Iba1"))] = "Macrophage"
+    ct[imm & pos("MPO")] = "Neutrophil"
     ct[imm & pos("CD56") & pos("CD57") & ~pos("CD3e")] = "NK"
     ct[imm & pos("CD3e")] = "T"
 

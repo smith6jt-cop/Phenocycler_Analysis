@@ -25,7 +25,9 @@ def test_candidate_pairs_match_revised_first_pass():
     assert ("CD3e", "CD163") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
     assert ("CD20", "CD68") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
     assert ("CD68", "CD3e") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
-    assert ("CD11b", "CD20") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
+    # CD11b <- CD20 was retired: CD20 is too sparse in pancreas to define a negative control,
+    # so CD3e is the immune reference (see test_cd20_is_never_a_reference_marker).
+    assert ("CD11b", "CD3e") in rv.IMMUNE_REFERENCE_SCREEN_PAIRS
     assert ("CD20", "Pan_Cytokeratin") in rv.CANDIDATE_PAIRS
     assert rv.QUPATH_MARKERS["Pan_Cytokeratin"] == "Pan-Cytokeratin"
     assert rv.QUPATH_MARKERS["Ker8_18"] == "Ker8-18"
@@ -1336,3 +1338,19 @@ def test_immune_joint_comparator_pools_arms_and_emits_no_calls():
 def test_locked_path_still_requires_exactly_two_components():
     with pytest.raises(ValueError, match="two NNMF components"):
         rv.PairValidationConfig(n_components=4)
+
+
+def test_cd20_is_never_a_reference_marker():
+    """A reference's positive cells ARE the negative control, so it must label a population big enough
+    to estimate a background from. B cells are sparse in pancreas; CD20 is a target only."""
+    assert "CD20" in rv.INVALID_REFERENCE_MARKERS
+    for pairs in (rv.BASELINE_PAIRS, rv.IMMUNE_REFERENCE_SCREEN_PAIRS,
+                  rv.EPITHELIAL_REFERENCE_COMPARATOR_PAIRS, rv.CANDIDATE_PAIRS):
+        assert all(reference != "CD20" for _target, reference in pairs)
+    # CD20 remains a legitimate TARGET, thresholded against reliable references.
+    assert ("CD20", "CD3e") in rv.CANDIDATE_PAIRS
+    # The immune targets that used to lean on CD20 now use CD3e, which was already their alternative.
+    assert ("CD68", "CD3e") in rv.CANDIDATE_PAIRS
+    assert ("CD11b", "CD3e") in rv.CANDIDATE_PAIRS
+    # No marker may reference itself.
+    assert all(t != r for t, r in rv.CANDIDATE_PAIRS)

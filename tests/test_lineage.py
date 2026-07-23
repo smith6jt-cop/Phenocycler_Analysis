@@ -134,3 +134,26 @@ def test_output_schema(tmp_path):
     assert "broad_lineage" not in out.columns
     assert not any(c.startswith("score_") for c in out.columns)
     assert "epi_default" not in out.columns
+
+
+def test_frequent_immune_types_outrank_sparse_b_cells(tmp_path):
+    """CD20 is the least reliable immune marker and B cells are sparse in pancreas, so a more frequent
+    co-positive identity must win. Previously B was written last and overwrote macrophages."""
+    rows = [
+        {"id": "b_only", "CD20": (True, 3)},
+        {"id": "b_cd79a", "CD79a": (True, 3)},
+        {"id": "b_vs_mac", "CD20": (True, 9), "CD68": (True, 3)},     # -> Macrophage, not B
+        {"id": "b_vs_dc", "CD20": (True, 9), "CD11c": (True, 3)},     # -> DC, not B
+        {"id": "b_vs_neut", "CD20": (True, 9), "MPO": (True, 3)},     # -> Neutrophil, not B
+        {"id": "b_vs_t", "CD20": (True, 9), "CD3e": (True, 3)},       # -> T, not B
+    ]
+    out = _assign(tmp_path, rows).set_index("object_id")
+    assert (out["compartment"] == "Immune").all()
+    # A cell with no competing immune marker is still B.
+    assert out.loc["b_only", "cell_type"] == "B"
+    assert out.loc["b_cd79a", "cell_type"] == "B"
+    # Every more frequent immune identity now outranks it, regardless of relative intensity.
+    assert out.loc["b_vs_mac", "cell_type"] == "Macrophage"
+    assert out.loc["b_vs_dc", "cell_type"] == "DC"
+    assert out.loc["b_vs_neut", "cell_type"] == "Neutrophil"
+    assert out.loc["b_vs_t", "cell_type"] == "T"
