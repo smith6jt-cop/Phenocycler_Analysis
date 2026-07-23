@@ -60,7 +60,7 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
     ("Vimentin", "E_cadherin"): "mesenchymal candidate; must exclude genuine epithelial Vimentin",
     ("CD3e", "E_cadherin"): "best fixed-reference availability; epithelial adjacency risk",
     ("CD3e", "CD68"): "literature-supported T/myeloid exclusion; weak target separation in many donors",
-    ("CD3e", "CD163"): "literature-supported T/macrophage exclusion; reference absent in some donors",
+    ("CD3e", "CD163"): "literature-supported T/macrophage exclusion; CD163 is the panel's weakest channel but its macrophage control arm is large (>=1,336 cells/donor) so the fit is sound -- weak-but-valid; blocky qptiff panel is display-only (2026-07-23 investigation)",
     ("CD68", "EpCAM"): "strongest computational CD68 candidate; epithelial adjacency risk",
     ("CD68", "CD3e"): "lymphoid reference replacing CD20, which is too sparse to be a negative control",
     ("CD11b", "Pan_Cytokeratin"): "best fixed-reference availability; epithelial adjacency risk",
