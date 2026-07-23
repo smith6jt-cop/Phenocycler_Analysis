@@ -23,11 +23,17 @@ import pandas as pd
 from .cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 
 
+# v7: the positive CALL is divisor-gated only (target > Step 2 divisor). The former target-component
+# rescue -- which also called every NNMF-target-component cell left of Step 1 even below the divisor --
+# is removed from the call: negligible for clean markers (<=0.3 pp) but it doubled a high-background
+# marker like CD11b by retaining background cells the divisor correctly excludes (6521 CD11b<-PanCK
+# 14% -> 28% supported). Below-divisor component cells stay tracked (target_supported_below_divisor)
+# and are shown in the bundle as a distinct "retained, not called" category. Adds threshold_positive_n.
 # v6: robust min-max tails adapt when the balanced fit sample cannot span the configured pair, so a
 # single bright cell in a sparse arm no longer sets the feature scale (22 of 600 screened rows, all with
 # immune targets). Adds anchor_recovery, arm-saturation/stability_informative reporting, and a
 # saturated-arm probe Jaccard. v5 artifacts were produced under the degenerate bound rule.
-METHOD_VERSION = "restore-pair-validation-v6"
+METHOD_VERSION = "restore-pair-validation-v7"
 # NB: ``BroadLineageRevised.md`` lists 8 first-pass pairs.  ``CD20 <- E_cadherin`` was the eighth and
 # is deliberately absent — CD20 is deferred out of RESTORE entirely (see RESTORE_EXCLUDED_MARKERS).
 BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
@@ -740,42 +746,38 @@ def negative_control_statistics(values: np.ndarray) -> dict[str, float | int]:
 def normalize_and_call(
     values: np.ndarray,
     divisor: float,
-    *,
-    target_component_supported: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Normalize by the manuscript divisor and apply the target-component rescue."""
+    """Normalize by the manuscript divisor; positivity is strictly ``value > divisor``.
+
+    The call is divisor-gated only (2026-07-23). The former ``| target_component_supported`` rescue
+    -- which additionally called every NNMF-target-component cell left of the Step 1 separator, even
+    below the Step 2 divisor -- is removed: it is negligible for clean markers (<=0.3 pp) but doubles
+    a high-background marker like CD11b by retaining background cells the divisor correctly excludes.
+    Those below-divisor component cells remain tracked (``target_supported`` /
+    ``target_supported_below_divisor``) and are shown in the review bundle as a distinct
+    "retained, not called" category, so any marker they would help is visible for a per-marker
+    reviewer decision -- they are simply not counted as positive here.
+    """
     values = np.asarray(values, dtype=float)
-    target_component_supported = np.asarray(target_component_supported, dtype=bool)
-    if target_component_supported.shape != values.shape:
-        raise ValueError("target_component_supported must match values")
     if not np.isfinite(values).all() or np.any(values < 0):
         raise ValueError("RESTORE values must be finite nonnegative linear intensities")
     if not np.isfinite(divisor) or divisor <= 0:
         raise ValueError("divisor must be finite and positive")
     normalized = values / divisor
-    return normalized, (normalized > 1.0) | target_component_supported
+    return normalized, normalized > 1.0
 
 
 def normalize_for_assessment(
     values: np.ndarray,
     assessment: PairAssessment,
     divisor: float | None,
-    *,
-    target_component_supported: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Apply calls only for a valid pair or an independently confirmed absence."""
     values = np.asarray(values, dtype=float)
-    target_component_supported = np.asarray(target_component_supported, dtype=bool)
-    if target_component_supported.shape != values.shape:
-        raise ValueError("target_component_supported must match values")
     if assessment.state is PairState.VALID:
         if divisor is None:
             raise ValueError("a VALID pair requires a canonical divisor")
-        return normalize_and_call(
-            values,
-            divisor,
-            target_component_supported=target_component_supported,
-        )
+        return normalize_and_call(values, divisor)
     if assessment.state is PairState.NO_TARGET_EXPRESSION_CONFIRMED:
         if divisor is not None:
             raise ValueError("confirmed target absence must not fabricate a divisor")
@@ -2228,6 +2230,7 @@ def evaluate_locked_pair(
         len(target_redsea), dtype=bool
     )
     potential_lineage_positive = np.zeros(len(target_redsea), dtype=bool)
+    threshold_positive = np.zeros(len(target_redsea), dtype=bool)
     if candidate_divisor is not None:
         threshold_positive = target_redsea > candidate_divisor
         target_supported_below_divisor = target_supported & ~threshold_positive
@@ -2237,6 +2240,8 @@ def evaluate_locked_pair(
         potential_lineage_positive = threshold_positive | target_supported
     full_target_supported_below_divisor = np.zeros(len(donor_df), dtype=bool)
     full_target_supported_below_divisor[valid_idx] = target_supported_below_divisor
+    full_threshold_positive = np.zeros(len(donor_df), dtype=bool)
+    full_threshold_positive[valid_idx] = threshold_positive
     full_target_supported_additional_below_divisor = np.zeros(
         len(donor_df), dtype=bool
     )
@@ -2253,7 +2258,6 @@ def evaluate_locked_pair(
             target_redsea,
             assessment,
             canonical_divisor,
-            target_component_supported=target_supported,
         )
         full_normalized[valid_idx] = normalized
         full_lineage_positive[valid_idx] = lineage_positive
@@ -2275,6 +2279,7 @@ def evaluate_locked_pair(
         "full_target_population": full_target_population,
         "full_target_supported": full_target_supported,
         "full_target_supported_below_divisor": full_target_supported_below_divisor,
+        "full_threshold_positive": full_threshold_positive,
         "full_target_supported_additional_below_divisor": (
             full_target_supported_additional_below_divisor
         ),
@@ -2290,6 +2295,7 @@ def evaluate_locked_pair(
         "target_population": target_population,
         "target_supported": target_supported,
         "target_supported_additional": target_supported_additional,
+        "threshold_positive": threshold_positive,
         "target_supported_below_divisor": target_supported_below_divisor,
         "target_supported_additional_below_divisor": (
             target_supported_additional_below_divisor
@@ -2314,6 +2320,7 @@ def evaluate_locked_pair(
         "target_n": int(target_population.sum()),
         "target_anchor_n": int(target_population.sum()),
         "target_supported_n": int(target_supported.sum()),
+        "threshold_positive_n": int(threshold_positive.sum()),
         "target_supported_additional_n": int(target_supported_additional.sum()),
         "target_supported_below_divisor_n": int(
             target_supported_below_divisor.sum()
@@ -2479,6 +2486,7 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "target_n": evaluation["target_n"],
         "target_anchor_n": evaluation["target_anchor_n"],
         "target_supported_n": evaluation["target_supported_n"],
+        "threshold_positive_n": evaluation["threshold_positive_n"],
         "target_supported_additional_n": evaluation[
             "target_supported_additional_n"
         ],

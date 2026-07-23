@@ -67,10 +67,13 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
     ("CD11b", "CD3e"): "lymphoid reference replacing CD20; myeloid/T exclusion at a usable arm size",
 }
 
+# 2026-07-23: the positive CALL is divisor-gated (target > Step 2 divisor). Cells in the NNMF target
+# component that sit at or below the Step 2 divisor are RETAINED and shown, but NOT called -- code 5's
+# name/colour say so. Codes are preserved so the QuPath importer's numeric classes stay stable.
 CATEGORY_CODE = {
     "Reference control arm": 1,
-    "High-confidence target anchor (sets Step 1)": 2,
-    "Lower-confidence target component (reference-negative; retained)": 5,
+    "Called target+ (above Step 2 divisor)": 2,
+    "Target component at/below Step 2 (retained, not called)": 5,
     "Double-high": 3,
     "Other retained (not a divisor control)": 4,
     "Double-low (fit excluded)": 0,
@@ -78,8 +81,8 @@ CATEGORY_CODE = {
 }
 CATEGORY_COLOR = {
     "Reference control arm": "#0072B2",
-    "High-confidence target anchor (sets Step 1)": "#D55E00",
-    "Lower-confidence target component (reference-negative; retained)": "#6A3D9A",
+    "Called target+ (above Step 2 divisor)": "#D55E00",
+    "Target component at/below Step 2 (retained, not called)": "#B9AFCB",
     "Double-high": "#CC79A7",
     "Other retained (not a divisor control)": "#7F7F7F",
     "Double-low (fit excluded)": "#D9D9D9",
@@ -87,12 +90,13 @@ CATEGORY_COLOR = {
 }
 CATEGORY_ORDER = tuple(CATEGORY_CODE)
 CATEGORY_LEGEND = {
-    "Reference control arm": "Reference controls: set Step 2 target divisor",
-    "High-confidence target anchor (sets Step 1)": (
-        "High-confidence target anchor: sets Step 1 vertical separator"
+    "Reference control arm": "Reference controls: set the Step 2 target divisor",
+    "Called target+ (above Step 2 divisor)": (
+        "Called positive: target intensity above the Step 2 divisor (the divisor-gated call)"
     ),
-    "Lower-confidence target component (reference-negative; retained)": (
-        "Input-QC-retained lower-confidence target component left of Step 1: retained even below Step 2"
+    "Target component at/below Step 2 (retained, not called)": (
+        "NNMF target component left of Step 1 but at/below the Step 2 divisor: retained for review, "
+        "NOT counted positive (was the pre-2026-07-23 component rescue)"
     ),
     "Double-high": "Double-high: excluded from both maxima",
     "Other retained (not a divisor control)": "Other retained: excluded from both maxima",
@@ -333,12 +337,15 @@ def review_categories(evaluation: dict, n_rows: int) -> np.ndarray:
         evaluation["reference_raw"] > evaluation["reference_input_floor"]
     )
     valid_categories[retained & target_high & reference_high] = "Double-high"
-    target_anchor = np.asarray(evaluation["target_population"], dtype=bool)
     target_supported = np.asarray(evaluation["target_supported"], dtype=bool)
+    threshold_positive = np.asarray(evaluation["threshold_positive"], dtype=bool)
+    # Below the Step 2 divisor: NNMF target component retained for review, not counted positive.
     valid_categories[
-        retained & target_supported & ~target_anchor
-    ] = "Lower-confidence target component (reference-negative; retained)"
-    valid_categories[target_anchor] = "High-confidence target anchor (sets Step 1)"
+        retained & target_supported & ~threshold_positive
+    ] = "Target component at/below Step 2 (retained, not called)"
+    # Above the Step 2 divisor: the divisor-gated positive call (includes the high-confidence anchor,
+    # which sets the Step 1 separator drawn on the panel).
+    valid_categories[threshold_positive] = "Called target+ (above Step 2 divisor)"
     valid_categories[
         np.asarray(evaluation["reference_control"], dtype=bool)
     ] = "Reference control arm"
@@ -473,16 +480,17 @@ def project_review_crop(
         )
     candidate_divisor = evaluation["candidate_full_maximum"]
     target_supported_below_divisor = np.zeros(len(valid_idx), dtype=bool)
+    threshold_positive = np.zeros(len(valid_idx), dtype=bool)
     if candidate_divisor is not None:
-        target_supported_below_divisor = target_supported & (
-            target_redsea <= float(candidate_divisor)
-        )
+        threshold_positive = target_redsea > float(candidate_divisor)
+        target_supported_below_divisor = target_supported & ~threshold_positive
     projected_evaluation = {
         "valid_idx": valid_idx,
         "qc_retained": qc_retained,
         "reference_control": reference_control,
         "target_population": target_population,
         "target_supported": target_supported,
+        "threshold_positive": threshold_positive,
         "target_raw": target_raw,
         "reference_raw": reference_raw,
         "target_input_floor": target_floor,
@@ -561,8 +569,8 @@ def _point_colors(
 ) -> np.ndarray:
     emphasized = {
         "Reference control arm",
-        "High-confidence target anchor (sets Step 1)",
-        "Lower-confidence target component (reference-negative; retained)",
+        "Called target+ (above Step 2 divisor)",
+        "Target component at/below Step 2 (retained, not called)",
         "Double-high",
     }
     categories = np.asarray(categories, dtype=object)
@@ -608,8 +616,8 @@ def representative_zoom_bounds(
     focus = finite & np.isin(
         categories,
         (
-            "High-confidence target anchor (sets Step 1)",
-            "Lower-confidence target component (reference-negative; retained)",
+            "Called target+ (above Step 2 divisor)",
+            "Target component at/below Step 2 (retained, not called)",
         ),
     )
     if not focus.any():
@@ -1069,11 +1077,10 @@ def _draw_review_row(
             f"{evaluation['state']}\nTarget/reference fold "
             f"{evaluation['target_fold']:.2f}/{evaluation['reference_fold']:.2f} | "
             f"{jaccard_note}{recovery_note}\n"
-            f"High-confidence anchor n={evaluation['target_anchor_n']:,} | "
-            "input-QC-retained lower-confidence target "
-            f"n={evaluation['target_supported_additional_n']:,}\n"
-            "Lower-confidence at/below Step 2 "
-            f"n={evaluation['target_supported_additional_below_divisor_n']:,}\n"
+            f"Called >Step 2 divisor n={evaluation['threshold_positive_n']:,} | "
+            f"anchor (sets Step 1) n={evaluation['target_anchor_n']:,}\n"
+            "Retained at/below Step 2 (component, NOT called) "
+            f"n={evaluation['target_supported_below_divisor_n']:,}\n"
             f"Scale tails {'WIDENED' if evaluation.get('scale_bound_adapted') else 'as configured'} "
             f"({evaluation.get('scale_bound_lower_quantile', 0.005):.3f}-"
             f"{evaluation.get('scale_bound_upper_quantile', 0.995):.3f} on n="
@@ -1790,11 +1797,11 @@ def build_review_bundle(
                 "legend_placement": "dedicated non-data axis below all plot rows",
             },
             "target_review_colors": {
-                "high_confidence_anchor": CATEGORY_COLOR[
-                    "High-confidence target anchor (sets Step 1)"
+                "called_above_divisor": CATEGORY_COLOR[
+                    "Called target+ (above Step 2 divisor)"
                 ],
-                "lower_confidence_component": CATEGORY_COLOR[
-                    "Lower-confidence target component (reference-negative; retained)"
+                "retained_below_divisor_not_called": CATEGORY_COLOR[
+                    "Target component at/below Step 2 (retained, not called)"
                 ],
             },
             "marker_pixel_colors": {

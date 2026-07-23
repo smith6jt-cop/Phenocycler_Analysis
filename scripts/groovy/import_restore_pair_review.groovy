@@ -151,8 +151,8 @@ def classColors = [
     "RESTORE review - Unavailable"       : [34, 34, 34],
     "RESTORE review - Double-low"        : [189, 189, 189],
     "RESTORE review - Reference control" : [0, 114, 178],
-    "RESTORE review - High-confidence target"  : [213, 94, 0],
-    "RESTORE review - Lower-confidence target" : [106, 61, 154],
+    "RESTORE review - Called target+"          : [213, 94, 0],
+    "RESTORE review - Retained below Step 2"   : [185, 175, 203],
     "RESTORE review - Double-high"       : [204, 121, 167],
     "RESTORE review - Other retained"    : [127, 127, 127],
 ]
@@ -160,10 +160,10 @@ def codeClasses = [
     "-1": "RESTORE review - Unavailable",
     "0" : "RESTORE review - Double-low",
     "1" : "RESTORE review - Reference control",
-    "2" : "RESTORE review - High-confidence target",
+    "2" : "RESTORE review - Called target+",
     "3" : "RESTORE review - Double-high",
     "4" : "RESTORE review - Other retained",
-    "5" : "RESTORE review - Lower-confidence target",
+    "5" : "RESTORE review - Retained below Step 2",
 ]
 def hasTemporaryReviewClass = { object ->
     def pathClass = object.getPathClass()

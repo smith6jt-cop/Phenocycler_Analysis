@@ -54,25 +54,22 @@ def test_directional_groups_rejects_same_direction_clusters():
     assert not result.directional_median
 
 
-def test_manuscript_maximum_and_target_component_rescue_call():
+def test_manuscript_maximum_divisor_gated_call():
+    # 2026-07-23: the call is strictly value > divisor; the former target-component rescue is gone,
+    # so a below-divisor cell is NOT positive even when it was in the NNMF target component.
     stats = rv.negative_control_statistics(np.array([1.0, 2.0, 4.0]))
     assert stats["maximum"] == 4.0
     normalized, positive = rv.normalize_and_call(
         np.array([0.0, 4.0, 4.0001, 8.0]),
         stats["maximum"],
-        target_component_supported=np.array([True, False, False, False]),
     )
     assert np.allclose(normalized, [0.0, 1.0, 1.000025, 2.0])
-    assert positive.tolist() == [True, False, True, True]
+    assert positive.tolist() == [False, False, True, True]
 
 
-def test_target_component_rescue_requires_shape_matched_explicit_mask():
-    with pytest.raises(ValueError, match="must match"):
-        rv.normalize_and_call(
-            np.array([1.0, 2.0]),
-            2.0,
-            target_component_supported=np.array([True]),
-        )
+def test_call_rejects_nonpositive_divisor():
+    with pytest.raises(ValueError, match="divisor must be finite and positive"):
+        rv.normalize_and_call(np.array([1.0, 2.0]), 0.0)
 
 
 def test_negative_control_maximum_requires_positive_nonnegative_values():
@@ -289,10 +286,10 @@ def test_calls_are_blocked_except_valid_or_confirmed_absence():
         values,
         _assessment(),
         divisor=2.0,
-        target_component_supported=np.array([True, True, False]),
     )
     assert np.allclose(normalized, [0.0, 1.0, 1.00005])
-    assert positive.tolist() == [True, True, True]
+    # Divisor-gated: only value > divisor is positive (2.0 is not > 2.0).
+    assert positive.tolist() == [False, False, True]
 
     absent = _assessment(
         target_arm_fold=1.0,
@@ -302,7 +299,6 @@ def test_calls_are_blocked_except_valid_or_confirmed_absence():
         values,
         absent,
         divisor=None,
-        target_component_supported=np.ones(3, dtype=bool),
     )
     assert np.isnan(normalized).all()
     assert not positive.any()
@@ -311,14 +307,12 @@ def test_calls_are_blocked_except_valid_or_confirmed_absence():
             values,
             absent,
             divisor=2.0,
-            target_component_supported=np.ones(3, dtype=bool),
         )
     with pytest.raises(ValueError, match="cannot produce"):
         rv.normalize_for_assessment(
             values,
             _assessment(target_arm_fold=1.0),
             divisor=None,
-            target_component_supported=np.ones(3, dtype=bool),
         )
 
 
@@ -615,7 +609,10 @@ def test_locked_pair_assigns_all_cells_but_uses_double_low_qc_only_for_fitting()
     assert result["canonical_divisor"] == result["candidate_full_maximum"]
     assert result["target_supported_n"] >= result["target_anchor_n"]
     assert not result["target_supported"][~result["qc_retained"]].any()
-    assert result["lineage_positive_n"] >= result["target_supported_n"]
+    # 2026-07-23: the call is divisor-gated -- lineage-positive is exactly the above-divisor count.
+    # (It is NOT bounded by target_supported: a double-high cell above the divisor is called but is
+    # not in the target component, so threshold_positive can exceed target_supported.)
+    assert result["lineage_positive_n"] == result["threshold_positive_n"]
     assert result["target_threshold_grid"]["sample_n"].tolist() == [5, 10]
 
     with_missing = frame.copy()
@@ -753,6 +750,8 @@ def test_review_categories_keep_unavailable_and_double_low_distinct():
         "reference_control": np.array([True, False, False, False, False]),
         "target_population": np.array([False, True, False, False, False]),
         "target_supported": np.array([False, True, False, True, True]),
+        # idx1 is above the Step 2 divisor (called); idx4 is a target-component cell below it (retained).
+        "threshold_positive": np.array([False, True, False, False, False]),
         "target_raw": np.array([1.0, 10.0, 10.0, 1.0, 10.0]),
         "reference_raw": np.array([10.0, 1.0, 10.0, 1.0, 1.0]),
         "target_input_floor": 5.0,
@@ -761,10 +760,10 @@ def test_review_categories_keep_unavailable_and_double_low_distinct():
     categories = rpr.review_categories(evaluation, n_rows=6)
     assert categories.tolist() == [
         "Reference control arm",
-        "High-confidence target anchor (sets Step 1)",
+        "Called target+ (above Step 2 divisor)",
         "Double-high",
         "Double-low (fit excluded)",
-        "Lower-confidence target component (reference-negative; retained)",
+        "Target component at/below Step 2 (retained, not called)",
         "Unavailable",
     ]
 
@@ -778,7 +777,7 @@ def test_representative_zoom_is_deterministic_and_target_focused():
     )
     categories = np.array(
         ["Other retained (not a divisor control)"] * 20
-        + ["Lower-confidence target component (reference-negative; retained)"] * 3,
+        + ["Target component at/below Step 2 (retained, not called)"] * 3,
         dtype=object,
     )
     first = rpr.representative_zoom_bounds(donor_df, categories)
@@ -839,7 +838,9 @@ def test_full_cell_projection_labels_every_crop_cell_and_matches_sample():
             "Cell__Reference": [0.0, 0.0, 10.0, 0.0, 1.0],
             "raw__Target": [10.0, 2.0, 1.0, 10.0, 1.0],
             "raw__Reference": [1.0, 1.0, 10.0, 10.0, 1.0],
-            "redsea__Target": [10.0, 2.0, 1.0, 10.0, 1.0],
+            # idx3 is raw double-high but its target redsea (3) sits below the divisor (5), so it stays
+            # Double-high rather than being divisor-called.
+            "redsea__Target": [10.0, 2.0, 1.0, 3.0, 1.0],
             "redsea__Reference": [1.0, 1.0, 5.0, 5.0, 1.0],
         }
     )
@@ -861,7 +862,7 @@ def test_full_cell_projection_labels_every_crop_cell_and_matches_sample():
         full_df, evaluation, (0.0, 4.0), (0.0, 4.0)
     )
     assert projected["review_category"].tolist() == [
-        "High-confidence target anchor (sets Step 1)",
+        "Called target+ (above Step 2 divisor)",
         "Double-low (fit excluded)",
         "Reference control arm",
         "Double-high",
@@ -904,8 +905,8 @@ def test_review_row_combines_marker_images_overlay_and_merged_view():
     )
     categories = np.array(
         ["Other retained (not a divisor control)"] * 8
-        + ["High-confidence target anchor (sets Step 1)"] * 2
-        + ["Lower-confidence target component (reference-negative; retained)"] * 2,
+        + ["Called target+ (above Step 2 divisor)"] * 2
+        + ["Target component at/below Step 2 (retained, not called)"] * 2,
         dtype=object,
     )
     evaluation = {
@@ -923,6 +924,7 @@ def test_review_row_combines_marker_images_overlay_and_merged_view():
         "target_fold": 2.0,
         "reference_fold": 3.0,
         "min_control_jaccard": 0.95,
+        "threshold_positive_n": 2,
         "target_anchor_n": 2,
         "target_supported_n": 4,
         "target_supported_additional_n": 2,
@@ -973,9 +975,9 @@ def test_review_row_combines_marker_images_overlay_and_merged_view():
     assert len(overlay_axis.collections[0].get_offsets()) == 12
     assert len(merged_axis.collections[0].get_offsets()) == 12
     assert not axes[0].texts
-    assert "High-confidence anchor n=2" in axes[0].get_title()
-    assert "input-QC-retained lower-confidence target n=2" in axes[0].get_title()
-    assert "Lower-confidence at/below Step 2 n=1" in axes[0].get_title()
+    assert "Called >Step 2 divisor n=2" in axes[0].get_title()
+    assert "anchor (sets Step 1) n=2" in axes[0].get_title()
+    assert "Retained at/below Step 2 (component, NOT called) n=2" in axes[0].get_title()
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     assert not axes[0].title.get_window_extent(renderer).overlaps(
@@ -987,15 +989,13 @@ def test_review_row_combines_marker_images_overlay_and_merged_view():
 def test_target_confidence_colors_are_distinct_and_high_contrast():
     high = np.asarray(
         rpr.to_rgba(
-            rpr.CATEGORY_COLOR[
-                "High-confidence target anchor (sets Step 1)"
-            ]
+            rpr.CATEGORY_COLOR["Called target+ (above Step 2 divisor)"]
         )[:3]
     )
     lower = np.asarray(
         rpr.to_rgba(
             rpr.CATEGORY_COLOR[
-                "Lower-confidence target component (reference-negative; retained)"
+                "Target component at/below Step 2 (retained, not called)"
             ]
         )[:3]
     )
@@ -1008,8 +1008,8 @@ def test_review_figure_uses_large_fonts_and_nonoverlapping_legend_band():
     axes[0, 0].set_title(
         "LOW_SIGNAL_UNRESOLVED\n"
         "Target/reference fold 1.56/3.04 | control Jaccard 0.98\n"
-        "High-confidence anchor n=28,685 | input-QC-retained lower-confidence target n=4,531\n"
-        "Lower-confidence at/below Step 2 n=3,884",
+        "Called >Step 2 divisor n=24,801 | anchor (sets Step 1) n=28,685\n"
+        "Retained at/below Step 2 (component, NOT called) n=3,884",
         fontsize=rpr.PDF_ROW_TITLE_FONT_SIZE,
         pad=10,
         linespacing=1.3,
@@ -1060,10 +1060,10 @@ def test_qupath_importer_is_rendered_with_bundle_csv_path(tmp_path):
     assert "def setTemporaryClasses = true" in text
     assert "classifyNotSampled" not in text
     assert '"RESTORE review - Not sampled"' not in text
-    assert '"RESTORE review - High-confidence target"' in text
-    assert '"RESTORE review - Lower-confidence target"' in text
-    assert '"5" : "RESTORE review - Lower-confidence target"' in text
-    assert "[106, 61, 154]" in text
+    assert '"RESTORE review - Called target+"' in text
+    assert '"RESTORE review - Retained below Step 2"' in text
+    assert '"5" : "RESTORE review - Retained below Step 2"' in text
+    assert "[185, 175, 203]" in text
     assert "outside the representative crop retained" in text
     assert 'def originalClassMetadataKey = "RESTORE review original PathClass"' in text
     assert "PathClass.fromString(originalClass)" in text
