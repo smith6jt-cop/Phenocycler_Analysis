@@ -50,9 +50,9 @@ SHORTLIST_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD20", "CD68"),
     ("CD20", "CD163"),
     ("CD68", "EpCAM"),
-    ("CD68", "CD20"),
+    ("CD68", "CD3e"),
     ("CD11b", "Pan_Cytokeratin"),
-    ("CD11b", "CD20"),
+    ("CD11b", "CD3e"),
 )
 
 PAIR_RATIONALE: dict[tuple[str, str], str] = {
@@ -66,9 +66,9 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
     ("CD20", "CD68"): "strongest fixed B-cell/myeloid candidate in the expanded screen",
     ("CD20", "CD163"): "B-cell/macrophage alternative; reference absent in some donors",
     ("CD68", "EpCAM"): "strongest computational CD68 candidate; epithelial adjacency risk",
-    ("CD68", "CD20"): "biologically exclusive comparator; CD20 reference absent in some donors",
+    ("CD68", "CD3e"): "lymphoid reference replacing CD20, which is too sparse to be a negative control",
     ("CD11b", "Pan_Cytokeratin"): "best fixed-reference availability; epithelial adjacency risk",
-    ("CD11b", "CD20"): "least-confounded lymphoid reference; often lacks a supported reference arm",
+    ("CD11b", "CD3e"): "lymphoid reference replacing CD20; myeloid/T exclusion at a usable arm size",
 }
 
 CATEGORY_CODE = {

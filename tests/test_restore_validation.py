@@ -1340,6 +1340,15 @@ def test_locked_path_still_requires_exactly_two_components():
         rv.PairValidationConfig(n_components=4)
 
 
+def test_review_shortlist_only_names_pairs_the_screen_produces():
+    """The bundle selects its review queue from the screen, so a shortlist entry that is not a
+    candidate pair would silently yield no rows (this caught CD68<-CD20 / CD11b<-CD20 when CD20 was
+    retired as a reference)."""
+    missing = [p for p in rpr.SHORTLIST_PAIRS if p not in rv.CANDIDATE_PAIRS]
+    assert not missing, f"shortlist pairs absent from CANDIDATE_PAIRS: {missing}"
+    assert all(reference != "CD20" for _t, reference in rpr.SHORTLIST_PAIRS)
+
+
 def test_cd20_is_never_a_reference_marker():
     """A reference's positive cells ARE the negative control, so it must label a population big enough
     to estimate a background from. B cells are sparse in pancreas; CD20 is a target only."""
