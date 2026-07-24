@@ -630,6 +630,107 @@ def test_locked_pair_assigns_all_cells_but_uses_double_low_qc_only_for_fitting()
     assert missing_result["full_labels"][-1] == -1
 
 
+def _asymmetric_pair_frame(rng, target_arm, reference_arm):
+    """Two cleanly separated exclusive arms of controllable size for the frequency rule."""
+    target = np.r_[
+        rng.normal(100, 2, target_arm),
+        rng.normal(1, 0.05, reference_arm),
+    ]
+    reference = np.r_[
+        rng.normal(1, 0.05, target_arm),
+        rng.normal(100, 2, reference_arm),
+    ]
+    return pd.DataFrame(
+        {
+            "raw__E_cadherin": target,
+            "raw__CD31": reference,
+            "redsea__E_cadherin": np.clip(target - 0.2, 0, None),
+            "redsea__CD31": np.clip(reference - 0.2, 0, None),
+            rv.compartment_column("Membrane", "E_cadherin"): target * 0.9,
+            rv.compartment_column("Membrane", "CD31"): reference * 0.9,
+            rv.compartment_column("Cell", "E_cadherin"): target,
+            rv.compartment_column("Cell", "CD31"): reference,
+        }
+    )
+
+
+def test_reference_frequency_rule_is_pure_proportion_diagnostic():
+    rng = np.random.default_rng(7)
+    config = rv.PairValidationConfig(
+        seeds=(0, 1, 2),
+        fit_cap=400,
+        threshold_sample_sizes=(5, 10),
+        threshold_resamples=10,
+        min_control_jaccard=0.8,
+    )
+    # reference arm smaller than target arm -> the inverted-fit case -> undersized
+    undersized = rv.evaluate_locked_pair(
+        _asymmetric_pair_frame(rng, target_arm=120, reference_arm=30),
+        "synthetic",
+        "E_cadherin",
+        "CD31",
+        config=config,
+        pair_review=rv.PairReview.ACCEPTED,
+    )
+    # reference arm larger than target arm -> not undersized
+    oversized = rv.evaluate_locked_pair(
+        _asymmetric_pair_frame(rng, target_arm=30, reference_arm=120),
+        "synthetic",
+        "E_cadherin",
+        "CD31",
+        config=config,
+        pair_review=rv.PairReview.ACCEPTED,
+    )
+    for result in (undersized, oversized):
+        # the ratio is EXACTLY reference_n / target_n -- a pure proportion, no absolute term
+        assert result["reference_to_target_ratio"] == pytest.approx(
+            result["reference_n"] / result["target_n"]
+        )
+        assert result["reference_undersized"] == (
+            result["target_n"] > 0 and result["reference_n"] < result["target_n"]
+        )
+        # the flat metrics row carries both columns unchanged
+        row = rv.locked_pair_metrics(result)
+        assert row["reference_to_target_ratio"] == result["reference_to_target_ratio"]
+        assert row["reference_undersized"] == result["reference_undersized"]
+    assert undersized["reference_undersized"] is True
+    assert undersized["reference_n"] < undersized["target_n"]
+    assert oversized["reference_undersized"] is False
+    assert oversized["reference_n"] > oversized["target_n"]
+    # diagnostic only: the flag never alters the divisor or the pair state
+    assert oversized["canonical_divisor"] == oversized["candidate_full_maximum"]
+    assert undersized["canonical_divisor"] == undersized["candidate_full_maximum"]
+
+
+def test_reference_frequency_rule_has_no_absolute_floor():
+    # A tiny reference arm that still EXCEEDS an even tinier target arm is NOT undersized: the rule is a
+    # pure proportion, so absolute counts (which vary widely across images) never enter it.
+    rng = np.random.default_rng(11)
+    config = rv.PairValidationConfig(
+        seeds=(0, 1, 2),
+        fit_cap=200,
+        threshold_sample_sizes=(3, 5),
+        threshold_resamples=10,
+        min_control_jaccard=0.8,
+    )
+    result = rv.evaluate_locked_pair(
+        _asymmetric_pair_frame(rng, target_arm=8, reference_arm=40),
+        "synthetic",
+        "E_cadherin",
+        "CD31",
+        config=config,
+        pair_review=rv.PairReview.ACCEPTED,
+    )
+    assert result["reference_n"] > result["target_n"]
+    assert result["reference_undersized"] is False
+    assert result["reference_to_target_ratio"] > 1.0
+
+
+def test_reference_to_target_ratio_config_must_be_positive():
+    with pytest.raises(ValueError, match="min_reference_to_target_ratio"):
+        rv.PairValidationConfig(min_reference_to_target_ratio=0)
+
+
 def test_green_interval_is_hidden_only_when_it_has_no_visible_width():
     assert rvf._visible_scaled_interval(2.0, 4.0, (0.0, 10.0)) == (0.2, 0.4)
     assert rvf._visible_scaled_interval(4.0, 4.0, (0.0, 10.0)) is None

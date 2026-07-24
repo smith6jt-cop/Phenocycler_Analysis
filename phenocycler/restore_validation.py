@@ -33,7 +33,7 @@ from .cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 # single bright cell in a sparse arm no longer sets the feature scale (22 of 600 screened rows, all with
 # immune targets). Adds anchor_recovery, arm-saturation/stability_informative reporting, and a
 # saturated-arm probe Jaccard. v5 artifacts were produced under the degenerate bound rule.
-METHOD_VERSION = "restore-pair-validation-v7"
+METHOD_VERSION = "restore-pair-validation-v8"
 # NB: ``BroadLineageRevised.md`` lists 8 first-pass pairs.  ``CD20 <- E_cadherin`` was the eighth and
 # is deliberately absent — CD20 is deferred out of RESTORE entirely (see RESTORE_EXCLUDED_MARKERS).
 BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
@@ -187,6 +187,16 @@ class PairValidationConfig:
     min_reference_arm_fold: float = 2.0
     min_arm_n: int = 2
     min_control_jaccard: float = 0.90
+    # Reference-frequency selection rule (2026-07-24): a target's negative control (the reference-
+    # positive, target-negative arm) must be at least as large as the target-positive population, or
+    # the background maximum is estimated from too few cells to threshold many (the inverted-fit failure
+    # mode, e.g. CD11b <- CD3e). Reported per pair as reference_to_target_ratio = reference_n / target_n
+    # and the boolean reference_undersized = ratio < this value. PURE PROPORTION -- no absolute cell-
+    # count floor, because images vary widely in total and per-marker counts so an absolute threshold is
+    # not comparable across donors. DIAGNOSTIC ONLY: it never gates PairState or alters a divisor; the
+    # reviewer uses it and records any reject as a human decision (so E_cadherin <- CD31 stays
+    # reviewable rather than auto-failed).
+    min_reference_to_target_ratio: float = 1.0
     # Minimum cells each robust min-max tail must span for the balanced fit sample to estimate the
     # scaling bounds. Below it the quantile degenerates into an order statistic of a handful of cells
     # (a sparse-marker arm), so bounds fall back to the input-QC-retained population instead.
@@ -242,6 +252,8 @@ class PairValidationConfig:
             raise ValueError("min_arm_n must be >= 2")
         if not 0 <= self.min_control_jaccard <= 1:
             raise ValueError("min_control_jaccard must be in [0, 1]")
+        if self.min_reference_to_target_ratio <= 0:
+            raise ValueError("min_reference_to_target_ratio must be > 0")
         if self.min_quantile_support_cells < 1:
             raise ValueError("min_quantile_support_cells must be >= 1")
         if self.degenerate_tail_support_cells < self.min_quantile_support_cells:
@@ -2318,6 +2330,18 @@ def evaluate_locked_pair(
         "reference_fold": reference_fold,
         "reference_n": int(reference_control.sum()),
         "target_n": int(target_population.sum()),
+        # Reference-frequency rule (pure proportion, no absolute floor). Diagnostic only -- never gates
+        # PairState, never alters a divisor.
+        "reference_to_target_ratio": (
+            float(int(reference_control.sum()) / int(target_population.sum()))
+            if int(target_population.sum()) > 0
+            else np.nan
+        ),
+        "reference_undersized": bool(
+            int(target_population.sum()) > 0
+            and int(reference_control.sum())
+            < config.min_reference_to_target_ratio * int(target_population.sum())
+        ),
         "target_anchor_n": int(target_population.sum()),
         "target_supported_n": int(target_supported.sum()),
         "threshold_positive_n": int(threshold_positive.sum()),
@@ -2484,6 +2508,8 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "fit_per_arm": evaluation["fit_per_arm"],
         "reference_n": evaluation["reference_n"],
         "target_n": evaluation["target_n"],
+        "reference_to_target_ratio": evaluation["reference_to_target_ratio"],
+        "reference_undersized": evaluation["reference_undersized"],
         "target_anchor_n": evaluation["target_anchor_n"],
         "target_supported_n": evaluation["target_supported_n"],
         "threshold_positive_n": evaluation["threshold_positive_n"],
