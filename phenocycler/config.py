@@ -26,45 +26,52 @@ from .cohort import filter_eligible_donors
 # Scientific constants (faithful to Islet-Explorer-Senior; not usually tuned)
 # --------------------------------------------------------------------------- #
 
-# Broad phenotyping — 5-compartment ORDERED RESIDUAL partition (+ explicit "Other").
-# Each cell is typed by the first matching gate in COMPARTMENT_ORDER (each gate runs on the
-# residual of the prior); cells failing every gate -> "Other" (real panel gaps: mast/Schwann/
-# adipocyte/quiescent-stellate). Endocrine/exocrine are a SUB-branch of Epithelial (hormone+ vs
-# hormone-). Priority: Epithelial > Endothelial > Neural > Immune > Mesenchymal > Other.
-# See phenocycler/lineage.py for the tree + sub-splits.
-COMPARTMENT_ORDER: list[str] = ["Epithelial", "Endothelial", "Neural", "Immune", "Mesenchymal"]
+# Broad phenotyping — 5-compartment ORDERED RESIDUAL partition over the RESTORE tri-state calls
+# (+ explicit "Other" and "Unresolved"). Each cell is typed by the first POSITIVE gate in
+# COMPARTMENT_ORDER (each gate on the residual of the prior). The first gate that is UNAVAILABLE
+# (indeterminate — a required marker has no valid call for that cell) BLOCKS assignment -> "Unresolved":
+# we cannot rule the cell into or out of that (higher-priority) compartment, so no lower gate may claim
+# it. A cell that is valid-and-NEGATIVE for every gate -> "Other" (a real panel gap, NOT force-assigned).
+# Priority high->low: Immune > Epithelial > Endothelial > Neural > Mesenchymal > Other.
+# Gate 4 (2026-07-24): Immune moved to FIRST, and the tree runs on tri-state positive|negative|unavailable
+# calls emitted by restore_apply from the frozen ACCEPTED_PAIRS. Endocrine/exocrine + immune/mesenchymal
+# SUBTYPES are DEFERRED to a validated level-2 pass (docs/level2_hierarchy.md); this first deliverable is
+# the 5 broad compartments only. See phenocycler/lineage.py for the tree.
+COMPARTMENT_ORDER: list[str] = ["Immune", "Epithelial", "Endothelial", "Neural", "Mesenchymal"]
 OTHER_LABEL: str = "Other"
+UNRESOLVED_LABEL: str = "Unresolved"   # blocked by an unavailable higher-priority gate (NOT a negative Other)
 
-# Anchor gate marker(s) per compartment — a cell enters the compartment if ANY is `_pos`.
-# Mesenchymal is ORDERED: SMA (muscle/pericyte) claimed first, then Vimentin (fibroblast/stellate)
-# in the SMA-negative residual (Vimentin is the most promiscuous marker -> gated last).
+# Anchor gate marker(s) per compartment — a cell enters the compartment if ANY gate marker is a POSITIVE
+# RESTORE call. Gate 4 (2026-07-24): the gate set is EXACTLY the 7 divisor-backed ACCEPTED_PAIRS targets
+# (restore_validation.ACCEPTED_PAIRS), so every gate marker has an accepted per-donor divisor and a
+# meaningful tri-state call. Markers with NO accepted pair are DEFERRED to the level-2 pass and are NOT
+# gates here (as gates they would be permanently 'unavailable' and Unresolve most cells):
+#   Immune  — CD79a/CD163/CD206/Iba1/CD11c/MPO/CD20 (B/DC/macrophage-subset/neutrophil markers) + the
+#             NK CD56+CD57+ gate are deferred; Immune rests on the three screened anchors CD3e (T),
+#             CD68 (macrophage), CD11b (myeloid). CD20 also takes no part in RESTORE (RESTORE_EXCLUDED_MARKERS).
+#   Mesench — SMA (mural/myofibroblast) is a level-2 Mesenchymal pair, so level-1 Mesenchymal rests on Vimentin.
+# See restore_validation.ACCEPTED_PAIRS and docs/level2_hierarchy.md.
 COMPARTMENT_GATES: dict[str, list[str]] = {
-    "Epithelial":  ["E_cadherin"],          # only epithelial marker that stays + on endocrine
+    "Immune":      ["CD3e", "CD68", "CD11b"],   # T / macrophage / myeloid — the 3 screened immune targets
+    "Epithelial":  ["E_cadherin"],              # only epithelial marker that stays + on endocrine
     "Endothelial": ["CD31"],
-    "Neural":      ["B3TUBB"],               # residual (after epithelial) so islet TUBB3 is gone
-    # CD20 is NOT a compartment anchor: B cells are sparse in pancreas, so a lone CD20 call is far more
-    # likely to be stray signal on an abundant cell than a real B cell, and an any-positive union would
-    # let it pull that cell into Immune before a more frequent compartment could claim it. B cells still
-    # reach Immune via CD79a and are sub-typed "B" there (see lineage._cell_types, where B/Plasma also
-    # gate at the lowest precedence so more frequent immune types resolve first).
-    # Stronger as of 2026-07-23: CD20 is excluded from RESTORE in BOTH roles and deferred to a second
-    # pass (restore_validation.RESTORE_EXCLUDED_MARKERS), so it has no threshold to gate on at all.
-    "Immune":      ["CD3e", "CD79a", "CD68", "CD163", "CD206", "Iba1", "CD11b", "CD11c", "MPO"],
-    "Mesenchymal": ["SMA", "Vimentin"],
+    "Neural":      ["B3TUBB"],                   # residual (after epithelial) so islet TUBB3 is gone
+    "Mesenchymal": ["Vimentin"],                # SMA deferred to the level-2 pass (mural/myofibroblast split)
 }
 
-# Endocrine sub-branch of Epithelial: hormone+ = endocrine (beta INS, alpha GCG, delta SST);
-# hormone- epithelial = exocrine. (IAPP removed 2026-07-10 — failed marker.)
+# Endocrine sub-branch of Epithelial: hormone+ = endocrine (beta INS, alpha GCG, delta SST). DEFERRED to
+# the level-2 pass (Gate 4 delivers the 5 broad compartments only); retained here for the level-2 code and
+# the config drift guard, NOT consumed by the Gate-4 lineage tree. (IAPP removed 2026-07-10 — failed marker.)
 ENDOCRINE_MARKERS: list[str] = ["INS", "GCG", "SST"]
 
 COMPARTMENT_COLORS: dict[str, str] = {
-    "Epithelial": "#4477AA", "Endothelial": "#66CCEE", "Neural": "#B5838D",
-    "Immune": "#228833", "Mesenchymal": "#AA3377", "Other": "#BBBBBB",
+    "Immune": "#228833", "Epithelial": "#4477AA", "Endothelial": "#66CCEE", "Neural": "#B5838D",
+    "Mesenchymal": "#AA3377", "Other": "#BBBBBB", "Unresolved": "#666666",
 }
 # unique 3-char codes for the terse per-donor progress line.
 COMPARTMENT_ABBR: dict[str, str] = {
-    "Epithelial": "Epi", "Endothelial": "Eth", "Neural": "Nrl",
-    "Immune": "Imm", "Mesenchymal": "Mes", "Other": "Oth",
+    "Immune": "Imm", "Epithelial": "Epi", "Endothelial": "Eth", "Neural": "Nrl",
+    "Mesenchymal": "Mes", "Other": "Oth", "Unresolved": "Unr",
 }
 STATUS_ORDER: list[str] = ["ND", "AAB", "T1D"]
 
@@ -230,6 +237,32 @@ class PipelineConfig:
     @property
     def qupath_class_dir(self) -> Path:
         return self.phenotype_dir / "qupath_class"
+
+    # ---- RESTORE production-apply inputs (Gate 4) --------------------------
+    @property
+    def restore_pair_validation_dir(self) -> Path:
+        """Root of the gitignored RESTORE pair-validation artifacts (screens, pilots, reference dossier)."""
+        return self.data_dir / "restore_pair_validation"
+
+    @property
+    def restore_allcells_sample_dir(self) -> Path:
+        """All-cells (modulus-1, unsampled) QuPath compartment sample consumed by restore_apply."""
+        return self.restore_pair_validation_dir / "qupath_compartment_full_20donor"
+
+    @property
+    def restore_pair_reviews_csv(self) -> Path:
+        """Maintainer-signed ACCEPTED target/reference rules (Gate-2 sign-off); required by restore_apply."""
+        return self.restore_pair_validation_dir / "pair_reviews_accepted.csv"
+
+    @property
+    def restore_expression_reviews_csv(self) -> Path:
+        """Optional per-(donor,target) image reviews (e.g. confirmed absence); passed through to the screen."""
+        return self.restore_pair_validation_dir / "expression_reviews.csv"
+
+    @property
+    def restore_apply_manifest_csv(self) -> Path:
+        """Cohort donor x accepted-pair QC disposition + divisor manifest written by restore_apply."""
+        return self.restore_gated_dir / "apply_manifest.csv"
 
     # ---- helpers -----------------------------------------------------------
     def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:

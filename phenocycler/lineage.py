@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-Broad phenotyping — 5-compartment ORDERED RESIDUAL partition (+ explicit "Other").
+Broad phenotyping — 5-compartment ORDERED RESIDUAL partition over TRI-STATE RESTORE calls
+(+ explicit ``Other`` and ``Unresolved``).
 
-Every cell is typed by the first matching gate in ``COMPARTMENT_ORDER``, each gate running on the
-RESIDUAL of the prior (so the priority order IS the multi-positive tie-break); cells failing every gate
-land in ``Other`` (real panel gaps — mast/Schwann/adipocyte/quiescent-stellate — NOT force-assigned).
+Every cell carries, per gate marker, a tri-state RESTORE call ``positive`` | ``negative`` |
+``unavailable`` (emitted by ``restore_apply`` from the frozen ``ACCEPTED_PAIRS`` — one per gate marker).
+Each cell is typed by the first POSITIVE gate in ``COMPARTMENT_ORDER`` (each gate on the RESIDUAL of the
+prior, so the priority order IS the multi-positive tie-break). The first gate that is UNAVAILABLE
+(indeterminate — a gate marker has no valid call for that cell, so the compartment can be neither
+confirmed nor ruled out) BLOCKS assignment -> ``Unresolved``: no lower-priority gate may claim a cell we
+could not rule out of a higher-priority compartment. A cell valid-and-NEGATIVE for every gate ->
+``Other`` (a real panel gap — mast/Schwann/adipocyte/quiescent-stellate — NOT force-assigned).
 Priority high->low:
 
-  1. Epithelial  <- E_cadherin_pos      (exocrine + endocrine; the only epithelial marker that stays +
-                                         on endocrine). sub: Endocrine (hormone+: beta INS, alpha
-                                         GCG, delta SST) vs Exocrine (hormone-; basal/ductal Keratin_5/TP63)
-  2. Endothelial <- CD31_pos            (sub: lymphatic Podoplanin+, else vascular)
-  3. Neural      <- B3TUBB_pos          (residual, after epithelial -> islet TUBB3 co-expression removed)
-  4. Immune      <- ANY(CD3e/CD20/CD79a/CD68/CD163/CD206/Iba1/CD11b/CD11c/MPO)_pos
-                     sub, LOWEST->HIGHEST precedence: B / Plasma -> DC -> Macrophage -> Neutrophil
-                     -> NK -> T (B is sparse in pancreas, so frequent types claim their cells first)
-  5. Mesenchymal <- SMA_pos (Muscle), then Vimentin_pos in the SMA-neg residual (Fibroblast)
-  6. Other       <- failed every gate
+  1. Immune      <- ANY(CD3e, CD68, CD11b) positive   (T / macrophage / myeloid — the 3 screened anchors)
+  2. Epithelial  <- E_cadherin positive               (the only epithelial marker that stays + on endocrine)
+  3. Endothelial <- CD31 positive
+  4. Neural      <- B3TUBB positive                    (residual, after epithelial -> islet TUBB3 removed)
+  5. Mesenchymal <- Vimentin positive
+  6. Other       <- valid-and-negative for every gate
+     Unresolved  <- blocked by an unavailable higher-priority gate (NOT a negative Other)
 
-`_pos` comes straight from RESTORE (no `_norm` floor). Reads ONE RESTORE-gated parquet per donor
-(all markers, `{m}_pos`/`{m}_norm`).
+Gate marker calls come straight from RESTORE (``{m}_state``). Subtypes (endocrine/exocrine, immune/
+mesenchymal fine types, NK) are DEFERRED to a validated level-2 pass (docs/level2_hierarchy.md); this
+first deliverable is the 5 broad compartments only, so ``cell_type`` == ``compartment`` here.
 
-Inputs : <restore_gated_dir>/donor_id=*/data_0.parquet   ({m}_pos, {m}_norm)
+Inputs : <restore_gated_dir>/donor_id=*/data_0.parquet   ({m}_pos, {m}_norm, {m}_state)
          <cells_dir>/donor_id=*/data_0.parquet           (cell_region, islet_num)
          <donor_metadata>                                 (disease.status; figure only)
-Outputs: <phenotype_dir>/broad/donor_id=*/data_0.parquet  (object_id, donor_id, compartment, cell_type, ...)
+Outputs: <phenotype_dir>/broad/donor_id=*/data_0.parquet  (object_id, donor_id, compartment, cell_type,
+                                                            assignment_reason, blocked_by, {m}_state)
          <phenotype_dir>/broad_lineage_composition.png
 
     python -m phenocycler.lineage --jobs 8
@@ -35,6 +40,7 @@ from __future__ import annotations
 import argparse
 import functools
 import glob
+import os
 from pathlib import Path
 
 import numpy as np
@@ -47,11 +53,23 @@ if not matplotlib.get_backend().startswith("module://"):  # keep a notebook's in
 import matplotlib.pyplot as plt  # noqa: E402
 
 from .config import (PipelineConfig, load_config, COMPARTMENT_ORDER, COMPARTMENT_GATES,
-                     ENDOCRINE_MARKERS, COMPARTMENT_COLORS, COMPARTMENT_ABBR, STATUS_ORDER, OTHER_LABEL)
+                     COMPARTMENT_COLORS, COMPARTMENT_ABBR, STATUS_ORDER, OTHER_LABEL, UNRESOLVED_LABEL)
 from .parallel import map_donors
 
-# 6 rows for composition (5 compartments + Other), in priority order.
-CLASSES = COMPARTMENT_ORDER + [OTHER_LABEL]
+# 7 rows for composition (5 compartments + Other + Unresolved), in priority order.
+CLASSES = COMPARTMENT_ORDER + [OTHER_LABEL, UNRESOLVED_LABEL]
+
+# tri-state {m}_state values (must match restore_apply.CELL_{POSITIVE,NEGATIVE,UNAVAILABLE})
+CELL_POSITIVE = "positive"
+CELL_UNAVAILABLE = "unavailable"
+
+# assignment_reason vocabulary (kept beside the dtype widths so both stay in sync with the labels)
+_REASONS = ("positive", "blocked_unavailable_gate", "all_negative")
+# Fixed-width numpy string widths DERIVED from the actual labels, so a future longer compartment /
+# reason / gate name can never silently truncate on assignment (numpy truncates without error).
+_COMPARTMENT_W = max(len(c) for c in CLASSES)
+_REASON_W = max(len(r) for r in _REASONS)
+_BLOCKED_W = max(len(c) for c in COMPARTMENT_ORDER)
 
 
 def status_map(cfg: PipelineConfig) -> dict:
@@ -65,140 +83,122 @@ def status_map(cfg: PipelineConfig) -> dict:
         return {}
 
 
-def _pos_norm_getters(g: pd.DataFrame):
-    """Return (pos, norm) closures giving `{m}_pos` (bool) / `{m}_norm` (float) for any marker, with
-    all-False / 0.0 fallbacks for a marker absent from this donor's gated parquet (e.g. batch-specific)."""
-    n = len(g)
-    zeros_b = np.zeros(n, bool)
-    zeros_f = np.zeros(n, np.float64)
-
-    def pos(m: str) -> np.ndarray:
-        c = f"{m}_pos"
-        return g[c].fillna(False).to_numpy(bool) if c in g.columns else zeros_b
-
-    def norm(m: str) -> np.ndarray:
-        c = f"{m}_norm"
-        return g[c].fillna(0.0).to_numpy(np.float64) if c in g.columns else zeros_f
-
-    return pos, norm
+def _required_gate_markers() -> list[str]:
+    """The gate markers every donor's gated parquet must carry a ``{m}_state`` for (the accepted targets)."""
+    return sorted({m for gate in COMPARTMENT_GATES.values() for m in gate})
 
 
-def _cell_types(compartment: np.ndarray, pos, norm) -> np.ndarray:
-    """Finer sub-split within each compartment (secondary annotation). Later writes win, so within a
-    compartment the more-specific / higher-priority identity overrides a co-positive lower one."""
-    n = len(compartment)
-    ct = compartment.astype("<U24").copy()
+def _state_getters(g: pd.DataFrame, required_markers):
+    """Return (is_pos, is_unavail) closures over the tri-state ``{m}_state`` columns.
 
-    # --- Epithelial: endocrine (hormone+) vs exocrine (hormone-) ---
-    epi = compartment == "Epithelial"
-    horm = np.zeros(n, bool)
-    for m in ENDOCRINE_MARKERS:
-        horm |= pos(m)
-    exo = epi & ~horm
-    ct[exo] = "Exocrine"
-    ct[exo & (pos("Keratin_5") | pos("TP63"))] = "Exocrine-ductal"
-    endo = epi & horm
-    # endocrine subtype by dominant hormone _norm: beta = INS, alpha = GCG, delta = SST
-    # (IAPP removed 2026-07-10 — failed marker; beta was max(INS, IAPP))
-    beta = norm("INS")
-    sub = np.array(["Endocrine-beta", "Endocrine-alpha", "Endocrine-delta"])[
-        np.argmax(np.vstack([beta, norm("GCG"), norm("SST")]).T, axis=1)]
-    ct[endo] = sub[endo]
+    Fail LOUD (Gate 4): a required gate marker with no ``{m}_state`` column is a real pipeline error
+    (the gated parquet is incomplete), NOT an all-negative silent default. There is no ``.fillna``
+    coercion here — every gate marker is one of the frozen ACCEPTED_PAIRS targets, so its column must
+    exist for every eligible donor."""
+    missing = [f"{m}_state" for m in required_markers if f"{m}_state" not in g.columns]
+    if missing:
+        raise KeyError(
+            f"gated parquet missing required tri-state columns {missing}; "
+            "restore_apply must emit a {marker}_state for every accepted target"
+        )
+    states = {m: g[f"{m}_state"].to_numpy() for m in required_markers}
 
-    # --- Endothelial: vascular vs lymphatic (Podoplanin+) ---
-    eth = compartment == "Endothelial"
-    ct[eth] = "Endothelial-vascular"
-    ct[eth & pos("Podoplanin")] = "Endothelial-lymphatic"
+    def is_pos(m: str) -> np.ndarray:
+        return states[m] == CELL_POSITIVE
 
-    # --- Neural ---
-    ct[compartment == "Neural"] = "Neural"
+    def is_unavail(m: str) -> np.ndarray:
+        return states[m] == CELL_UNAVAILABLE
 
-    # --- Immune (last-write-wins precedence: B/Plasma -> DC -> Macrophage -> Neutrophil -> NK -> T) ---
-    # B/Plasma are written FIRST, i.e. at the LOWEST precedence, so every more frequent immune type
-    # claims its cells before a B call is allowed to stand. B cells are sparse in pancreas even with
-    # inflammation or disease, so a CD20 call carries the most risk of the three error directions: a
-    # macrophage or T cell picking up stray CD20 outnumbers the real B cells it would be confused with.
-    # Gating B last (highest precedence, as it was) inverted that -- it let the rare, least reliable
-    # marker overwrite the abundant, well-supported ones. A genuine CD20+CD68+ cell is now Macrophage.
-    #
-    # As of 2026-07-23 CD20 is excluded from RESTORE in BOTH roles (restore_validation
-    # .RESTORE_EXCLUDED_MARKERS) and deferred to a second pass, so no CD20_pos column is produced and
-    # pos("CD20") is all-False. The CD20 term is kept so the deferred pass needs no edit here. CD79a is
-    # likewise not screened, so until that pass lands the B/Plasma branch yields nothing and its cells
-    # remain "Immune-other" -- a deliberate abstention, not a silent negative call.
-    imm = compartment == "Immune"
-    ct[imm] = "Immune-other"
-    b = imm & (pos("CD20") | pos("CD79a"))
-    ct[b] = "B"
-    ct[b & pos("CD38")] = "Plasma"                                   # CD38 is batch-1 only -> no Plasma in batch-2
-    ct[imm & (pos("CD11c") | pos("CD209"))] = "DC"
-    ct[imm & (pos("CD68") | pos("CD163") | pos("CD206") | pos("Iba1"))] = "Macrophage"
-    ct[imm & pos("MPO")] = "Neutrophil"
-    ct[imm & pos("CD56") & pos("CD57") & ~pos("CD3e")] = "NK"
-    ct[imm & pos("CD3e")] = "T"
-
-    # --- Mesenchymal: fibroblast (Vimentin) then muscle (SMA wins — claimed first in the ordered gate) ---
-    mes = compartment == "Mesenchymal"
-    ct[mes & pos("Vimentin")] = "Fibroblast"
-    ct[mes & pos("SMA")] = "Muscle"
-
-    return ct
+    return is_pos, is_unavail
 
 
-def assign_donor(donor: str, gated_f: str, cells_dir):
-    """Type every cell in one donor by the ordered residual gating tree (+ Other).
+def _atomic_write_parquet(df: pd.DataFrame, dst: Path) -> None:
+    """Write a parquet via a per-process temp file then ``os.replace`` (atomic on the same filesystem)."""
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
+    try:
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
-    Returns (out_df, mfrac) where mfrac is the {INS,GCG} positivity fraction (% of ALL cells) for the
-    disease-trend panel (the Endocrine sub-branch lumps the hormones, masking beta-loss)."""
+
+def assign_donor(donor: str, gated_f: str, cells_dir) -> pd.DataFrame:
+    """Type every cell in one donor by the tri-state ordered residual gating tree.
+
+    Per gate the tri-state precedence is POSITIVE > UNAVAILABLE > NEGATIVE: a positive marker claims the
+    compartment even if a sibling gate marker is unavailable; otherwise an unavailable gate marker makes
+    the whole gate indeterminate. Walking ``COMPARTMENT_ORDER`` high->low, the first POSITIVE gate claims
+    the cell; the first UNAVAILABLE gate (all higher gates having been valid-and-negative) BLOCKS it to
+    ``Unresolved``; a cell that passes every gate valid-and-negative is ``Other``."""
     g = pd.read_parquet(gated_f)
     g["object_id"] = g["object_id"].astype(str)
-    pos, norm = _pos_norm_getters(g)
+    required = _required_gate_markers()
+    is_pos, is_unavail = _state_getters(g, required)
     n = len(g)
 
-    # ordered residual gating: first matching compartment claims the cell; the rest -> Other.
-    compartment = np.array([OTHER_LABEL] * n, dtype="<U16")   # "Endothelial"/"Mesenchymal" = 11 chars
-    assigned = np.zeros(n, bool)
+    compartment = np.full(n, OTHER_LABEL, dtype=f"<U{_COMPARTMENT_W}")   # widths derived from the labels
+    reason = np.full(n, "all_negative", dtype=f"<U{_REASON_W}")          # (never silently truncate)
+    blocked_by = np.full(n, "", dtype=f"<U{_BLOCKED_W}")
+    decided = np.zeros(n, bool)
     for comp in COMPARTMENT_ORDER:
-        hit = np.zeros(n, bool)
+        gate_pos = np.zeros(n, bool)
+        gate_unavail = np.zeros(n, bool)
         for m in COMPARTMENT_GATES[comp]:
-            hit |= pos(m)
-        if comp == "Immune":
-            # NK cells express NONE of the 10 canonical immune markers, so add the CD56+CD57+ gate to pull
-            # them into Immune (they are NOT an "Other" gap per the user). Safe here: epithelial + neural
-            # (the CD56 confounders) are already removed by this point in the residual. Sub-typed "NK".
-            hit |= (pos("CD56") & pos("CD57"))
-        take = (~assigned) & hit
-        compartment[take] = comp
-        assigned |= take
+            gate_pos |= is_pos(m)
+            gate_unavail |= is_unavail(m)
+        gate_unavail &= ~gate_pos                                 # a positive marker dominates an unavailable sibling
+        take_pos = (~decided) & gate_pos
+        take_unavail = (~decided) & gate_unavail
+        compartment[take_pos] = comp
+        reason[take_pos] = "positive"
+        compartment[take_unavail] = UNRESOLVED_LABEL
+        reason[take_unavail] = "blocked_unavailable_gate"
+        blocked_by[take_unavail] = comp
+        decided |= take_pos | take_unavail
+    # undecided cells are valid-and-negative for every gate -> Other/all_negative (as initialised).
 
-    cell_type = _cell_types(compartment, pos, norm)
-
-    out = pd.DataFrame({"object_id": g["object_id"].astype(str), "donor_id": donor,
-                        "compartment": compartment, "cell_type": cell_type})
-    # attach cell_region / islet_num for downstream (spatial / drill-down)
+    out = pd.DataFrame({
+        "object_id": g["object_id"].astype(str),
+        "donor_id": str(donor),
+        "compartment": compartment,
+        "cell_type": compartment,               # subtypes deferred to level 2 -> cell_type == compartment
+        "assignment_reason": reason,
+        "blocked_by": blocked_by,
+    })
+    for m in required:                           # per-marker tri-state passthrough (provenance)
+        out[f"{m}_state"] = g[f"{m}_state"].to_numpy()
+    # attach cell_region / islet_num for downstream (spatial / drill-down). Read EVERY partition file
+    # (not just the first) and validate a one-to-one context key, so a duplicate object_id fails loud
+    # instead of fanning the merge out into duplicate phenotype rows.
     cf = sorted(glob.glob(str(Path(cells_dir) / f"donor_id={donor}" / "*.parquet")))
     if cf:
-        ctx = pd.read_parquet(cf[0], columns=["object_id", "cell_region", "islet_num"])
-        out = out.merge(ctx.astype({"object_id": str}), on="object_id", how="left")
-    mfrac = {"INS": 100 * pos("INS").mean(), "GCG": 100 * pos("GCG").mean()}
-    return out, mfrac
+        ctx = pd.concat(
+            [pd.read_parquet(f, columns=["object_id", "cell_region", "islet_num"]) for f in cf],
+            ignore_index=True,
+        )
+        out = out.merge(ctx.astype({"object_id": str}), on="object_id", how="left", validate="m:1")
+    return out
 
 
 def _assign_and_write(donor: str, gated_dir: str, cells_dir: str, out_dir: str) -> dict:
-    """Worker: assign one donor, write its partition, return composition + marker-fraction summary."""
+    """Worker: assign one donor, write its partition atomically, return the composition summary."""
     gf = sorted(glob.glob(str(Path(gated_dir) / f"donor_id={donor}" / "*.parquet")))
     if not gf:
         return {}
-    out, mfrac = assign_donor(donor, gf[0], cells_dir)
+    out = assign_donor(donor, gf[0], cells_dir)
     dst = Path(out_dir) / f"donor_id={donor}"
-    dst.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(dst / "data_0.parquet", index=False)
+    _atomic_write_parquet(out, dst / "data_0.parquet")
     vc = out["compartment"].value_counts()
     comp = (vc / len(out) * 100).reindex(CLASSES).fillna(0)
-    n = len(out); other = int((out["compartment"] == OTHER_LABEL).sum())
-    print(f"[{donor}] {n:,} cells | " + " ".join(f"{COMPARTMENT_ABBR[c]}={comp[c]:.0f}%" for c in CLASSES) +
-          f" | Other={100*other/n:.1f}%", flush=True)
-    return {"donor": donor, "comp": comp.to_dict(), "mfrac": mfrac, "n": n, "other": other}
+    n = len(out)
+    other = int((out["compartment"] == OTHER_LABEL).sum())
+    unresolved = int((out["compartment"] == UNRESOLVED_LABEL).sum())
+    print(f"[{donor}] {n:,} cells | " + " ".join(f"{COMPARTMENT_ABBR[c]}={comp[c]:.0f}%" for c in CLASSES),
+          flush=True)
+    return {"donor": donor, "comp": comp.to_dict(), "n": n, "other": other, "unresolved": unresolved}
 
 
 def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFrame:
@@ -223,27 +223,22 @@ def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFram
 
     smap = status_map(cfg)
     comp = {r["donor"]: pd.Series(r["comp"]).reindex(CLASSES).fillna(0) for r in results}
-    mfracs = {r["donor"]: r["mfrac"] for r in results}
     n_total = sum(r["n"] for r in results)
     other_total = sum(r["other"] for r in results)
+    unresolved_total = sum(r["unresolved"] for r in results)
     C = pd.DataFrame(comp).T
     C["status"] = [smap.get(d, "?") for d in C.index]
-    M = pd.DataFrame(mfracs).T
-    M["status"] = [smap.get(d, "?") for d in M.index]
-    print(f"\n[total] {n_total:,} cells, {100*other_total/max(n_total,1):.1f}% Other "
-          "(failed every gate — real panel gaps, NOT force-assigned)")
+    print(f"\n[total] {n_total:,} cells | {100*other_total/max(n_total,1):.1f}% Other "
+          "(valid-and-negative for every gate — real panel gaps, NOT force-assigned) | "
+          f"{100*unresolved_total/max(n_total,1):.1f}% Unresolved (blocked by an unavailable gate)")
 
-    _composition_figure(C, M, cfg.phenotype_dir / "broad_lineage_composition.png")
+    _composition_figure(C, cfg.phenotype_dir / "broad_lineage_composition.png")
     print("\ncomposition by status (mean %):")
     print(C.groupby("status")[CLASSES].mean().reindex(STATUS_ORDER).round(1).to_string())
-    print("\ndisease trend (mean % of cells positive, by status):")
-    print(pd.concat([M.groupby("status")[["INS", "GCG"]].mean(),
-                     C.groupby("status")["Immune"].mean()], axis=1)
-            .reindex(STATUS_ORDER).round(2).to_string())
     return C
 
 
-def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
+def _composition_figure(C: pd.DataFrame, path: Path):
     """Per-donor stacked composition (broken y-axis) + per-compartment boxplots by disease status with
     non-parametric stats. Units of replication are donors, not cells."""
     plt.rcParams.update({"font.size": 15, "xtick.labelsize": 14, "ytick.labelsize": 14,
@@ -303,8 +298,10 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     outer = fig.add_gridspec(1, 2, width_ratios=[1.05, 1.95], wspace=0.13)
     gsA = outer[0].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.06)
     a_top, a_bot = fig.add_subplot(gsA[0]), fig.add_subplot(gsA[1])
-    gsB = outer[1].subgridspec(2, 3, hspace=0.62, wspace=0.34)
-    bax = {L: fig.add_subplot(gsB[i // 3, i % 3]) for i, L in enumerate(CLASSES)}
+    _ncol = 3                                       # rows grow with CLASSES (7: 5 compartments + Other + Unresolved)
+    _nrow = int(np.ceil(len(CLASSES) / _ncol))
+    gsB = outer[1].subgridspec(_nrow, _ncol, hspace=0.62, wspace=0.34)
+    bax = {L: fig.add_subplot(gsB[i // _ncol, i % _ncol]) for i, L in enumerate(CLASSES)}
 
     # A: per-donor stacked composition — split y-axis (Epithelial dominates the low range; the split
     # expands the top so the minority compartments are legible). Ordered ND->Aab+->T1D.
@@ -325,6 +322,12 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     for L in CLASSES:
         ax = bax[L]
         data = [gdata[s][L] for s in present_status]
+        if not present_status:          # no donor-status metadata -> the disease-comparison panel is moot
+            ax.set_title(L, fontsize=14, color=COMPARTMENT_COLORS[L])
+            ax.text(0.5, 0.5, "no disease-status\nmetadata", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10, color="#888888")
+            ax.set_xticks([]); ax.set_yticks([])
+            continue
         bp = ax.boxplot(data, positions=list(range(len(present_status))), widths=0.6,
                         patch_artist=True, showfliers=False, showmeans=False, zorder=1,
                         medianprops=dict(color="black", lw=1.3))
@@ -380,7 +383,8 @@ def _composition_figure(C: pd.DataFrame, M: pd.DataFrame, path: Path):
     fig.text((bp0.x0 + bp2.x1) / 2, 0.045,
              "Box = median/IQR . whiskers = range . diamond = mean +/- SEM . dots = donors.",
              ha="center", va="center", fontsize=11)
-    fig.suptitle("Cell Phenotyping: 5 compartments + Other (ordered residual gating)", fontsize=20, y=1.0)
+    fig.suptitle("Cell Phenotyping: 5 compartments + Other + Unresolved (tri-state ordered residual)",
+                 fontsize=20, y=1.0)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[saved] {path}")

@@ -4,7 +4,9 @@
 // QuPath's PathObject.getID() == our object_id, so matching is EXACT (no centroid
 // rounding) and the class is set in ONE step.
 //
-// CSV format (phenocycler.qupath_export):  object_id, broad_lineage, image
+// CSV format (phenocycler.qupath_export):  object_id, compartment, cell_type, image
+// Colours by `compartment` (column f[1]); to colour by the finer `cell_type` use f[2]
+// (currently cell_type == compartment — subtypes are deferred to the level-2 pass).
 //
 // EDIT `folder` below to point at <data_dir>/phenotype/qupath_class produced by the
 // pipeline (python -m phenocycler.qupath_export).
@@ -15,11 +17,12 @@ def folder = new File(System.getProperty("user.home"),
                       "Phenocycler_Analysis/data/phenotype/qupath_class")
 // ----------------------------------------------------------------------------
 
-// distinct colours for the six broad lineages (match the analysis figures)
+// distinct colours for the 5 compartments + Other + Unresolved (match config.COMPARTMENT_COLORS)
 def COLORS = [
-    "Epithelial" : [68, 119, 170],   "Fibroblast" : [238, 102, 119],
-    "Immune"     : [34, 136, 51],    "Endocrine"  : [204, 187, 68],
-    "Endothelial": [102, 204, 238],  "Muscle"     : [170, 51, 119],
+    "Immune"     : [34, 136, 51],    "Epithelial" : [68, 119, 170],
+    "Endothelial": [102, 204, 238],  "Neural"     : [181, 131, 141],
+    "Mesenchymal": [170, 51, 119],   "Other"      : [187, 187, 187],
+    "Unresolved" : [102, 102, 102],
 ]
 COLORS.each { name, c -> getPathClass(name).setColor(c[0], c[1], c[2]) }
 
@@ -39,7 +42,7 @@ println "Open image has ${detById.size()} detections."
 int matched = 0, missing = 0
 csvFiles.each { file ->
     def reader = new BufferedReader(new FileReader(file))
-    reader.readLine()   // header: object_id,broad_lineage,image
+    reader.readLine()   // header: object_id,compartment,cell_type,image  (f[1]=compartment)
     String line
     while ((line = reader.readLine()) != null) {
         def f = line.split(',')

@@ -33,7 +33,7 @@ from .config import PipelineConfig, load_config
 STAGES = [
     ("cells", "cells/donor_id=*", "Raw cells (DuckDB)"),
     ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
-    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (all markers)"),
+    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (accepted pairs)"),
     ("proliferation", "restore_gated_proliferation/donor_id=*", "Proliferation (Ki67/PCNA bimodal)"),
     ("restore_diag", "restore_redsea/mxnorm/restore_mxnorm_efficacy.csv", "RESTORE efficacy (mxnorm)"),
     ("lineage", "phenotype/broad/donor_id=*", "Compartments (5 + Other)"),
@@ -108,7 +108,7 @@ def _run_restore_diagnostic(cfg: PipelineConfig) -> None:
 
 
 def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
-    from . import (cells_parquet, redsea, restore, lineage, qupath_export, figures)
+    from . import (cells_parquet, redsea, restore, restore_apply, lineage, qupath_export, figures)
 
     def _cells():
         cells_parquet.build_cells_parquet(cfg)
@@ -118,19 +118,10 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
         redsea.run_redsea(cfg, cfg.discover_donors(), params, n_jobs=cfg.n_jobs)
 
     def _restore():
-        # The stage is kept in ORDER so a full run stops HERE with an explanation, rather than skipping
-        # silently to lineage and typing cells from gated parquet that no accepted method produced.
-        raise SystemExit(
-            "[restore] the paired RESTORE driver was retired with its curated pair web: ten of those\n"
-            "          pairs used CD20 as a reference, which is too sparse in pancreas to define a\n"
-            "          negative control, and the method is being rebuilt from the manuscript.\n"
-            "          CD20 is now excluded from RESTORE in BOTH roles and deferred to a second pass\n"
-            "          after the broad cell types are settled, so no CD20 threshold will be produced.\n"
-            "          There is no accepted pair, divisor, or gated output yet -- that is Gate 2/4 of\n"
-            "          docs/restore_faithful_rebuild_plan.md, and it needs the human pair review.\n"
-            "          Screen:  python -m phenocycler.restore_validation evaluate-locked ...\n"
-            "          Review:  data/restore_pair_validation/expanded_review_v10/START_HERE_RESTORE_REVIEW.txt"
-        )
+        # Gate 4 (2026-07-24): the production apply runs the frozen ACCEPTED_PAIRS (one reference per
+        # target, maintainer sign-off) on all cells per donor and writes the tri-state gated parquet that
+        # `lineage` consumes. It replaces the retired paired-SSC driver (deleted with its CD20 pair web).
+        restore_apply.run_apply(cfg)
 
     def _proliferation():
         restore.run_restore_proliferation(cfg)

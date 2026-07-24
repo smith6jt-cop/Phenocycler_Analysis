@@ -5,7 +5,7 @@ from __future__ import annotations
 from phenocycler import load_config
 from phenocycler.cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 from phenocycler.config import (COMPARTMENT_ORDER, COMPARTMENT_GATES, OTHER_LABEL,
-                                ENDOCRINE_MARKERS)
+                                UNRESOLVED_LABEL, ENDOCRINE_MARKERS)
 
 
 def test_defaults_and_derived_paths():
@@ -17,6 +17,17 @@ def test_defaults_and_derived_paths():
     assert cfg.restore_thresholds_csv == cfg.data_dir / "restore_thresholds_redsea.csv"
     assert cfg.broad_dir == cfg.data_dir / "phenotype" / "broad"
     assert cfg.qupath_class_dir == cfg.data_dir / "phenotype" / "qupath_class"
+
+
+def test_restore_apply_input_paths():
+    """Gate-4 restore_apply inputs are derived under data_dir/restore_pair_validation."""
+    cfg = load_config()
+    pv = cfg.data_dir / "restore_pair_validation"
+    assert cfg.restore_pair_validation_dir == pv
+    assert cfg.restore_allcells_sample_dir == pv / "qupath_compartment_full_20donor"
+    assert cfg.restore_pair_reviews_csv == pv / "pair_reviews_accepted.csv"
+    assert cfg.restore_expression_reviews_csv == pv / "expression_reviews.csv"
+    assert cfg.restore_apply_manifest_csv == cfg.restore_gated_dir / "apply_manifest.csv"
 
 
 def test_scientific_defaults():
@@ -88,18 +99,30 @@ def test_excluded_donors_fail_closed_when_requested_explicitly():
 
 
 def test_compartment_constants_shape():
-    assert COMPARTMENT_ORDER == ["Epithelial", "Endothelial", "Neural", "Immune", "Mesenchymal"]
+    # Gate 4 (2026-07-24): Immune is FIRST, and every gate marker is a divisor-backed ACCEPTED_PAIRS target.
+    assert COMPARTMENT_ORDER == ["Immune", "Epithelial", "Endothelial", "Neural", "Mesenchymal"]
     assert OTHER_LABEL == "Other"
+    assert UNRESOLVED_LABEL == "Unresolved"
+    assert COMPARTMENT_GATES["Immune"] == ["CD3e", "CD68", "CD11b"]   # the 3 screened immune anchors
     assert COMPARTMENT_GATES["Epithelial"] == ["E_cadherin"]      # E-cadherin anchor (stays + on endocrine)
     assert COMPARTMENT_GATES["Endothelial"] == ["CD31"]
     assert COMPARTMENT_GATES["Neural"] == ["B3TUBB"]
-    assert COMPARTMENT_GATES["Mesenchymal"] == ["SMA", "Vimentin"]   # ordered: SMA then Vimentin
-    assert {"CD3e", "CD68", "MPO"}.issubset(set(COMPARTMENT_GATES["Immune"]))
-    # CD20 is deliberately NOT a compartment anchor: B cells are sparse in pancreas, so a lone CD20
-    # call would more often be stray signal pulling an abundant cell into Immune than a real B cell.
-    assert "CD20" not in COMPARTMENT_GATES["Immune"]
-    assert "CD79a" in COMPARTMENT_GATES["Immune"]       # B cells still reach Immune via CD79a
-    assert ENDOCRINE_MARKERS == ["INS", "GCG", "SST"]      # IAPP removed 2026-07-10 (failed marker)
+    assert COMPARTMENT_GATES["Mesenchymal"] == ["Vimentin"]      # SMA deferred to the level-2 pass
+    # These markers have NO accepted RESTORE pair, so they are DEFERRED (not gates) — as gates they would
+    # be permanently 'unavailable' and Unresolve most cells. CD20 additionally takes no part in RESTORE.
+    for deferred in ("CD20", "CD79a", "CD163", "CD206", "Iba1", "CD11c", "MPO", "SMA"):
+        assert deferred not in COMPARTMENT_GATES["Immune"]
+    assert "SMA" not in COMPARTMENT_GATES["Mesenchymal"]
+    assert ENDOCRINE_MARKERS == ["INS", "GCG", "SST"]      # retained for the deferred level-2 pass
+
+
+def test_gate_markers_are_the_accepted_restore_targets():
+    """Every compartment gate marker must be a divisor-backed ACCEPTED_PAIRS target (Gate 4), so a
+    tri-state 'unavailable' always means a real per-donor QC gap, never 'never screened'."""
+    from phenocycler.restore_validation import ACCEPTED_PAIRS
+    gate_markers = {m for gates in COMPARTMENT_GATES.values() for m in gates}
+    accepted_targets = {t for t, _ in ACCEPTED_PAIRS}
+    assert gate_markers == accepted_targets
 
 
 def test_legacy_pair_webs_are_retired():
@@ -120,7 +143,7 @@ def test_legacy_pair_webs_are_retired():
 def test_config_matches_science_modules():
     """Guard the module-level constants against drift."""
     from phenocycler import lineage, marker_taxonomy
-    assert list(lineage.CLASSES) == COMPARTMENT_ORDER + [OTHER_LABEL]
+    assert list(lineage.CLASSES) == COMPARTMENT_ORDER + [OTHER_LABEL, UNRESOLVED_LABEL]
     assert not hasattr(marker_taxonomy, "CD99_BRIGHT")            # CD99 demoted to a state marker
     for gates in COMPARTMENT_GATES.values():                     # gate markers must be TYPE (heatmap)
         for m in gates:
