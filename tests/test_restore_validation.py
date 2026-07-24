@@ -270,7 +270,11 @@ def _assessment(**overrides):
         ({"reference_arm_fold": 1.5}, rv.PairState.NO_REFERENCE_POPULATION),
         ({"directional_median": False}, rv.PairState.INVALID_PAIR),
         ({"stable": False}, rv.PairState.MODEL_UNSTABLE),
-        ({"target_arm_fold": 1.99}, rv.PairState.LOW_SIGNAL_UNRESOLVED),
+        # genuine absence (no target arm) still abstains ...
+        ({"target_n": 1}, rv.PairState.LOW_SIGNAL_UNRESOLVED),
+        # ... but a low arm-MEAN SBR with a present arm no longer abstains (METHOD v9): high background
+        # compresses the ratio while the divisor still separates -- it becomes a reported flag, VALID.
+        ({"target_arm_fold": 1.99}, rv.PairState.VALID),
         (
             {
                 "target_arm_fold": 1.99,
@@ -325,7 +329,7 @@ def test_calls_are_blocked_except_valid_or_confirmed_absence():
     with pytest.raises(ValueError, match="cannot produce"):
         rv.normalize_for_assessment(
             values,
-            _assessment(target_arm_fold=1.0),
+            _assessment(stable=False),  # MODEL_UNSTABLE: a non-VALID, non-absence state blocks calls
             divisor=None,
         )
 
@@ -621,6 +625,9 @@ def test_locked_pair_assigns_all_cells_but_uses_double_low_qc_only_for_fitting()
     assert result["reference_input_floor_method"] == rv.LINEAR_OTSU_FLOOR
     assert result["fit_per_arm"] == 30
     assert result["canonical_divisor"] == result["candidate_full_maximum"]
+    # v9 stability is gated on divisor reproducibility; a clean pair is reproducible and high-SBR.
+    assert result["divisor_reproducibility"] >= 0.9
+    assert result["target_low_sbr"] is False
     assert result["target_supported_n"] >= result["target_anchor_n"]
     assert not result["target_supported"][~result["qc_retained"]].any()
     # 2026-07-23: the call is divisor-gated -- lineage-positive is exactly the above-divisor count.
@@ -743,6 +750,11 @@ def test_reference_frequency_rule_has_no_absolute_floor():
 def test_reference_to_target_ratio_config_must_be_positive():
     with pytest.raises(ValueError, match="min_reference_to_target_ratio"):
         rv.PairValidationConfig(min_reference_to_target_ratio=0)
+
+
+def test_min_divisor_reproducibility_config_range():
+    with pytest.raises(ValueError, match="min_divisor_reproducibility"):
+        rv.PairValidationConfig(min_divisor_reproducibility=1.5)
 
 
 def test_green_interval_is_hidden_only_when_it_has_no_visible_width():

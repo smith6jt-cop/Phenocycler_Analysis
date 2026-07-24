@@ -33,7 +33,7 @@ from .cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 # single bright cell in a sparse arm no longer sets the feature scale (22 of 600 screened rows, all with
 # immune targets). Adds anchor_recovery, arm-saturation/stability_informative reporting, and a
 # saturated-arm probe Jaccard. v5 artifacts were produced under the degenerate bound rule.
-METHOD_VERSION = "restore-pair-validation-v8"
+METHOD_VERSION = "restore-pair-validation-v9"
 # NB: ``BroadLineageRevised.md`` lists 8 first-pass pairs.  ``CD20 <- E_cadherin`` was the eighth and
 # is deliberately absent — CD20 is deferred out of RESTORE entirely (see RESTORE_EXCLUDED_MARKERS).
 BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
@@ -209,6 +209,13 @@ class PairValidationConfig:
     min_target_arm_fold: float = 2.0
     min_reference_arm_fold: float = 2.0
     min_arm_n: int = 2
+    # Seed-stability is gated on the DIVISOR -- the only quantity RESTORE uses -- not on control-set
+    # membership. A high-background marker shuffles near-separator control cells across seeds (a low
+    # control_jaccard) while its background-ceiling maximum, set by the brightest control cells deep in
+    # the reference component, is reproducible. A pair is stable when min(seed divisor)/max(seed divisor)
+    # across the locked seeds is at least this value. control_jaccard is retained as a reported diagnostic
+    # (min_control_jaccard below is no longer a gate).  (2026-07-24, METHOD v9)
+    min_divisor_reproducibility: float = 0.90
     min_control_jaccard: float = 0.90
     # Reference-frequency selection rule (2026-07-24): a target's negative control (the reference-
     # positive, target-negative arm) must be at least as large as the target-positive population, or
@@ -275,6 +282,8 @@ class PairValidationConfig:
             raise ValueError("min_arm_n must be >= 2")
         if not 0 <= self.min_control_jaccard <= 1:
             raise ValueError("min_control_jaccard must be in [0, 1]")
+        if not 0 <= self.min_divisor_reproducibility <= 1:
+            raise ValueError("min_divisor_reproducibility must be in [0, 1]")
         if self.min_reference_to_target_ratio <= 0:
             raise ValueError("min_reference_to_target_ratio must be > 0")
         if self.min_quantile_support_cells < 1:
@@ -467,13 +476,13 @@ def assess_pair_state(
                     f"{config.min_target_arm_fold:g} despite confirmed target expression"
                 ),
             )
-        return PairAssessment(
-            PairState.LOW_SIGNAL_UNRESOLVED,
-            (
-                f"target-arm fold {target_arm_fold:.3g} is below the provisional "
-                f"{config.min_target_arm_fold:g} donor-local SBR criterion"
-            ),
-        )
+        # UNREVIEWED (METHOD v9): a low target-arm MEAN SBR no longer abstains. High background
+        # compresses the arm-mean ratio, but the divisor (max negative control) still separates real
+        # signal above the background ceiling, and the manuscript prescribes FLAGGING weak/near-
+        # background calls rather than zeroing them. The pair proceeds to the convergence and pair-
+        # review checks; the caller records the reported diagnostic ``target_low_sbr``. Genuine absence
+        # is still caught above by ``target_n < min_arm_n`` (a missing target arm, not merely a weak
+        # one), and confirmed absence by the CONFIRMED_ABSENT branch.
     if expression_review is ExpressionReview.CONFIRMED_ABSENT:
         return PairAssessment(
             PairState.INVALID_PAIR,
@@ -2021,6 +2030,14 @@ def evaluate_locked_pair(
         control_agreement = _binary_agreement(
             primary_control, fit_controls.reference_control.astype(np.int8)
         )
+        # The divisor this seed would produce = max target intensity in its reference control. Stability
+        # is gated on this (see below), because it is the only quantity RESTORE uses.
+        fit_control_mask = fit_controls.reference_control
+        seed_divisor = (
+            float(target_redsea[fit_control_mask].max())
+            if fit_control_mask.any()
+            else np.nan
+        )
         stability_rows.append(
             {
                 "seed": int(fit["seed"]),
@@ -2030,6 +2047,7 @@ def evaluate_locked_pair(
                 "component_jaccard": component_agreement["control_jaccard"],
                 "component_binary_ari": component_agreement["binary_ari"],
                 "scale_bound_adapted": fit["scale_bound_adapted"],
+                "control_divisor": seed_divisor,
                 **control_agreement,
             }
         )
@@ -2089,13 +2107,26 @@ def evaluate_locked_pair(
     min_jaccard = float(
         min(row["control_jaccard"] for row in stability_rows)
     )
+    seed_divisors = [
+        row["control_divisor"]
+        for row in stability_rows
+        if np.isfinite(row["control_divisor"]) and row["control_divisor"] > 0
+    ]
+    # Reproducibility of the DIVISOR across seeds -- min/max of the per-seed background-ceiling maxima.
+    # This is the stability quantity RESTORE actually depends on; control-set membership (min_jaccard,
+    # reported) may shuffle at the separator on a high-background marker while the divisor is stable.
+    divisor_reproducibility = (
+        float(min(seed_divisors) / max(seed_divisors))
+        if len(seed_divisors) >= 2 and max(seed_divisors) > 0
+        else 1.0
+    )
     converged = all(row["converged"] for row in stability_rows)
     stable = bool(
         all(
             row["directional_mean"] and row["directional_median"]
             for row in stability_rows
         )
-        and min_jaccard >= config.min_control_jaccard
+        and divisor_reproducibility >= config.min_divisor_reproducibility
     )
 
     by_seed_target_folds = []
@@ -2347,9 +2378,16 @@ def evaluate_locked_pair(
         "converged": converged,
         "stable": stable,
         "min_control_jaccard": min_jaccard,
+        "divisor_reproducibility": divisor_reproducibility,
         "stability_rows": stability_rows,
         "target_fold": target_fold,
         "target_fold_by_seed": by_seed_target_folds,
+        # Low arm-mean SBR is a reported low-confidence FLAG, not an abstention (METHOD v9): high
+        # background compresses the target-arm/reference-arm mean ratio while the divisor still separates
+        # real signal above the background ceiling. See assess_pair_state.
+        "target_low_sbr": bool(
+            np.isfinite(target_fold) and target_fold < config.min_target_arm_fold
+        ),
         "reference_fold": reference_fold,
         "reference_n": int(reference_control.sum()),
         "target_n": int(target_population.sum()),
@@ -2491,6 +2529,7 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "converged": evaluation["converged"],
         "stable": evaluation["stable"],
         "min_control_jaccard": evaluation["min_control_jaccard"],
+        "divisor_reproducibility": evaluation["divisor_reproducibility"],
         "stability_informative": evaluation["stability_informative"],
         "probe_control_jaccard": evaluation["probe_control_jaccard"],
         "target_arm_saturated": evaluation["target_arm_saturated"],
@@ -2502,6 +2541,7 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "scale_bound_support_cells": evaluation["scale_bound_support_cells"],
         "anchor_recovery": evaluation["anchor_recovery"],
         "target_fold": evaluation["target_fold"],
+        "target_low_sbr": evaluation["target_low_sbr"],
         "reference_fold": evaluation["reference_fold"],
         "n_input": evaluation["n_input"],
         "n_assigned": evaluation["n_assigned"],
