@@ -100,9 +100,32 @@ for _target, _reference in CANDIDATE_PAIRS:  # fail at import, not mid-screen
     if _target == _reference:
         raise ValueError(f"{_target} cannot be its own reference")
 del _target, _reference, _marker, _role
+# The Gate-2-FROZEN production pairs (maintainer sign-off 2026-07-24): one predeclared reference per
+# target under the reference>=target frequency rule. Identical to BASELINE_PAIRS except CD11b takes
+# EpCAM (a maintainer override of the marginal E_cadherin baseline; see
+# reference_selection.ACCEPTED_REFERENCE_OVERRIDES). E_cadherin<-CD31 is retained despite failing the
+# proportion because endothelium is the only biologically exclusive epithelial reference (advisory for
+# a structural target). Used by the Gate-3 full-cell pilot and Gate-5 all-donor validation. It is NOT
+# yet wired into lineage.py/config.py -- that is Gate 4.
+ACCEPTED_PAIRS: tuple[tuple[str, str], ...] = (
+    ("E_cadherin", "CD31"),
+    ("CD31", "E_cadherin"),
+    ("CD3e", "E_cadherin"),
+    ("CD68", "E_cadherin"),
+    ("CD11b", "EpCAM"),
+    ("B3TUBB", "EpCAM"),
+    ("Vimentin", "E_cadherin"),
+)
+for _t, _r in ACCEPTED_PAIRS:  # fail at import if the frozen set drifts from the candidate web
+    if (_t, _r) not in set(CANDIDATE_PAIRS):
+        raise ValueError(f"accepted pair {_t} <- {_r} is not in CANDIDATE_PAIRS")
+if len({_t for _t, _ in ACCEPTED_PAIRS}) != len(ACCEPTED_PAIRS):
+    raise ValueError("ACCEPTED_PAIRS must carry exactly one reference per target")
+del _t, _r
 PAIR_SETS: dict[str, tuple[tuple[str, str], ...]] = {
     "baseline": BASELINE_PAIRS,
     "immune-screen": IMMUNE_REFERENCE_SCREEN_PAIRS,
+    "accepted": ACCEPTED_PAIRS,
     "all": CANDIDATE_PAIRS,
 }
 COMPARTMENTS: tuple[str, ...] = ("Nucleus", "Cytoplasm", "Membrane", "Cell")

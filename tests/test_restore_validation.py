@@ -33,6 +33,20 @@ def test_candidate_pairs_match_revised_first_pass():
     assert set(rv.MARKER_INPUT_FLOOR_METHODS) == set(rv.QUPATH_MARKERS)
 
 
+def test_accepted_pairs_are_the_frozen_one_reference_per_target():
+    assert set(rv.ACCEPTED_PAIRS).issubset(set(rv.CANDIDATE_PAIRS))
+    targets = [t for t, _ in rv.ACCEPTED_PAIRS]
+    assert len(targets) == len(set(targets))  # one reference per target
+    ref = dict(rv.ACCEPTED_PAIRS)
+    # CD11b took the maintainer override to EpCAM, not the E_cadherin baseline
+    assert ref["CD11b"] == "EpCAM"
+    assert ("CD11b", "E_cadherin") in set(rv.BASELINE_PAIRS)
+    assert rv.PAIR_SETS["accepted"] == rv.ACCEPTED_PAIRS
+    for target, reference in rv.ACCEPTED_PAIRS:  # no excluded marker in either role
+        assert target not in rv.RESTORE_EXCLUDED_MARKERS
+        assert reference not in rv.RESTORE_EXCLUDED_MARKERS
+
+
 def test_directional_groups_selects_reference_arm_not_cluster_number():
     target = np.array([10, 11, 9, 1, 2, 1, 1, 1], dtype=float)
     reference = np.array([1, 2, 1, 10, 9, 11, 1, 2], dtype=float)
