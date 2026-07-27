@@ -186,6 +186,7 @@ def _apply_one_donor(
     expr_review_map: dict,
     config: PairValidationConfig,
     require_all_cells: bool,
+    on_technical_failure: str = "halt",
 ) -> dict:
     """Type one donor's cells for the 7 accepted pairs and write its tri-state gated parquet.
 
@@ -207,6 +208,7 @@ def _apply_one_donor(
     }
     metrics_rows: list[dict] = []
     pair_summaries: list[dict] = []
+    technical_failures: list[dict] = []
     for target, reference in ACCEPTED_PAIRS:
         review = pair_review_map.get((target, reference), PairReview.UNREVIEWED)
         if review is not PairReview.ACCEPTED:
@@ -225,11 +227,33 @@ def _apply_one_donor(
         )
         state = PairState(ev["state"])
         if state in HARD_FAIL_STATES:
-            raise ValueError(
-                f"donor {donor} {target} <- {reference}: ACCEPTED pair returned {state.value} "
-                f"({ev.get('state_reason', '')}); halting — no automatic fallback (a technical failure on "
-                "a validated pair is a method/data problem to surface, not a biological negative)"
+            # Two defensible responses, and the choice is the caller's because it changes what the
+            # output MEANS -- never a silent default.
+            #
+            # halt (the original, still the default): a technical failure on a cohort-validated pair is
+            #   a method/data problem to surface. That was right at 7 pairs, all universally expressed.
+            # unavailable: mark this donor-marker `unavailable` for every cell, which `lineage` treats
+            #   as BLOCKING -> Unresolved, never as a negative. At 24 pairs x 20 donors -- including
+            #   sparse immune markers and hormones that legitimately fail on individual donors -- one
+            #   donor-pair halting the whole cohort is brittle, and the tri-state design already has
+            #   the honest answer for it. The failure is still loud: it is counted here, recorded per
+            #   pair in the manifest, and every affected cell is Unresolved rather than typed.
+            #
+            # What NEITHER does is absorb the failure as a biological negative.
+            if on_technical_failure == "halt":
+                raise ValueError(
+                    f"donor {donor} {target} <- {reference}: ACCEPTED pair returned {state.value} "
+                    f"({ev.get('state_reason', '')}); halting — no automatic fallback (a technical failure on "
+                    "a validated pair is a method/data problem to surface, not a biological negative). "
+                    "Pass --on-technical-failure unavailable to record it as a blocking `unavailable` "
+                    "for this donor-marker instead."
+                )
+            technical_failures.append(
+                {"donor": str(donor), "target": target, "reference": reference,
+                 "state": state.value, "state_reason": str(ev.get("state_reason", ""))}
             )
+            print(f"[{donor}] {target} <- {reference}: {state.value} -> marker recorded UNAVAILABLE "
+                  f"for this donor ({ev.get('state_reason', '')})", flush=True)
         if int(ev["n_input"]) != len(donor_df):
             raise AssertionError(
                 f"donor {donor} {target}: evaluation length {ev['n_input']} != {len(donor_df)} cells"
@@ -283,7 +307,8 @@ def _apply_one_donor(
         + " ".join(f"{t}={100 * called[t] / max(n, 1):.1f}%" for t in REQUIRED_TARGETS),
         flush=True,
     )
-    return {"donor": str(donor), "n": n, "metrics": metrics_rows}
+    return {"donor": str(donor), "n": n, "metrics": metrics_rows,
+            "technical_failures": technical_failures}
 
 
 def run_apply(
@@ -293,6 +318,7 @@ def run_apply(
     n_jobs=None,
     config: PairValidationConfig | None = None,
     require_all_cells: bool = True,
+    on_technical_failure: str = "halt",
 ) -> pd.DataFrame:
     """Apply the 7 accepted RESTORE pairs on all cells per donor; write gated parquets + a cohort manifest.
 
@@ -358,11 +384,20 @@ def run_apply(
         expr_review_map=expr_map,
         config=config,
         require_all_cells=require_all_cells,
+        on_technical_failure=on_technical_failure,
     )
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
     # on_error='raise' — a per-donor failure must stop the whole run, never be swallowed as a None row.
     results = map_donors(fn, donor_ids, n_jobs=n_jobs, ordered=True, on_error="raise")
 
+    failures = [f for res in results if res for f in res.get("technical_failures", [])]
+    if failures:
+        fdf = pd.DataFrame(failures)
+        _atomic_write(cfg.restore_gated_dir / "technical_failures.csv",
+                      lambda p: fdf.to_csv(p, index=False))
+        print(f"\n[restore] {len(failures)} donor-marker technical failures recorded UNAVAILABLE "
+              f"(cells Unresolved, never negative) -> {cfg.restore_gated_dir / 'technical_failures.csv'}")
+        print(fdf.groupby(["target", "state"]).size().rename("donors").to_string())
     rows = [row for res in results if res for row in res["metrics"]]
     manifest = pd.DataFrame(rows)
     _atomic_write(cfg.restore_apply_manifest_csv, lambda p: manifest.to_csv(p, index=False))
@@ -380,6 +415,12 @@ def main(argv=None):
     ap.add_argument("--config", type=Path, default=None)
     ap.add_argument("--jobs", type=int, default=None, help="per-donor process pool size")
     ap.add_argument("--donors", nargs="*", default=None)
+    ap.add_argument(
+        "--on-technical-failure", choices=("halt", "unavailable"), default="halt",
+        help="what to do when an ACCEPTED pair returns a technical (non-callable) state for one donor. "
+             "halt (default) stops the run; unavailable records that donor-marker as blocking, so its "
+             "cells become Unresolved rather than typed. Neither absorbs it as a biological negative.",
+    )
     # Same two knobs as `restore_validation evaluate-locked`, so a sweep arm and its production apply
     # are invoked identically. Default None == take the value from config.ini.
     ap.add_argument(
@@ -402,7 +443,7 @@ def main(argv=None):
         cfg.restore_control_definition = a.control_definition
     if a.divisor_statistic is not None:
         cfg.restore_divisor_statistic = a.divisor_statistic
-    run_apply(cfg, donors=a.donors)
+    run_apply(cfg, donors=a.donors, on_technical_failure=a.on_technical_failure)
     return 0
 
 

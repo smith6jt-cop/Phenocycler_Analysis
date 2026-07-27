@@ -297,3 +297,45 @@ def test_explicit_config_overrides_the_ini(tmp_path, monkeypatch):
     monkeypatch.setattr(ra, "evaluate_locked_pair", capture)
     ra.run_apply(cfg, donors=["TEST"], config=PairValidationConfig(divisor_statistic="p999"))
     assert {c.divisor_statistic for c in seen} == {"p999"}
+
+
+# --------------------------------------------------------------------------- #
+# Technical failure policy (2026-07-27)
+#
+# At 7 universally-expressed pairs, halting the cohort on one donor-pair was right. At 24 pairs x 20
+# donors -- sparse immune markers, hormones that legitimately fail on individual donors -- it blocks
+# 19 good donors on one bad donor-marker. The tri-state design already has the honest answer.
+# What NEITHER policy may do is absorb the failure as a biological negative.
+# --------------------------------------------------------------------------- #
+
+def test_halt_is_the_default(tmp_path, monkeypatch):
+    cfg = _setup(tmp_path, monkeypatch, state_for={"CD3e": PairState.MODEL_UNSTABLE})
+    with pytest.raises(ValueError, match="MODEL_UNSTABLE"):
+        ra.run_apply(cfg, donors=["TEST"])
+
+
+def test_unavailable_policy_blocks_rather_than_negating(tmp_path, monkeypatch):
+    cfg = _setup(tmp_path, monkeypatch, sample_n=6, state_for={"CD3e": PairState.MODEL_UNSTABLE})
+    ra.run_apply(cfg, donors=["TEST"], on_technical_failure="unavailable")
+    gated = pd.read_parquet(cfg.restore_gated_dir / "donor_id=TEST" / "data_0.parquet")
+    # the failed marker is UNAVAILABLE for every cell -- never 'negative', which would let a lower
+    # gate silently claim the cell as though CD3e had been measured and found absent
+    assert (gated["CD3e_state"] == "unavailable").all()
+    assert not (gated["CD3e_state"] == "negative").any()
+    assert (gated["CD68_state"] == "positive").sum() == 3          # other pairs unaffected
+    # and it is recorded, not swallowed
+    failures = pd.read_csv(cfg.restore_gated_dir / "technical_failures.csv")
+    assert failures.target.tolist() == ["CD3e"]
+    assert failures.state.tolist() == ["MODEL_UNSTABLE"]
+
+
+def test_unavailable_marker_makes_lineage_unresolved_not_other(tmp_path, monkeypatch):
+    """The whole point: a blocked cell must be Unresolved, so it is visibly un-typed rather than
+    quietly counted as a negative in the residual."""
+    cfg = _setup(tmp_path, monkeypatch, sample_n=6, state_for={"CD3e": PairState.MODEL_UNSTABLE})
+    ra.run_apply(cfg, donors=["TEST"], on_technical_failure="unavailable")
+    gated = str(cfg.restore_gated_dir / "donor_id=TEST" / "data_0.parquet")
+    out = lineage.assign_donor("TEST", gated, cfg.cells_dir).set_index("object_id")
+    # odd cells are negative for every other gate; CD3e is unavailable, so Immune is indeterminate
+    assert (out.loc[["TEST-1", "TEST-3", "TEST-5"], "compartment"] == "Unresolved").all()
+    assert (out.loc[["TEST-1", "TEST-3", "TEST-5"], "assignment_reason"] == "blocked_unavailable_gate").all()
