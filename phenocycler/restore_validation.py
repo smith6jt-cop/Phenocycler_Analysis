@@ -175,6 +175,7 @@ del _target, _reference, _marker, _role
 # Wired into production as of Gate 4 (2026-07-24): restore_apply.REQUIRED_TARGETS is derived from this
 # tuple and config.COMPARTMENT_GATES uses exactly these seven targets (tests/test_config.py:121).
 ACCEPTED_PAIRS: tuple[tuple[str, str], ...] = (
+    # --- the original 7 (Gate-2 sign-off 2026-07-24) ---
     ("E_cadherin", "CD31"),
     ("CD31", "E_cadherin"),
     ("CD3e", "E_cadherin"),
@@ -182,6 +183,38 @@ ACCEPTED_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD11b", "EpCAM"),
     ("B3TUBB", "EpCAM"),
     ("Vimentin", "E_cadherin"),
+    # --- level-1 gate expansion (Gate-2 sign-off 2026-07-27) -------------------------------------
+    # Rationale, evidence and per-pair flags: data/restore_pair_validation/pair_reviews_accepted.csv
+    # and docs/ANATOMY_CHECK_2026-07-27.md. `Other` was the ordered residual's terminal bucket, so a
+    # cell whose only lineage marker was ungated could not be typed -- B cells, DC, neutrophils,
+    # macrophage subsets, ENDOCRINE cells, lymphatics and smooth muscle were all landing there by
+    # construction rather than by evidence.
+    #
+    # The three epithelial promotions take the SAME recorded exception as E_cadherin <- CD31: they
+    # fail the pure-proportion rule (0.03-0.18) because every majority-positive structural target
+    # must, not because the reference is poor (reference_fold 19-37x).
+    ("Pan_Cytokeratin", "CD31"),
+    ("Ker8_18", "CD31"),
+    ("EpCAM", "CD31"),
+    # Immune. CD163 was screened and REJECTED (see LEVEL1_EXPANSION_PAIRS).
+    ("CD79a", "E_cadherin"),
+    ("CD11c", "E_cadherin"),
+    ("Iba1", "E_cadherin"),
+    ("CD206", "E_cadherin"),
+    ("MPO", "E_cadherin"),
+    ("CD4", "E_cadherin"),
+    ("CD8", "E_cadherin"),
+    # Epithelial / endocrine. INS carries a live caveat: its signal collapses in T1D (beta-cell loss),
+    # so affected donors need an expression review resolving them to NO_TARGET_EXPRESSION_CONFIRMED
+    # rather than a technical halt. SST carries an UNEXPLAINED ND anomaly -- see the floor table.
+    ("Keratin_5", "CD31"),
+    ("INS", "Pan_Cytokeratin"),
+    ("GCG", "Pan_Cytokeratin"),
+    ("SST", "Pan_Cytokeratin"),
+    # Endothelial / mesenchymal.
+    ("CD34", "E_cadherin"),
+    ("Podoplanin", "E_cadherin"),
+    ("SMA", "E_cadherin"),
 )
 for _t, _r in ACCEPTED_PAIRS:  # fail at import if the frozen set drifts from the candidate web
     if (_t, _r) not in set(CANDIDATE_PAIRS):

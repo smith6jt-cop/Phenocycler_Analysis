@@ -56,6 +56,7 @@ from .cohort import ensure_eligible_donors
 from .parallel import map_donors
 from .restore_validation import (
     ACCEPTED_PAIRS,
+    COMPARTMENTS,
     CONTROL_DEFINITIONS,
     DIVISOR_STATISTICS,
     METHOD_VERSION,
@@ -109,7 +110,18 @@ def config_from_pipeline(cfg: PipelineConfig) -> PairValidationConfig:
             f"[restore] config.ini [restore] divisor_statistic={statistic!r} is not one of "
             f"{sorted(DIVISOR_STATISTICS)}"
         )
-    return PairValidationConfig(control_definition=control, divisor_statistic=statistic)
+    compartments = tuple(c.strip() for c in str(cfg.restore_feature_compartments).split(",") if c.strip())
+    unknown = [c for c in compartments if c not in COMPARTMENTS]
+    if unknown or not compartments:
+        raise SystemExit(
+            f"[restore] config.ini [restore] feature_compartments={cfg.restore_feature_compartments!r} "
+            f"is not a comma-separated subset of {list(COMPARTMENTS)}"
+        )
+    return PairValidationConfig(
+        control_definition=control,
+        divisor_statistic=statistic,
+        feature_compartments=compartments,
+    )
 
 
 def cell_calls_from_evaluation(ev: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -330,7 +342,8 @@ def run_apply(
     # frozen specification, and it changes every divisor.
     print(
         f"[restore] {METHOD_VERSION} | control_definition={config.control_definition} "
-        f"divisor_statistic={config.divisor_statistic} | {len(donor_ids)} donors "
+        f"divisor_statistic={config.divisor_statistic} "
+        f"features={'+'.join(config.feature_compartments)} | {len(donor_ids)} donors "
         f"x {len(ACCEPTED_PAIRS)} accepted pairs"
     )
 

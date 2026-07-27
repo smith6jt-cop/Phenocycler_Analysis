@@ -42,21 +42,29 @@ OTHER_LABEL: str = "Other"
 UNRESOLVED_LABEL: str = "Unresolved"   # blocked by an unavailable higher-priority gate (NOT a negative Other)
 
 # Anchor gate marker(s) per compartment — a cell enters the compartment if ANY gate marker is a POSITIVE
-# RESTORE call. Gate 4 (2026-07-24): the gate set is EXACTLY the 7 divisor-backed ACCEPTED_PAIRS targets
-# (restore_validation.ACCEPTED_PAIRS), so every gate marker has an accepted per-donor divisor and a
-# meaningful tri-state call. Markers with NO accepted pair are DEFERRED to the level-2 pass and are NOT
-# gates here (as gates they would be permanently 'unavailable' and Unresolve most cells):
-#   Immune  — CD79a/CD163/CD206/Iba1/CD11c/MPO/CD20 (B/DC/macrophage-subset/neutrophil markers) + the
-#             NK CD56+CD57+ gate are deferred; Immune rests on the three screened anchors CD3e (T),
-#             CD68 (macrophage), CD11b (myeloid). CD20 also takes no part in RESTORE (RESTORE_EXCLUDED_MARKERS).
-#   Mesench — SMA (mural/myofibroblast) is a level-2 Mesenchymal pair, so level-1 Mesenchymal rests on Vimentin.
-# See restore_validation.ACCEPTED_PAIRS and docs/level2_hierarchy.md.
+# RESTORE call, and the gate set is EXACTLY the divisor-backed ACCEPTED_PAIRS targets.
+#
+# Gate markers, expanded 2026-07-27 (maintainer sign-off) from 7 to 24. Every entry is a divisor-backed
+# ACCEPTED_PAIRS target, so a tri-state "unavailable" always means a real per-donor QC gap and never
+# "never screened" (enforced by tests/test_config.py::test_gate_markers_are_the_accepted_restore_targets).
+#
+# Why the expansion: `Other` is the ordered residual's terminal bucket, so a cell whose only lineage
+# marker was ungated could not be typed. With 7 markers, B cells, plasma cells, DC, neutrophils,
+# macrophage subsets, ENDOCRINE cells, lymphatics and smooth muscle all landed in `Other` by
+# construction. Measured consequence of the old Epithelial gate: only 1-6% of islet-core cells --
+# endocrine by QuPath annotation, hormone-validated -- were called Epithelial, and 82-94% `Other`
+# (docs/ANATOMY_CHECK_2026-07-27.md).
 COMPARTMENT_GATES: dict[str, list[str]] = {
-    "Immune":      ["CD3e", "CD68", "CD11b"],   # T / macrophage / myeloid — the 3 screened immune targets
-    "Epithelial":  ["E_cadherin"],              # only epithelial marker that stays + on endocrine
-    "Endothelial": ["CD31"],
-    "Neural":      ["B3TUBB"],                   # residual (after epithelial) so islet TUBB3 is gone
-    "Mesenchymal": ["Vimentin"],                # SMA deferred to the level-2 pass (mural/myofibroblast split)
+    # T / B / macrophage / DC / granulocyte. CD163 screened and rejected (arm separation below the 2x
+    # floor on every disease group); CD68/CD11b/Iba1/CD206 already cover macrophages.
+    "Immune":      ["CD3e", "CD68", "CD11b", "CD79a", "CD11c", "Iba1", "CD206", "MPO", "CD4", "CD8"],
+    # Exocrine keratins + EpCAM + the hormones. No single marker spans this compartment: endocrine
+    # sits BELOW acinar on E-cadherin and ABOVE it on EpCAM, and the keratins are near-zero in islets.
+    "Epithelial":  ["E_cadherin", "Pan_Cytokeratin", "Ker8_18", "EpCAM", "Keratin_5",
+                    "INS", "GCG", "SST"],
+    "Endothelial": ["CD31", "CD34", "Podoplanin"],   # vascular + lymphatic
+    "Neural":      ["B3TUBB"],                       # residual (after epithelial) so islet TUBB3 is gone
+    "Mesenchymal": ["Vimentin", "SMA"],              # fibroblast/stellate + mural
 }
 
 # Endocrine sub-branch of Epithelial: hormone+ = endocrine (beta INS, alpha GCG, delta SST). DEFERRED to
@@ -150,6 +158,12 @@ class PipelineConfig:
     # its own; restore_validation remains the single source of truth for the allowed values.
     restore_control_definition: str = "reference_only"
     restore_divisor_statistic: str = "max"
+    # QuPath compartments feeding the NNMF separator, comma-separated. The locked value is
+    # "Membrane,Cell", but 14 of the 24 accepted targets post-date the compartment sample and have only
+    # whole-cell values, so a production run over the full accepted set REQUIRES "Cell". Measured
+    # 2026-07-27 on the 7 original pairs x 3 donors: states identical 21/21, divisor ratio 0.96-1.05,
+    # call Jaccard median 0.997, call-rate |delta| median 0.04 pp.
+    restore_feature_compartments: str = "Membrane,Cell"
 
     # -- RESTORE (scripts/senior/restore_normalize.py defaults) --------------
     restore_model: str = "SSC"       # SSC | GMM | KMeans
@@ -363,6 +377,7 @@ _INI_SCHEMA = {
         # METHOD_VERSION v10 pair-method policy (consumed by restore_apply -> evaluate_locked_pair).
         "control_definition": ("restore_control_definition", str),
         "divisor_statistic": ("restore_divisor_statistic", str),
+        "feature_compartments": ("restore_feature_compartments", str),
         "model": ("restore_model", str),
         "subsample": ("restore_subsample", int),
         "robust": ("restore_robust", lambda s: str(s).lower() in ("1", "true", "yes", "on")),

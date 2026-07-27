@@ -129,16 +129,23 @@ def test_compartment_constants_shape():
     assert COMPARTMENT_ORDER == ["Immune", "Epithelial", "Endothelial", "Neural", "Mesenchymal"]
     assert OTHER_LABEL == "Other"
     assert UNRESOLVED_LABEL == "Unresolved"
-    assert COMPARTMENT_GATES["Immune"] == ["CD3e", "CD68", "CD11b"]   # the 3 screened immune anchors
-    assert COMPARTMENT_GATES["Epithelial"] == ["E_cadherin"]      # E-cadherin anchor (stays + on endocrine)
-    assert COMPARTMENT_GATES["Endothelial"] == ["CD31"]
+    # Expanded 2026-07-27 from 7 gate markers to 24 (maintainer sign-off). `Other` is the ordered
+    # residual's terminal bucket, so a cell whose only lineage marker was ungated could not be typed.
+    assert COMPARTMENT_GATES["Immune"] == ["CD3e", "CD68", "CD11b", "CD79a", "CD11c", "Iba1",
+                                           "CD206", "MPO", "CD4", "CD8"]
+    assert COMPARTMENT_GATES["Epithelial"] == ["E_cadherin", "Pan_Cytokeratin", "Ker8_18", "EpCAM",
+                                               "Keratin_5", "INS", "GCG", "SST"]
+    assert COMPARTMENT_GATES["Endothelial"] == ["CD31", "CD34", "Podoplanin"]
     assert COMPARTMENT_GATES["Neural"] == ["B3TUBB"]
-    assert COMPARTMENT_GATES["Mesenchymal"] == ["Vimentin"]      # SMA deferred to the level-2 pass
-    # These markers have NO accepted RESTORE pair, so they are DEFERRED (not gates) — as gates they would
-    # be permanently 'unavailable' and Unresolve most cells. CD20 additionally takes no part in RESTORE.
-    for deferred in ("CD20", "CD79a", "CD163", "CD206", "Iba1", "CD11c", "MPO", "SMA"):
-        assert deferred not in COMPARTMENT_GATES["Immune"]
-    assert "SMA" not in COMPARTMENT_GATES["Mesenchymal"]
+    assert COMPARTMENT_GATES["Mesenchymal"] == ["Vimentin", "SMA"]
+    # Still NOT gates, each for a stated reason rather than by omission:
+    #   CD20   — takes no part in RESTORE at all (RESTORE_EXCLUDED_MARKERS)
+    #   CD163  — screened 2026-07-27 and REJECTED: arm separation 1.73-2.25x, at or below the 2x floor
+    #   CD56   — marks NK, neural AND endocrine cells, so it cannot discriminate three compartments
+    #   CD66   — epithelial and granulocyte
+    for rejected in ("CD20", "CD163", "CD56", "CD66"):
+        assert rejected not in COMPARTMENT_GATES["Immune"]
+        assert rejected not in COMPARTMENT_GATES["Epithelial"]
     assert ENDOCRINE_MARKERS == ["INS", "GCG", "SST"]      # retained for the deferred level-2 pass
 
 

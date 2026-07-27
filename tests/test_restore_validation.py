@@ -47,14 +47,19 @@ def test_accepted_pairs_are_the_frozen_one_reference_per_target():
         assert reference not in rv.RESTORE_EXCLUDED_MARKERS
 
 
-def test_epithelial_target_comparator_is_diagnostic_only():
-    """Pan-CK / Ker8_18 / EpCAM as TARGETS (they appear elsewhere only as references), so the
-    single-marker Epithelial gate can be tested against alternatives. Diagnostic: these must NOT leak
-    into ACCEPTED_PAIRS, which would put an unvalidated pair into production."""
+def test_epithelial_target_comparator_promoted_only_against_cd31():
+    """Pan-CK / Ker8_18 / EpCAM entered as diagnostic TARGETS (they appear elsewhere only as
+    references) so the single-marker Epithelial gate could be tested against alternatives. The
+    anatomy check settled it and they were promoted 2026-07-27 — but only against CD31, E-cadherin's
+    own frozen reference. The Vimentin-referenced rows stay comparators, so exactly one reference
+    reaches production per target."""
     comparator = set(rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS)
     assert comparator <= set(rv.CANDIDATE_PAIRS)
     assert rv.PAIR_SETS["epithelial-comparator"] == rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS
-    assert comparator & set(rv.ACCEPTED_PAIRS) == {("E_cadherin", "CD31")}  # only the already-frozen one
+    assert comparator & set(rv.ACCEPTED_PAIRS) == {
+        ("E_cadherin", "CD31"), ("Pan_Cytokeratin", "CD31"), ("Ker8_18", "CD31"), ("EpCAM", "CD31"),
+    }
+    assert not {p for p in comparator if p[1] == "Vimentin"} & set(rv.ACCEPTED_PAIRS)
     assert {t for t, _ in comparator} == {"Pan_Cytokeratin", "Ker8_18", "EpCAM", "E_cadherin"}
     # both references are biologically exclusive with epithelium and are themselves screened markers
     assert {r for _, r in comparator} == {"CD31", "Vimentin"}
@@ -1337,7 +1342,8 @@ def test_review_shortlist_has_one_rationale_per_unique_pair():
     # 11 original + the 2 accepted pairs added 2026-07-25 + the 7 epithelial promotion candidates
     # added 2026-07-27 (Pan-CK / Ker8_18 / EpCAM x {CD31, Vimentin}, plus E_cadherin <- Vimentin as
     # the comparator for the frozen E_cadherin <- CD31).
-    assert len(rpr.SHORTLIST_PAIRS) == 20
+    # 11 original + 2 (2026-07-25) + 7 epithelial promotion candidates + 14 level-1 expansion pairs
+    assert len(rpr.SHORTLIST_PAIRS) == 34
     assert len(set(rpr.SHORTLIST_PAIRS)) == len(rpr.SHORTLIST_PAIRS)
     assert set(rpr.SHORTLIST_PAIRS) == set(rpr.PAIR_RATIONALE)
 
@@ -1351,8 +1357,24 @@ def test_epithelial_promotion_candidates_have_a_review_surface():
             assert (target, reference) in rpr.SHORTLIST_PAIRS
             assert (target, reference) in rv.CANDIDATE_PAIRS
     assert ("E_cadherin", "Vimentin") in rpr.SHORTLIST_PAIRS   # comparator for the frozen CD31 pair
-    # ...but they must NOT be production pairs yet.
-    assert not (set(rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS) - {("E_cadherin", "CD31")}) & set(rv.ACCEPTED_PAIRS)
+    # Promoted to production 2026-07-27 against CD31 — E-cadherin's own frozen reference, so the
+    # comparison is like-for-like. The Vimentin-referenced rows stay comparators.
+    for target in ("Pan_Cytokeratin", "Ker8_18", "EpCAM"):
+        assert (target, "CD31") in rv.ACCEPTED_PAIRS
+        assert (target, "Vimentin") not in rv.ACCEPTED_PAIRS
+    assert ("E_cadherin", "Vimentin") not in rv.ACCEPTED_PAIRS
+
+
+def test_every_gate_marker_reaches_production_through_an_accepted_pair():
+    """The whole point of the expansion: a marker in a gate must have a divisor, or the gate is
+    permanently 'unavailable' and Unresolves every cell it touches."""
+    from phenocycler.config import COMPARTMENT_GATES
+    accepted = {t for t, _ in rv.ACCEPTED_PAIRS}
+    gated = {m for gs in COMPARTMENT_GATES.values() for m in gs}
+    assert gated == accepted
+    assert len(accepted) == 24
+    assert "CD163" not in accepted      # screened and rejected on arm separation
+    assert "CD20" not in accepted       # excluded from RESTORE in both roles
 
 
 def test_every_accepted_pair_has_a_review_surface():

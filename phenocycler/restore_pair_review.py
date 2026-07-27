@@ -73,6 +73,23 @@ SHORTLIST_PAIRS: tuple[tuple[str, str], ...] = (
     ("EpCAM", "CD31"),
     ("EpCAM", "Vimentin"),
     ("E_cadherin", "Vimentin"),
+    # Added 2026-07-27 with the level-1 gate expansion sign-off. Every accepted production pair needs
+    # an image-review surface (the invariant below), and these 14 went to production on screen
+    # diagnostics alone -- the per-image biological review is still outstanding for all of them.
+    ("CD79a", "E_cadherin"),
+    ("CD11c", "E_cadherin"),
+    ("Iba1", "E_cadherin"),
+    ("CD206", "E_cadherin"),
+    ("MPO", "E_cadherin"),
+    ("CD4", "E_cadherin"),
+    ("CD8", "E_cadherin"),
+    ("Keratin_5", "CD31"),
+    ("INS", "Pan_Cytokeratin"),
+    ("GCG", "Pan_Cytokeratin"),
+    ("SST", "Pan_Cytokeratin"),
+    ("CD34", "E_cadherin"),
+    ("Podoplanin", "E_cadherin"),
+    ("SMA", "E_cadherin"),
 )
 
 PAIR_RATIONALE: dict[tuple[str, str], str] = {
@@ -117,6 +134,24 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
                        "real population and not a background band",
     ("EpCAM", "Vimentin"): "epithelial promotion candidate; mesenchymal reference for the endocrine-"
                            "recovering marker",
+    ("CD79a", "E_cadherin"): "B/plasma cells -- the population CD3e/CD68/CD11b structurally cannot reach",
+    ("CD11c", "E_cadherin"): "dendritic cells; overlaps CD11b myeloid, check it is not simply re-calling it",
+    ("Iba1", "E_cadherin"): "macrophage/monocyte; overlaps CD68, check the increment is real",
+    ("CD206", "E_cadherin"): "M2 macrophage; overlaps CD68/Iba1",
+    ("MPO", "E_cadherin"): "neutrophils; granule marker, check for release/debris staining rather than cells",
+    ("CD4", "E_cadherin"): "T-helper AND monocytes -- not T-exclusive; only used at compartment level here",
+    ("CD8", "E_cadherin"): "cytotoxic T; the cleanest immune subset marker in the panel by arm separation",
+    ("Keratin_5", "CD31"): "basal/ductal keratin; sparse, check it marks ducts and not scattered noise",
+    ("INS", "Pan_Cytokeratin"): "beta cells. Signal COLLAPSES in T1D (target_fold 137/199 -> 8.4) which is "
+                                "beta-cell loss, not failure -- those donors need CONFIRMED_ABSENT, and the "
+                                "review must distinguish absence from a bad threshold",
+    ("GCG", "Pan_Cytokeratin"): "alpha cells; stable across all disease groups -- the control for INS",
+    ("SST", "Pan_Cytokeratin"): "delta cells. UNEXPLAINED: target_fold 1.68 with low SBR on 62% of ND donors "
+                                "against 20.7 in T1D. Delta cells should not be weakest in ND -- resolve before "
+                                "relying on it",
+    ("CD34", "E_cadherin"): "endothelial progenitor AND fibroblast; called at 17% on 6539, check it is vessels",
+    ("Podoplanin", "E_cadherin"): "lymphatic endothelium; also mesothelium and some fibroblasts",
+    ("SMA", "E_cadherin"): "mural/myofibroblast; gates Mesenchymal LAST so it only claims the residual",
     ("E_cadherin", "Vimentin"): "COMPARATOR for the frozen E_cadherin<-CD31, which was accepted despite "
                                 "failing the pure-proportion rule at 0.19x. Vimentin is abundant enough "
                                 "to pass it, so this is the test of whether that caveat matters",
