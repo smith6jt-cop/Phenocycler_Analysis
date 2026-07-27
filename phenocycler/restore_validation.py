@@ -126,7 +126,15 @@ EPITHELIAL_TARGET_COMPARATOR_PAIRS: tuple[tuple[str, str], ...] = tuple(
 #
 # CD56 is deliberately excluded: it marks NK cells, neural tissue AND endocrine cells, so it cannot
 # discriminate three of the five compartments. CD66 likewise (epithelial and granulocyte).
-_IMMUNE_EXPANSION = ("CD79a", "CD11c", "CD163", "Iba1", "CD206", "MPO", "CD4", "CD8")
+#
+# CD163 was dropped from this set after the 20-donor screen (2026-07-27). It is the only one of the 15
+# that fails on more than one axis: reference/target ratio 0.34-0.62 (undersized on 70% of donors),
+# target_fold median 1.73-2.25 -- at or below the 2x arm-separation floor -- and `target_low_sbr`
+# flagged on 33-67% of donors, consistently across every disease group. Macrophages are abundant
+# enough here that CD163's positive population rivals its reference's control, the same structural
+# problem the epithelial targets have. The cost of dropping it is low: CD68, CD11b, Iba1 and CD206
+# already gate macrophages. It remains a REFERENCE (CD3e <- CD163) where it works.
+_IMMUNE_EXPANSION = ("CD79a", "CD11c", "Iba1", "CD206", "MPO", "CD4", "CD8")
 _EPITHELIAL_EXPANSION = ("Keratin_5",)
 _ENDOCRINE_EXPANSION = ("INS", "GCG", "SST")
 _ENDOTHELIAL_EXPANSION = ("CD34", "Podoplanin")
@@ -246,8 +254,18 @@ MARKER_INPUT_FLOOR_METHODS: dict[str, str] = {
     "CD34": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
     "Podoplanin": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
     "Keratin_5": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    # INS: target_fold collapses 137-199 (ND/AAB) -> 8.4 (T1D), `target_low_sbr` fires on 44% of T1D
+    # donors and 0% of ND/AAB, and the screen's single MODEL_UNSTABLE is 6566, a T1D donor. That is
+    # beta-cell loss -- the defining feature of the disease -- being detected, not a threshold failing.
+    # Those donors need an EXPRESSION REVIEW resolving them to NO_TARGET_EXPRESSION_CONFIRMED (a
+    # confident negative) rather than a technical halt. GCG is stable across all three groups
+    # (target_fold 26-34), which is the correct contrast: alpha cells are preserved in T1D.
     "INS": LINEAR_OTSU_FLOOR,
     "GCG": LINEAR_OTSU_FLOOR,
+    # SST carries an UNEXPLAINED anomaly: target_fold median 1.68 in ND with `target_low_sbr` on 62%
+    # of ND donors, against 20.7 in T1D and 55.2 in AAB. Delta cells are not expected to be weakest in
+    # non-diabetic pancreas, so this is flagged rather than rationalised -- it wants its own look
+    # before SST is relied on.
     "SST": LINEAR_OTSU_FLOOR,
     "SMA": LINEAR_OTSU_FLOOR,
 }
