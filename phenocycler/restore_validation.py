@@ -1747,7 +1747,8 @@ def load_validation_sample(
     # number as the canonical `data/cells` column -- an identity this function already asserts below
     # for every sampled marker (verified 2026-07-27: max relative delta 6e-8 over 2.36M cells, i.e.
     # float32 round-trip). Such markers are synthesised here and recorded in the audit; pairs using
-    # them must run with `feature_compartments = ("Cell",)`, which `evaluate_locked_pair` enforces.
+    # them fall back to whole-cell automatically: `evaluate_locked_pair` resolves the effective feature
+    # compartments PER PAIR as the richest declared subset both its markers have, and records it.
     sampled_markers = [m for m in markers if compartment_column("Cell", m) in sample.columns]
     whole_cell_only = [m for m in markers if m not in set(sampled_markers)]
     raw = pd.read_parquet(
@@ -2176,26 +2177,35 @@ def evaluate_locked_pair(
     config = config or PairValidationConfig()
     if (target, reference) not in CANDIDATE_PAIRS:
         raise ValueError(f"pair is not in the candidate specification: {target} <- {reference}")
+    # `config.feature_compartments` is the DECLARED PREFERENCE; the effective set is the richest subset
+    # of it that this pair's two markers actually have. Markers added after the compartment sample was
+    # extracted have only whole-cell values (load_validation_sample synthesises `Cell__{marker}` from
+    # the canonical parquet), and their source QuPath CSV no longer exists.
+    #
+    # Resolving per PAIR rather than per RUN matters, and not only for tidiness. Measured 2026-07-27:
+    # CD68 <- E_cadherin on donor 6523 is MODEL_UNSTABLE on whole-cell alone (divisor reproducibility
+    # 0.864, no divisor, no calls) and perfectly stable with the Membrane feature restored
+    # (reproducibility 1.000, divisor 133.8, 3.53% called). Both its markers ARE in the compartment
+    # sample -- it was being degraded only because 14 OTHER accepted pairs are not, and the run-level
+    # setting applied their limitation to everything. Nothing about that donor is unusual; the arms,
+    # anchor recovery and separator are mid-cohort.
+    #
+    # "Cell" is always required: it is the whole-cell mean, present for every marker by construction.
+    effective_compartments = tuple(
+        c for c in config.feature_compartments
+        if all(compartment_column(c, m) in donor_df.columns for m in (target, reference))
+    )
+    if "Cell" not in effective_compartments:
+        raise ValueError(
+            f"{target} <- {reference}: no usable feature compartment. Declared "
+            f"{list(config.feature_compartments)}; 'Cell' must be among them and present for both "
+            "markers (load_validation_sample synthesises it from the canonical parquet)."
+        )
     feature_columns = [
         compartment_column(compartment, marker)
-        for compartment in config.feature_compartments
+        for compartment in effective_compartments
         for marker in (target, reference)
     ]
-    # A marker added to the pair web after the compartment sample was extracted has only its
-    # whole-cell feature (load_validation_sample synthesises `Cell__{marker}` from the canonical
-    # parquet). Asking for Membrane/Cytoplasm/Nucleus on such a marker is not recoverable, and the
-    # generic "missing column" error below would send the reader looking for a corrupt parquet rather
-    # than at the real cause. Name it.
-    absent = [c for c in feature_columns if c not in donor_df.columns]
-    if absent and set(config.feature_compartments) - {"Cell"}:
-        raise ValueError(
-            f"{target} <- {reference}: no {sorted(set(config.feature_compartments) - {'Cell'})} "
-            f"measurements for these markers (missing {absent}). They post-date the compartment "
-            "sample, whose source QuPath CSV no longer exists. Run this pair with "
-            "feature_compartments=('Cell',) -- measured 2026-07-27 to reproduce the locked "
-            "(Membrane, Cell) result on the 7 accepted pairs: states identical 21/21, divisor ratio "
-            "0.96-1.05, call Jaccard median 0.997 -- or re-export the compartment measurements."
-        )
     required = [
         f"raw__{target}",
         f"raw__{reference}",
@@ -2791,6 +2801,11 @@ def evaluate_locked_pair(
         "manuscript_divisor": manuscript_divisor,
         "divisor_statistic": config.divisor_statistic,
         "control_definition": config.control_definition,
+        # Which compartments this PAIR actually used, not what the run declared. A pair whose markers
+        # post-date the compartment sample silently falls back to whole-cell; recording the effective
+        # set is what makes that visible per row instead of inferable from a schema date.
+        "feature_compartments": "+".join(effective_compartments),
+        "feature_compartments_declared": "+".join(config.feature_compartments),
         "control_fraction_le_1": (
             float(target_full_stats["control_fraction_le_1"])
             if target_full_stats is not None
@@ -2907,6 +2922,7 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "canonical_divisor": evaluation["canonical_divisor"],
         "manuscript_divisor": evaluation["manuscript_divisor"],
         "divisor_statistic": evaluation["divisor_statistic"],
+        "feature_compartments": evaluation.get("feature_compartments"),
         "control_definition": evaluation["control_definition"],
         "control_fraction_le_1": evaluation["control_fraction_le_1"],
         "target_full_mean_plus_3sd": target_full.get("mean_plus_3sd", np.nan),

@@ -1724,3 +1724,56 @@ def test_excluded_marker_cannot_be_reintroduced_in_either_role():
         target, reference = pair
         offenders = [m for m in pair if m in rv.RESTORE_EXCLUDED_MARKERS]
         assert offenders, f"{target} <- {reference} should name an excluded marker"
+
+
+# --------------------------------------------------------------------------- #
+# Per-pair feature-compartment resolution (2026-07-27)
+#
+# 14 of the 24 accepted targets post-date the compartment sample and have only whole-cell values.
+# Applying THEIR limitation to every pair via a run-level setting cost a real result: CD68 <-
+# E_cadherin on donor 6523 is MODEL_UNSTABLE on whole-cell alone (divisor reproducibility 0.864, no
+# calls) and stable with Membrane restored (1.000, 3.53% called) -- and that one donor-marker left 80%
+# of the donor Unresolved. Both CD68 and E_cadherin ARE in the sample; nothing about 6523 is unusual.
+# --------------------------------------------------------------------------- #
+
+def _pair_frame(markers, compartments):
+    """Minimal donor_df carrying only the named compartments for the named markers."""
+    import numpy as np
+    n = 40
+    rng = np.random.default_rng(0)
+    cols = {"object_id": [f"c{i}" for i in range(n)]}
+    for m in markers:
+        cols[f"raw__{m}"] = rng.random(n) * 100
+        cols[f"redsea__{m}"] = rng.random(n) * 100
+        for c in compartments:
+            cols[rv.compartment_column(c, m)] = rng.random(n) * 100
+    return pd.DataFrame(cols)
+
+
+def test_effective_compartments_keep_membrane_when_the_pair_has_it():
+    df = _pair_frame(("CD68", "E_cadherin"), ("Membrane", "Cell"))
+    cfg = rv.PairValidationConfig(feature_compartments=("Membrane", "Cell"))
+    eff = tuple(c for c in cfg.feature_compartments
+                if all(rv.compartment_column(c, m) in df.columns for m in ("CD68", "E_cadherin")))
+    assert eff == ("Membrane", "Cell")
+
+
+def test_effective_compartments_fall_back_when_a_marker_lacks_membrane():
+    """A whole-cell-only marker must degrade ITS OWN pair, never the whole run."""
+    df = _pair_frame(("E_cadherin",), ("Membrane", "Cell"))
+    for c in ("raw__CD79a", "redsea__CD79a", rv.compartment_column("Cell", "CD79a")):
+        df[c] = 1.0                                        # CD79a has whole-cell only
+    cfg = rv.PairValidationConfig(feature_compartments=("Membrane", "Cell"))
+    eff = tuple(c for c in cfg.feature_compartments
+                if all(rv.compartment_column(c, m) in df.columns for m in ("CD79a", "E_cadherin")))
+    assert eff == ("Cell",)
+
+
+def test_cell_is_always_required():
+    """'Cell' is the whole-cell mean and exists for every marker; a declaration without it is an error,
+    not a silent empty feature set."""
+    df = _pair_frame(("CD68", "E_cadherin"), ("Membrane",))
+    cfg = rv.PairValidationConfig(feature_compartments=("Membrane",))
+    with pytest.raises(ValueError, match="no usable feature compartment"):
+        rv.evaluate_locked_pair(df, "TEST", "CD68", "E_cadherin", config=cfg,
+                                pair_review=rv.PairReview.ACCEPTED)
