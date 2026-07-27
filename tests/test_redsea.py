@@ -66,6 +66,78 @@ def test_compensate_isolated_cell_passthrough():
     assert np.isclose(corrected[2, 0], 7.7)     # unchanged: 77/10
 
 
+def test_donor_and_recipient_normalisation_differ_on_unequal_perimeters():
+    """The published (donor) operator divides by the NEIGHBOUR's total contact, not the recipient's.
+
+    Reference: redseapy builds ``comp*I - M[i,j]/B[j]`` and transposes it, then applies the result as
+    ``transpose(dot(transpose(E), P))`` == ``P.T @ E`` == ``A @ E`` — so the transpose is undone and the
+    net operator is the donor form. The two forms coincide only when every cell has the same total
+    contact perimeter, which is why the symmetric two-cell fixtures above cannot tell them apart.
+    """
+    #   cell0 -10- cell1 -5- cell2   ->  B = [10, 15, 5]
+    M = sp.csr_matrix(np.array([[0.0, 10.0, 0.0],
+                                [10.0, 0.0, 5.0],
+                                [0.0, 5.0, 0.0]]))
+    edge = np.array([[100.0], [1000.0], [20.0]])
+    data = np.full((3, 1), 1e6)          # large enough that nothing clips
+    sizes = np.ones(3)
+
+    donor, _, _ = redsea.compensate(data, edge, sizes, M, comp_mode=0, alpha=1.0, norm_form="donor")
+    recip, _, _ = redsea.compensate(data, edge, sizes, M, comp_mode=0, alpha=1.0, norm_form="recipient")
+
+    # donor: subtract sum_j M[i,j]/B[j] * edge[j]
+    #   cell0: (10/15)*1000                      = 666.67
+    #   cell1: (10/10)*100 + (5/5)*20            = 120
+    #   cell2: (5/15)*1000                       = 333.33
+    assert np.allclose((data - donor).ravel(), [2000.0 / 3, 120.0, 1000.0 / 3])
+    # recipient: rows sum to 1 -> a contact-weighted AVERAGE of the neighbours' whole rim sums
+    #   cell0: (10/10)*1000                      = 1000
+    #   cell1: (10/15)*100 + (5/15)*20           = 73.33
+    #   cell2: (5/5)*1000                        = 1000
+    assert np.allclose((data - recip).ravel(), [1000.0, 220.0 / 3, 1000.0])
+
+    # Mass conservation is the point: the donor form redistributes exactly each cell's own rim signal.
+    assert np.isclose((data - donor).sum(), edge.sum())
+    assert not np.isclose((data - recip).sum(), edge.sum())
+
+
+def test_compensate_rejects_unknown_norm_form():
+    M = sp.csr_matrix(np.array([[0.0, 4.0], [4.0, 0.0]]))
+    with pytest.raises(ValueError, match="norm_form"):
+        redsea.compensate(np.ones((2, 1)), np.ones((2, 1)), np.ones(2), M,
+                          comp_mode=1, alpha=1.0, norm_form="rowsum")
+
+
+def test_no_spillover_channels_pass_through_uncorrected():
+    """Nuclear/ECM channels get alpha=0 AND comp_mode=0, so corrected == raw for those columns."""
+    cols = ["E_cadherin", "DAPI", "CD31", "Collagen_IV", "Ki67"]
+    params = redsea.RedseaParams(comp_mode=1, alpha=1.0, exclude_no_spillover=True)
+
+    alpha, comp_mode, n_skipped = redsea.apply_no_spillover_mask(params, cols, params.alpha,
+                                                                 params.comp_mode)
+    assert n_skipped == 3                                    # DAPI, Collagen_IV, Ki67
+    assert np.allclose(alpha, [1.0, 0.0, 1.0, 0.0, 0.0])
+    assert np.allclose(comp_mode, [1, 0, 1, 0, 0])
+
+    M = sp.csr_matrix(np.array([[0.0, 4.0], [4.0, 0.0]]))
+    data = np.tile(np.array([[100.0], [10.0]]), (1, len(cols)))
+    edge = np.tile(np.array([[20.0], [5.0]]), (1, len(cols)))
+    sizes = np.array([10.0, 10.0])
+    corrected, _, _ = redsea.compensate(data, edge, sizes, M, comp_mode, alpha)
+
+    keep = np.array([c not in ("DAPI", "Collagen_IV", "Ki67") for c in cols])
+    raw_mean = data / sizes[:, None]
+    assert np.allclose(corrected[:, ~keep], raw_mean[:, ~keep])   # untouched
+    assert not np.allclose(corrected[:, keep], raw_mean[:, keep])  # corrected
+
+
+def test_no_spillover_mask_is_a_no_op_when_disabled():
+    cols = ["E_cadherin", "DAPI"]
+    params = redsea.RedseaParams(comp_mode=1, alpha=1.0, exclude_no_spillover=False)
+    alpha, comp_mode, n_skipped = redsea.apply_no_spillover_mask(params, cols, 1.0, 1)
+    assert (alpha, comp_mode, n_skipped) == (1.0, 1, 0)        # scalars preserved -> fast path kept
+
+
 def test_contact_matrix_counts_8_adjacencies():
     """Two 2x2 label blocks side by side: 4 shared-boundary pixel adjacencies."""
     mask = np.array([[1, 1, 2, 2],
@@ -109,7 +181,9 @@ def test_redsea_params_from_config_preserves_defaults():
     from phenocycler import load_config
     cfg = load_config()
     p = redsea.RedseaParams.from_config(cfg)
-    assert p.comp_mode == 0            # subtract-only
+    assert p.comp_mode == 1            # subtract + reinforce (Bai et al. default, restored in v10)
+    assert p.norm_form == "donor"      # published mass-conserving operator
+    assert p.exclude_no_spillover is True
     assert p.alpha == 1.0
     assert p.edge_radius == 0          # 1-px band
     assert p.gap_bridge == 1

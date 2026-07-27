@@ -33,7 +33,7 @@ from .cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
 # single bright cell in a sparse arm no longer sets the feature scale (22 of 600 screened rows, all with
 # immune targets). Adds anchor_recovery, arm-saturation/stability_informative reporting, and a
 # saturated-arm probe Jaccard. v5 artifacts were produced under the degenerate bound rule.
-METHOD_VERSION = "restore-pair-validation-v9"
+METHOD_VERSION = "restore-pair-validation-v10"
 # NB: ``BroadLineageRevised.md`` lists 8 first-pass pairs.  ``CD20 <- E_cadherin`` was the eighth and
 # is deliberately absent — CD20 is deferred out of RESTORE entirely (see RESTORE_EXCLUDED_MARKERS).
 BASELINE_PAIRS: tuple[tuple[str, str], ...] = (
@@ -130,6 +130,16 @@ PAIR_SETS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 COMPARTMENTS: tuple[str, ...] = ("Nucleus", "Cytoplasm", "Membrane", "Cell")
 LOCKED_FEATURE_COMPARTMENTS: tuple[str, ...] = ("Membrane", "Cell")
+
+# How the target-negative control population is defined (see PairValidationConfig.control_definition).
+CONTROL_DEFINITIONS: frozenset[str] = frozenset({"reference_only", "reference_and_target"})
+# Divisor summary statistic -> quantile (None == the manuscript maximum).
+DIVISOR_STATISTICS: dict[str, float | None] = {
+    "max": None,
+    "p999": 0.999,
+    "p99": 0.99,
+    "p95": 0.95,
+}
 QUPATH_MARKER_ALIASES = {
     "E_cadherin": "E-cadherin",
     "Pan_Cytokeratin": "Pan-Cytokeratin",
@@ -214,9 +224,8 @@ class PairValidationConfig:
     # control_jaccard) while its background-ceiling maximum, set by the brightest control cells deep in
     # the reference component, is reproducible. A pair is stable when min(seed divisor)/max(seed divisor)
     # across the locked seeds is at least this value. control_jaccard is retained as a reported diagnostic
-    # (min_control_jaccard below is no longer a gate).  (2026-07-24, METHOD v9)
+    # (the min_control_jaccard THRESHOLD was deleted in v10 -- it gated nothing; the column stays).
     min_divisor_reproducibility: float = 0.90
-    min_control_jaccard: float = 0.90
     # Reference-frequency selection rule (2026-07-24): a target's negative control (the reference-
     # positive, target-negative arm) must be at least as large as the target-positive population, or
     # the background maximum is estimated from too few cells to threshold many (the inverted-fit failure
@@ -237,6 +246,34 @@ class PairValidationConfig:
     degenerate_tail_support_cells: int = 10
     # Arm shrinkage used ONLY by the saturated-arm stability probe (reported, never gated).
     stability_probe_fraction: float = 0.8
+    # --- METHOD v10 (2026-07-25) -------------------------------------------------------------------
+    # How the target-negative control population is defined.
+    #   "reference_only"        : reference-component cells that are raw reference-high. This is the
+    #                             manuscript definition -- Chang et al. define the negative control by
+    #                             the REFERENCE marker alone (eqs 8-12); no target-side condition
+    #                             appears anywhere in the paper.
+    #   "reference_and_target"  : additionally requires raw target <= the target's own input floor.
+    #                             This was the pre-v10 behaviour, and it is why the divisor collapsed
+    #                             onto the target's Otsu threshold: capping the control population at
+    #                             the floor caps the maximum taken over it. Measured across the 49
+    #                             Gate-3 donor-pairs, divisor / target_input_floor had median 1.044 --
+    #                             i.e. RESTORE reduced numerically to two-class Otsu on the target's
+    #                             own channel, and the reference marker and the NNMF were inert with
+    #                             respect to the call. Retained only to reproduce v9 artifacts.
+    # NOTE the asymmetry this removes: `target_supported` already carries no raw-floor gate, so under
+    # "reference_only" the two control groups are defined symmetrically. The target ANCHOR
+    # (`target_population`) keeps both floor conditions -- it is a high-confidence seed, not a control.
+    control_definition: str = "reference_only"
+    # Statistic used to summarise the negative-control population into the divisor.
+    #   "max"  : the manuscript's B_i = max(b_i,k). Exact under the paper's noiseless model, where every
+    #            negative cell satisfies y = b exactly; an extreme order statistic once real per-cell
+    #            noise, residual spillover and segmentation error exist, so it grows with control-set
+    #            size without limit (measured: sampled-max/full-max 0.36 at n=50 rising to 0.77 at
+    #            n=2000 with no plateau, while control sets span 36x across donor-pairs).
+    #   "p999" / "p99" / "p95" : robust upper quantiles of the same population.
+    # The manuscript maximum is ALWAYS reported alongside as `manuscript_divisor`, so fidelity stays
+    # auditable per row whatever the production policy is.
+    divisor_statistic: str = "max"
 
     def __post_init__(self) -> None:
         if not self.feature_compartments:
@@ -280,8 +317,6 @@ class PairValidationConfig:
             raise ValueError("min_reference_arm_fold must be > 1")
         if self.min_arm_n < 2:
             raise ValueError("min_arm_n must be >= 2")
-        if not 0 <= self.min_control_jaccard <= 1:
-            raise ValueError("min_control_jaccard must be in [0, 1]")
         if not 0 <= self.min_divisor_reproducibility <= 1:
             raise ValueError("min_divisor_reproducibility must be in [0, 1]")
         if self.min_reference_to_target_ratio <= 0:
@@ -294,6 +329,16 @@ class PairValidationConfig:
             )
         if not 0 < self.stability_probe_fraction <= 1:
             raise ValueError("stability_probe_fraction must be in (0, 1]")
+        if self.control_definition not in CONTROL_DEFINITIONS:
+            raise ValueError(
+                f"control_definition must be one of {sorted(CONTROL_DEFINITIONS)}, "
+                f"got {self.control_definition!r}"
+            )
+        if self.divisor_statistic not in DIVISOR_STATISTICS:
+            raise ValueError(
+                f"divisor_statistic must be one of {sorted(DIVISOR_STATISTICS)}, "
+                f"got {self.divisor_statistic!r}"
+            )
 
     def specification(self) -> dict:
         """Return the complete machine-readable method and data-role contract."""
@@ -346,19 +391,34 @@ class PairValidationConfig:
                 "population sets the horizontal target divisor. Double-high, double-low, "
                 "and other assigned cells never set either maximum."
             ),
+            "control_definition_policy": (
+                f"control_definition={self.control_definition}. 'reference_only' is the manuscript "
+                "definition: the target-negative control is the reference-component, raw "
+                "reference-high population lying right of the Step 1 separator, defined by the "
+                "REFERENCE marker alone. 'reference_and_target' additionally caps the control at the "
+                "target's own raw input floor; because the divisor is a summary of that population, "
+                "capping it there pins the divisor to the floor (measured median "
+                "divisor/target_input_floor = 1.044 over the 49 Gate-3 donor-pairs), reducing RESTORE "
+                "to two-class Otsu on the target channel. Retained only to reproduce v9 artifacts."
+            ),
             "divisor_policy": (
-                "The canonical RESTORE divisor is the full maximum REDSEA target "
-                "intensity in the ordered reference-positive/target-negative control "
-                "population selected after the vertical reference baseline. Fixed-N "
-                "sampled maxima and mean+3SD are diagnostics only."
+                f"divisor_statistic={self.divisor_statistic}. The RESTORE divisor summarises the "
+                "ordered reference-positive/target-negative control population selected after the "
+                "vertical reference baseline. 'max' is the manuscript statistic (exact under its "
+                "noiseless model, where every negative cell satisfies y = b); it is an extreme order "
+                "statistic on real data and grows with control-set size without limit. The quantile "
+                "policies (p999/p99/p95) are stable in n. The manuscript maximum is ALWAYS emitted as "
+                "manuscript_divisor alongside canonical_divisor, and control_fraction_le_1 reports "
+                "what fraction of the control the chosen divisor bounds. Fixed-N sampled maxima and "
+                "mean+3SD remain diagnostics only."
             ),
             "calling_policy": (
-                "normalized = REDSEA value / divisor. Lineage evidence is positive when "
-                "normalized > 1 OR the cell is input-QC-retained, is in the NNMF target "
-                "component, and its matched REDSEA reference intensity is at or left of "
-                "the Step 1 separator. The latter override retains reference-negative "
-                "target-component cells even below the horizontal divisor; double-low "
-                "cells are never rescued. The horizontal line remains the RESTORE "
+                "normalized = REDSEA value / divisor. Lineage evidence is positive if and only if "
+                "normalized > 1 -- the call is divisor-gated only (METHOD v7, 2026-07-23). "
+                "Input-QC-retained NNMF target-component cells at or left of the Step 1 separator "
+                "that fall at or below the divisor are RETAINED and reported "
+                "(target_supported / target_supported_below_divisor) but are NOT called positive; "
+                "double-low cells are never rescued. The horizontal line remains the RESTORE "
                 "normalization divisor, not an exclusion boundary."
             ),
             "cell_availability_policy": (
@@ -764,23 +824,56 @@ def directional_groups(
     )
 
 
-def negative_control_statistics(values: np.ndarray) -> dict[str, float | int]:
-    """Compute the manuscript divisor and released-code sensitivity statistic."""
+def negative_control_statistics(
+    values: np.ndarray, statistic: str = "max"
+) -> dict[str, float | int]:
+    """Summarise the negative-control population into a divisor, plus sensitivity statistics.
+
+    ``statistic`` selects which summary becomes ``"divisor"``:
+      "max"  -- the manuscript's ``B_i = max(b_i,k)``. Under the paper's model every negative cell has
+                ``y = b + s`` with ``s = 0``, so the maximum over negatives IS ``b`` and the guarantee
+                "negatives normalise to <= 1" is exact. With real noise it is an extreme order
+                statistic: it has no limiting value and grows with control-set size.
+      "p999" / "p99" / "p95" -- robust upper quantiles, stable in n.
+
+    ``"maximum"`` is always returned so the manuscript value stays auditable regardless of policy, and
+    ``"control_fraction_le_1"`` reports what fraction of the control population the chosen divisor
+    actually bounds (1.0 by construction for "max").
+    """
+    if statistic not in DIVISOR_STATISTICS:
+        raise ValueError(
+            f"divisor_statistic must be one of {sorted(DIVISOR_STATISTICS)}, got {statistic!r}"
+        )
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     if values.size == 0:
         raise ValueError("negative-control population is empty")
     if np.any(values < 0):
         raise ValueError("RESTORE requires nonnegative linear intensities")
-    divisor = float(values.max())
-    if divisor <= 0:
+    maximum = float(values.max())
+    if maximum <= 0:
         raise ValueError("negative-control maximum must be positive")
-    normalized = values / divisor
-    if np.any(normalized > 1 + 1e-12):
+
+    quantile = DIVISOR_STATISTICS[statistic]
+    divisor = maximum if quantile is None else float(np.quantile(values, quantile))
+    if divisor <= 0:
+        # A REDSEA-clamped background can be 0 well above the 95th percentile; falling through would
+        # raise inside normalize_and_call and surface as TECHNICAL_FAILURE, which halts a production
+        # apply. Fail here with a diagnosable message instead of a downstream divide-by-zero.
+        raise ValueError(
+            f"negative-control {statistic} is {divisor:g} (population is >= "
+            f"{100 * (quantile or 1.0):.1f}% zeros); no positive divisor can be formed"
+        )
+    if statistic == "max" and np.any(values / divisor > 1 + 1e-12):
+        # The manuscript guarantee. It holds only for the maximum -- a quantile divisor leaves the
+        # upper (1-q) tail of the control above 1 by construction, which is the point of using one.
         raise AssertionError("negative controls must normalize to <= 1")
     return {
         "n": int(values.size),
-        "maximum": divisor,
+        "divisor": divisor,
+        "statistic": statistic,
+        "maximum": maximum,
+        "control_fraction_le_1": float(np.mean(values <= divisor)),
         "mean_plus_3sd": float(values.mean() + 3.0 * values.std(ddof=0)),
         "median": float(np.median(values)),
         "p95": float(np.quantile(values, 0.95)),
@@ -997,6 +1090,7 @@ def ordered_control_groups(
     reference_group: int,
     target_floor: float,
     reference_floor: float,
+    control_definition: str = "reference_only",
 ) -> OrderedControlGroups:
     """Infer the vertical separator before selecting target-negative controls.
 
@@ -1044,9 +1138,12 @@ def ordered_control_groups(
         finite
         & qc_retained
         & (labels == reference_group)
-        & (target_raw <= target_floor)
         & (reference_raw > reference_floor)
     )
+    if control_definition == "reference_and_target":
+        # Pre-v10: additionally cap the control at the target's own input floor. This is what made the
+        # divisor (a maximum over this set) collapse onto that floor. Retained to reproduce v9.
+        reference_candidates = reference_candidates & (target_raw <= target_floor)
     if not target_population.any():
         return OrderedControlGroups(
             target_population=target_population,
@@ -1074,6 +1171,13 @@ def ordered_control_groups(
         raise AssertionError("double-low cells cannot be target-component supported")
     if np.any(target_population & ~target_supported):
         raise AssertionError("the target anchor must be included in target support")
+    # Belt-and-braces. Disjointness does NOT depend on the target-side gate that v10 removes: the
+    # anchor requires reference_raw <= reference_floor and the candidates require
+    # reference_raw > reference_floor, which are mutually exclusive whatever the labels do. The
+    # assertion is unreachable today and exists only so a future edit to the REFERENCE floor
+    # conditions cannot silently let a cell be both anchor and control.
+    if np.any(target_population & reference_candidates):
+        raise AssertionError("target anchor and reference candidates must be disjoint")
     return OrderedControlGroups(
         target_population=target_population,
         target_supported=target_supported,
@@ -1664,13 +1768,19 @@ def _spatial_agreement(
     return agreement, excess
 
 
-def _safe_control_stats(values: np.ndarray) -> dict[str, float | int]:
+def _safe_control_stats(
+    values: np.ndarray, statistic: str = "max"
+) -> dict[str, float | int]:
     try:
-        return negative_control_statistics(values)
+        return negative_control_statistics(values, statistic)
     except ValueError:
+        # Keys must mirror negative_control_statistics exactly -- callers index them unconditionally.
         return {
             "n": int(np.isfinite(values).sum()),
+            "divisor": np.nan,
+            "statistic": statistic,
             "maximum": np.nan,
+            "control_fraction_le_1": np.nan,
             "mean_plus_3sd": np.nan,
             "median": np.nan,
             "p95": np.nan,
@@ -2007,6 +2117,7 @@ def evaluate_locked_pair(
             reference_group=fit_direction.reference_group,
             target_floor=target_floor,
             reference_floor=reference_floor,
+            control_definition=config.control_definition,
         )
     controls: OrderedControlGroups = primary["ordered_controls"]
     target_population = controls.target_population
@@ -2030,14 +2141,20 @@ def evaluate_locked_pair(
         control_agreement = _binary_agreement(
             primary_control, fit_controls.reference_control.astype(np.int8)
         )
-        # The divisor this seed would produce = max target intensity in its reference control. Stability
-        # is gated on this (see below), because it is the only quantity RESTORE uses.
+        # The divisor this seed would produce, under the SAME statistic production uses. Stability is
+        # gated on this (see below), because it is the only quantity RESTORE uses -- so it must track
+        # the configured policy, not a hard-coded maximum.
         fit_control_mask = fit_controls.reference_control
-        seed_divisor = (
-            float(target_redsea[fit_control_mask].max())
-            if fit_control_mask.any()
-            else np.nan
-        )
+        seed_divisor = np.nan
+        if fit_control_mask.any():
+            try:
+                seed_divisor = float(
+                    negative_control_statistics(
+                        target_redsea[fit_control_mask], config.divisor_statistic
+                    )["divisor"]
+                )
+            except (ValueError, AssertionError):
+                seed_divisor = np.nan
         stability_rows.append(
             {
                 "seed": int(fit["seed"]),
@@ -2176,12 +2293,14 @@ def evaluate_locked_pair(
     threshold_sample_n = 0
     if reference_group != target_group and target_population.any():
         try:
+            # The reference-axis statistic is a Step-1 diagnostic, not a production divisor, so it
+            # stays on the manuscript maximum regardless of the target-side policy.
             reference_full_stats = negative_control_statistics(
                 reference_redsea[target_population]
             )
             if reference_control.any():
                 target_full_stats = negative_control_statistics(
-                    target_redsea[reference_control]
+                    target_redsea[reference_control], config.divisor_statistic
                 )
                 threshold_sample_n = min(
                     int(reference_control.sum()),
@@ -2281,11 +2400,17 @@ def evaluate_locked_pair(
     full_reference_control = np.zeros(len(donor_df), dtype=bool)
     full_reference_control[valid_idx] = reference_control
     canonical_divisor = (
-        float(target_full_stats["maximum"])
+        float(target_full_stats["divisor"])
         if assessment.state is PairState.VALID and target_full_stats is not None
         else None
     )
     candidate_divisor = (
+        float(target_full_stats["divisor"])
+        if target_full_stats is not None
+        else None
+    )
+    # The manuscript value, always reported so fidelity stays auditable whatever the policy is.
+    manuscript_divisor = (
         float(target_full_stats["maximum"])
         if target_full_stats is not None
         else None
@@ -2495,6 +2620,14 @@ def evaluate_locked_pair(
         "reference_threshold_grid": reference_grid,
         "candidate_full_maximum": candidate_divisor,
         "canonical_divisor": canonical_divisor,
+        "manuscript_divisor": manuscript_divisor,
+        "divisor_statistic": config.divisor_statistic,
+        "control_definition": config.control_definition,
+        "control_fraction_le_1": (
+            float(target_full_stats["control_fraction_le_1"])
+            if target_full_stats is not None
+            else None
+        ),
         "display_target_bounds": (
             float(display_lower[0]),
             float(display_upper[0]),
@@ -2604,6 +2737,10 @@ def locked_pair_metrics(evaluation: dict) -> dict:
         "double_high_fraction": evaluation["double_high_fraction"],
         "candidate_full_maximum": evaluation["candidate_full_maximum"],
         "canonical_divisor": evaluation["canonical_divisor"],
+        "manuscript_divisor": evaluation["manuscript_divisor"],
+        "divisor_statistic": evaluation["divisor_statistic"],
+        "control_definition": evaluation["control_definition"],
+        "control_fraction_le_1": evaluation["control_fraction_le_1"],
         "target_full_mean_plus_3sd": target_full.get("mean_plus_3sd", np.nan),
         "target_sample_maximum": target_sample.get("maximum", np.nan),
         "target_sample_maximum_q05": target_sample.get("maximum_q05", np.nan),
@@ -3148,6 +3285,20 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="baseline",
         help="predeclared candidate pair set to evaluate",
     )
+    locked.add_argument(
+        "--control-definition",
+        choices=sorted(CONTROL_DEFINITIONS),
+        default=PairValidationConfig.control_definition,
+        help="how the target-negative control is defined: reference_only (manuscript, default) or "
+             "reference_and_target (pre-v10; pins the divisor to the target's Otsu floor)",
+    )
+    locked.add_argument(
+        "--divisor-statistic",
+        choices=sorted(DIVISOR_STATISTICS),
+        default=PairValidationConfig.divisor_statistic,
+        help="statistic summarising the negative control into the divisor: max (manuscript, default) "
+             "or a robust upper quantile p999/p99/p95",
+    )
 
     joint = sub.add_parser(
         "immune-joint",
@@ -3230,6 +3381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             config=PairValidationConfig(
                 fit_cap=args.fit_cap,
                 seeds=tuple(args.seed or [0, 1, 2]),
+                control_definition=args.control_definition,
+                divisor_statistic=args.divisor_statistic,
             ),
             expression_reviews=args.expression_reviews,
             pair_reviews=args.pair_reviews,

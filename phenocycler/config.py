@@ -112,9 +112,31 @@ class PipelineConfig:
     # -- REDSEA (scripts/senior/redsea_full.py defaults) ---------------------
     redsea_downsample: float = 1.0
     redsea_edge_radius: int = 0      # 0 == the 1-px cell rim
-    redsea_comp_mode: int = 0        # 0 == subtract-only
+    redsea_comp_mode: int = 1        # 1 == subtract + reinforce (Bai et al. default); 0 == subtract-only
     redsea_alpha: float = 1.0
     redsea_gap_bridge: int = 1
+    # "donor" == published mass-conserving operator F[i,j]=contact[i,j]/B[j]; "recipient" == pre-v10.
+    redsea_norm_form: str = "donor"
+    # Skip compensation for nuclear/ECM channels (marker_taxonomy.NO_SPILLOVER).
+    redsea_exclude_no_spillover: bool = True
+
+    # -- cell QC (phenocycler.cell_qc) — applied BEFORE any parameter estimation ---------------
+    # Tier 1, hard exclusion (the object is not a cell). See cell_qc.py for the measured evidence
+    # behind each value; all are donor-local or scale-free so none normalises across donors.
+    cell_qc_min_cell_area: float = 20.0            # um^2; a 5 um disc, still below a lymphocyte
+    cell_qc_require_nucleus: bool = True           # DNA gate: no nucleus -> DAPI 0.26-0.41x normal
+    cell_qc_max_area_median_multiple: float = 4.0  # x the donor's own median retained cell area
+    cell_qc_min_cell_solidity: float = 0.70        # area/convex-hull; concave/multi-lobed objects
+    cell_qc_min_raster_area_ratio: float = 0.5     # rasterized vs reported area (geometry defect)
+    # Tier 2, excluded from ESTIMATION only — these are real cells and still get a call, but their
+    # whole-cell mean is a nuclear mean so they must not set a floor, arm, separator or divisor.
+    cell_qc_no_cytoplasm_nc_ratio: float = 0.999
+    # Duplicate-detection removal. Detection was run with selectAnnotations(), which selects the
+    # Tissue annotation AND every nested Islet_N; InstanSeg segments each selected parent
+    # independently, so islet nuclei were segmented twice. 8/20 donors, 100% of duplicates in islets.
+    cell_qc_deduplicate: bool = True
+    cell_qc_duplicate_radius_um: float = 1.0
+    cell_qc_duplicate_area_tol: float = 0.15
 
     # -- RESTORE (scripts/senior/restore_normalize.py defaults) --------------
     restore_model: str = "SSC"       # SSC | GMM | KMeans
@@ -301,6 +323,28 @@ _INI_SCHEMA = {
         "comp_mode": ("redsea_comp_mode", int),
         "alpha": ("redsea_alpha", float),
         "gap_bridge": ("redsea_gap_bridge", int),
+        "norm_form": ("redsea_norm_form", str),
+        "exclude_no_spillover": (
+            "redsea_exclude_no_spillover",
+            lambda s: str(s).lower() in ("1", "true", "yes", "on"),
+        ),
+    },
+    "cell_qc": {
+        "min_cell_area": ("cell_qc_min_cell_area", float),
+        "require_nucleus": (
+            "cell_qc_require_nucleus",
+            lambda s: str(s).lower() in ("1", "true", "yes", "on"),
+        ),
+        "max_area_median_multiple": ("cell_qc_max_area_median_multiple", float),
+        "min_cell_solidity": ("cell_qc_min_cell_solidity", float),
+        "min_raster_area_ratio": ("cell_qc_min_raster_area_ratio", float),
+        "no_cytoplasm_nc_ratio": ("cell_qc_no_cytoplasm_nc_ratio", float),
+        "deduplicate": (
+            "cell_qc_deduplicate",
+            lambda s: str(s).lower() in ("1", "true", "yes", "on"),
+        ),
+        "duplicate_radius_um": ("cell_qc_duplicate_radius_um", float),
+        "duplicate_area_tol": ("cell_qc_duplicate_area_tol", float),
     },
     "restore": {
         "model": ("restore_model", str),

@@ -817,6 +817,10 @@ def _config_from_specification(specification: dict) -> PairValidationConfig:
     parameters = dict(specification["parameters"])
     for key in ("feature_compartments", "seeds", "threshold_sample_sizes"):
         parameters[key] = tuple(parameters[key])
+    # Pre-v10 method_spec.json files predate these fields; default them to the v9 behaviour so an
+    # existing screen or pilot directory stays loadable and reproduces exactly what it recorded.
+    parameters.setdefault("control_definition", "reference_and_target")
+    parameters.setdefault("divisor_statistic", "max")
     return PairValidationConfig(**parameters)
 
 

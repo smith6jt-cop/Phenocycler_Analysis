@@ -11,7 +11,9 @@ ONLY the ROI's strips from the striped int32 label mask. Falls back to the non-s
 scatter/hist when a donor has no OME image or instance mask.
 
 "before" = the raw QuPath mean (``cfg.cells_dir``); "after" = the REDSEA mean (``cfg.cells_redsea_dir``),
-joined on ``object_id`` (never coordinates); corrected ≤ raw (subtract-only) and the two align at r ≈ 0.998.
+joined on ``object_id`` (never coordinates). NB: the r ≈ 0.998 figure quoted elsewhere is a
+RASTERISATION-FIDELITY check (REDSEA's own UNcorrected mean vs QuPath's), not raw-vs-corrected
+agreement. Actual raw-vs-REDSEA r is 0.81-0.98 and the correction removes real signal by design.
 
 Thin entry point for the notebooks::
 

@@ -10,13 +10,17 @@ pure-python pixel loops):
     data[i,ch]     = whole-cell SUM of channel ch over cell i's pixels   (np.bincount)
     edge[i,ch]     = SUM over cell i's boundary band (1-px inner rim)     (np.bincount)
     contact[i,j]   = # 8-connected pixel adjacencies between cells i,j    (sparse COO)
-    F              = row_normalize(contact)          F[i,j]=contact[i,j]/rowsum_i
+    F              = donor_normalize(contact)        F[i,j]=contact[i,j]/colsum_j
     corrected_sum  = clip( data + comp_mode*edge - alpha*(F @ edge), 0 )
     corrected_mean = corrected_sum / cell_area_px
 
-Defaults are preserved exactly: ``comp_mode=0`` (subtract-only), ``alpha=1.0``,
-``edge_radius=0`` (the 1-px cell rim), ``gap_bridge=1``.  Mask source is per-cell
-GeoJSON exported from QuPath; the qptiff is read one channel at a time.
+Defaults (METHOD v10, 2026-07-25): ``comp_mode=1`` (subtract + reinforce, the Bai et al. default),
+``norm_form="donor"`` (the published mass-conserving operator), ``alpha=1.0``, ``edge_radius=0``
+(the 1-px cell rim), ``gap_bridge=1``, and nuclear/ECM channels passed through uncorrected
+(``marker_taxonomy.NO_SPILLOVER``).  The pre-v10 defaults — ``comp_mode=0``, ``norm_form="recipient"``,
+every channel corrected — are still reachable by config/CLI to reproduce v9 artifacts; see
+``compensate`` for why they over-subtract.  Mask source is per-cell GeoJSON exported from QuPath;
+the qptiff is read one channel at a time.
 
 Additions vs. upstream:
   * config-driven paths (no hardcoded ``/home/smith6jt/...``);
@@ -55,6 +59,7 @@ from skimage.draw import polygon as draw_polygon
 from skimage.segmentation import find_boundaries
 from skimage.morphology import binary_dilation, diamond
 
+from . import marker_taxonomy
 from .config import PipelineConfig, load_config
 from .gpu import get_backend
 from .parallel import map_donors
@@ -72,9 +77,13 @@ class RedseaParams:
     """The per-run REDSEA knobs (picklable; carried into worker processes)."""
     downsample: float = 1.0
     edge_radius: int = 0
-    comp_mode: int = 0
+    comp_mode: int = 1
     alpha: float = 1.0
     gap_bridge: int = 1
+    # "donor" == the published Bai et al. operator (mass-conserving); "recipient" == the pre-v10 form.
+    norm_form: str = "donor"
+    # Skip compensation for markers with no lateral membrane spillover (marker_taxonomy.NO_SPILLOVER).
+    exclude_no_spillover: bool = True
     keep_mask: bool = False
     save_intermediates: bool = False
     use_gpu: bool = False
@@ -95,6 +104,8 @@ class RedseaParams:
             comp_mode=cfg.redsea_comp_mode,
             alpha=cfg.redsea_alpha,
             gap_bridge=cfg.redsea_gap_bridge,
+            norm_form=cfg.redsea_norm_form,
+            exclude_no_spillover=cfg.redsea_exclude_no_spillover,
             use_gpu=cfg.use_gpu,
             gpu_device=cfg.gpu_device,
         )
@@ -265,6 +276,31 @@ def parse_alpha_per_channel(spec, cols, default):
     return a
 
 
+def apply_no_spillover_mask(params, cols, alpha, comp_mode):
+    """Zero ``alpha`` and ``comp_mode`` for channels REDSEA must not touch.
+
+    Returns ``(alpha, comp_mode, n_skipped)``. Both are promoted to length-C vectors only when at least
+    one channel is excluded, so a run with ``exclude_no_spillover=False`` keeps the scalar fast path and
+    stays byte-identical to the pre-v10 behaviour.
+
+    Setting both terms to 0 makes ``corrected_sum = data + 0*edge - 0*(F @ edge) = data`` for that
+    channel — a pure passthrough. The column is still WRITTEN, so the parquet schema is unchanged
+    (``load_validation_sample`` reads every ``QUPATH_MARKERS`` entry and ``reconcile_existing_donor``
+    compares Arrow schemas for equality).
+    """
+    if not getattr(params, "exclude_no_spillover", True):
+        return alpha, comp_mode, 0
+    keep = marker_taxonomy.spillover_corrected_mask(cols)
+    n_skipped = int((~keep).sum())
+    if n_skipped == 0:
+        return alpha, comp_mode, 0
+    alpha_vec = np.where(keep, np.broadcast_to(np.asarray(alpha, dtype=np.float64), (len(cols),)), 0.0)
+    comp_vec = np.where(keep, np.broadcast_to(np.asarray(comp_mode), (len(cols),)), 0)
+    log(f"  [no-spillover] {n_skipped} channel(s) pass through uncorrected: "
+        f"{[c for c, k in zip(cols, keep) if not k]}")
+    return alpha_vec, comp_vec, n_skipped
+
+
 def build_gate(params, cols):
     """Config for the receptivity (directional) gate, or None when disabled. `channels` is a bool[C]
     mask of the aggressor channels to gate (default the keratins + Vimentin); other channels always
@@ -313,24 +349,49 @@ def receptivity_weight(data, edge, sizes, bandcount, gate):
     return np.where(gate["channels"][None, :], w, 1.0)
 
 
-def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None, backend=None):
+def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None, backend=None,
+               norm_form="donor"):
     """REDSEA compensation. corrected_sum = data + comp_mode*edge - (alpha [* w]) * (F @ edge), clamp>=0.
-      comp_mode=1 : subtract + reinforce (redseapy default)
+      comp_mode=1 : subtract + reinforce (redseapy default, and ours since 2026-07-25)
       comp_mode=0 : subtract only (remove incoming neighbour spillover; no reinforce)
-    F is row-normalized contact (F[i,j]=contact[i,j]/rowsum_i); isolated cells -> F row 0 (passthrough).
 
-    ``alpha`` : scalar OR length-C vector (per-channel subtraction strength), broadcast over the columns
-                of (F @ edge) [N×C].
-    ``gate``  : None (w=1) or a receptivity-gate config from :func:`build_gate` (needs ``bandcount``)
-                that protects bright-interior cells channel-wise.
+    ``norm_form`` selects how the contact matrix is normalized into ``F``:
+      "donor"     : F[i,j] = contact[i,j] / B[j]   — the share of NEIGHBOUR j's boundary that faces i.
+                    This is the published operator (Bai et al. 2021). It is mass-conserving:
+                    ``sum_i F[i,j] * edge[j] == edge[j]``, i.e. j's rim signal is redistributed among
+                    its neighbours in proportion to shared perimeter and nothing is invented.
+      "recipient" : F[i,j] = contact[i,j] / B[i]   — rows sum to 1, so cell i subtracts a contact-
+                    weighted AVERAGE of its neighbours' whole rim sums regardless of how much perimeter
+                    it actually shares with them. Not mass-conserving; over-subtracts. This was the
+                    default through METHOD v9 and is retained only to reproduce those artifacts.
+
+    Why the published form was not obvious: ``redseapy`` builds ``comp*I - M[i,j]/B[j]`` and then
+    transposes it (``redsea.py:219``), which looks like it yields the recipient form — but it applies the
+    result as ``transpose(dot(transpose(E), P))`` (``redsea.py:294``), i.e. ``P.T @ E = A @ E``, undoing
+    the transpose. The net operator is the donor form.
+
+    Since ``M`` is symmetric, ``B = M.sum(0) == M.sum(1)``; the two forms differ whenever neighbouring
+    cells have unequal total contact perimeter, and coincide in a regular tiling.
+
+    ``alpha``     : scalar OR length-C vector (per-channel subtraction strength), broadcast over the
+                    columns of (F @ edge) [N×C]. A 0 entry disables subtraction for that channel.
+    ``comp_mode`` : scalar OR length-C vector, broadcast over the columns of ``edge``. Setting both
+                    ``alpha[c] = 0`` and ``comp_mode[c] = 0`` makes channel c a pure passthrough
+                    (corrected == raw), which is how markers with no lateral spillover are excluded
+                    (see ``marker_taxonomy.NO_SPILLOVER``).
+    ``gate``      : None (w=1) or a receptivity-gate config from :func:`build_gate` (needs ``bandcount``)
+                    that protects bright-interior cells channel-wise.
     ``backend`` (optional): a :class:`phenocycler.gpu.Backend`; when on GPU the sparse ``F @ edge``
-                matmul runs on the device. The GPU fast path is taken ONLY for the default (scalar
-                alpha, no gate) call; gated / per-channel-alpha calls fall through to the CPU branch
-                (correct, since data/edge/sizes/M are already NumPy there).
+                matmul runs on the device. The GPU fast path is taken ONLY for a scalar-alpha, ungated
+                call; gated / per-channel-alpha calls fall through to the CPU branch (correct, since
+                data/edge/sizes/M are already NumPy there).
 
-    The DEFAULT call (scalar ``alpha``, ``gate=None``, and a CPU/``None`` backend) is BYTE-IDENTICAL to
-    the original single-alpha REDSEA — it executes the exact same expression.
+    A scalar-``alpha``, ungated, ``norm_form="recipient"`` call on CPU is BYTE-IDENTICAL to the original
+    single-alpha REDSEA — it executes the exact same expression.
     Returns (corrected_mean[N,C], clamp_frac[C], n_isolated)."""
+    if norm_form not in ("donor", "recipient"):
+        raise ValueError(f"norm_form must be 'donor' or 'recipient', got {norm_form!r}")
+
     if (backend is not None and backend.on_gpu
             and gate is None and np.ndim(alpha) == 0):  # pragma: no cover - GPU only
         xp = backend.xp
@@ -342,7 +403,7 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None
         inv = xp.zeros_like(rowsum)
         nz = rowsum > 0
         inv[nz] = 1.0 / rowsum[nz]
-        F = backend.diags(inv) @ Mg
+        F = Mg @ backend.diags(inv) if norm_form == "donor" else backend.diags(inv) @ Mg
         corrected_sum = d + comp_mode * e - alpha * (F @ e)
         xp.clip(corrected_sum, 0, None, out=corrected_sum)
         corrected = corrected_sum / s[:, None]
@@ -356,7 +417,9 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None
     inv = np.zeros_like(rowsum)
     nz = rowsum > 0
     inv[nz] = 1.0 / rowsum[nz]
-    F = sp.diags(inv) @ M                            # rows sum to 1 (recipient form)
+    # donor form: divide column j by neighbour j's total contact perimeter B[j] (published, conserving).
+    # recipient form: divide row i by i's own total contact perimeter B[i] (rows sum to 1; legacy).
+    F = (M @ sp.diags(inv)) if norm_form == "donor" else (sp.diags(inv) @ M)
     if gate is None and np.ndim(alpha) == 0:
         # DEFAULT path — identical expression to the original single-alpha REDSEA (bit-for-bit).
         corrected_sum = data + comp_mode * edge - alpha * (F @ edge)
@@ -651,12 +714,14 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
     # 5) compensate (scalar alpha + no gate by default; optional per-channel vector + brightness gate)
     alpha = parse_alpha_per_channel(params.alpha_per_channel, cols, params.alpha)
     alpha = params.alpha if alpha is None else alpha
+    comp_mode = params.comp_mode
+    alpha, comp_mode, n_skipped = apply_no_spillover_mask(params, cols, alpha, comp_mode)
     corrected, clamp_frac, n_isolated = compensate(
-        data, edge, sizes, M, params.comp_mode, alpha,
-        bandcount=bandcount, gate=gate, backend=backend)
-    log(f"[{donor}] compensate(mode={params.comp_mode}, "
-        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}): "
-        f"{n_isolated} isolated cells")
+        data, edge, sizes, M, comp_mode, alpha,
+        bandcount=bandcount, gate=gate, backend=backend, norm_form=params.norm_form)
+    log(f"[{donor}] compensate(mode={params.comp_mode}, norm={params.norm_form}, "
+        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}, "
+        f"uncorrected_channels={n_skipped}): {n_isolated} isolated cells")
 
     # alignment sanity vs the existing parquet (correlation of UNcorrected mean)
     uncorr = np.where(sizes[:, None] > 0, data / np.where(sizes[:, None] == 0, 1, sizes[:, None]), np.nan)
@@ -719,12 +784,14 @@ def recompensate_from_intermediates(donor: str, cfg: PipelineConfig, params: Red
         bandcount = bandcount_from_mask(mask, len(oids), params.edge_radius)
         log(f"[{donor}] recomputed bandcount from mask")
     del mask
+    comp_mode = params.comp_mode
+    alpha, comp_mode, n_skipped = apply_no_spillover_mask(params, cols, alpha, comp_mode)
     corrected, clamp_frac, n_iso = compensate(
-        data, edge, sizes, M, params.comp_mode, alpha,
-        bandcount=bandcount, gate=gate, backend=backend)
-    log(f"[{donor}] recompensate(mode={params.comp_mode}, "
-        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}): "
-        f"{n_iso} isolated")
+        data, edge, sizes, M, comp_mode, alpha,
+        bandcount=bandcount, gate=gate, backend=backend, norm_form=params.norm_form)
+    log(f"[{donor}] recompensate(mode={params.comp_mode}, norm={params.norm_form}, "
+        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}, "
+        f"uncorrected_channels={n_skipped}): {n_iso} isolated")
     write_corrected(cfg, donor, oids, cols, corrected, sizes)
     return donor
 
@@ -762,7 +829,13 @@ def main(argv=None):
     ap.add_argument("--edge-radius", type=int, default=None,
                     help="boundary band dilation radius (px); 0 = the 1-px cell rim")
     ap.add_argument("--comp-mode", type=int, default=None, choices=[0, 1],
-                    help="0=subtract only (default); 1=subtract+reinforce")
+                    help="1=subtract+reinforce (default, Bai et al.); 0=subtract only (pre-v10)")
+    ap.add_argument("--norm-form", default=None, choices=["donor", "recipient"],
+                    help="contact normalisation: donor=contact[i,j]/B[j] (published, mass-conserving, "
+                         "default); recipient=contact[i,j]/B[i] (pre-v10, rows sum to 1)")
+    ap.add_argument("--no-exclude-no-spillover", action="store_true",
+                    help="correct EVERY channel including nuclear/ECM (pre-v10 behaviour); by default "
+                         "marker_taxonomy.NO_SPILLOVER channels pass through uncorrected")
     ap.add_argument("--alpha", type=float, default=None, help="spillover subtraction strength")
     ap.add_argument("--alpha-per-channel", default=None,
                     help="per-channel subtraction strengths, e.g. "
@@ -796,9 +869,12 @@ def main(argv=None):
 
     over = {}
     for k, src in [("downsample", a.downsample), ("edge_radius", a.edge_radius),
-                   ("comp_mode", a.comp_mode), ("alpha", a.alpha), ("gap_bridge", a.gap_bridge)]:
+                   ("comp_mode", a.comp_mode), ("alpha", a.alpha), ("gap_bridge", a.gap_bridge),
+                   ("norm_form", a.norm_form)]:
         if src is not None:
             over[k] = src
+    if a.no_exclude_no_spillover:
+        over["exclude_no_spillover"] = False
     params = RedseaParams.from_config(cfg, keep_mask=a.keep_mask,
                                       save_intermediates=a.save_intermediates,
                                       alpha_per_channel=a.alpha_per_channel,

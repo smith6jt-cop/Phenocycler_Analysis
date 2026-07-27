@@ -18,7 +18,10 @@ exactly with no centroid rounding.
 
 ### Producing the inputs (upstream)
 
-1. Process raw images with [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)
+1. **NOT USED for this cohort** (maintainer, 2026-07-25): the images here were processed by the
+   Akoya instrument only (`ImageProcessingApplied=OffsetAndShading`,
+   `AutofluorescenceSubtracted=True` in the qptiff XML). The chain below describes
+   [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)
    (illumination correction → stitching → deconvolution → EDF → registration →
    autofluorescence removal).
 2. In QuPath: run cell detection/segmentation, then

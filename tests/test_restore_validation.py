@@ -543,6 +543,108 @@ def test_sampled_maximum_grid_preserves_full_maximum_as_diagnostic_reference():
     assert (grid["maximum_to_full"] <= 1.0).all()
 
 
+def test_control_definition_admits_reference_component_double_high_cells():
+    """v10: the control is defined by the REFERENCE marker alone, so a double-high cell whose NNMF
+    label is the reference component now enters it — and raises the divisor accordingly.
+
+    This is the behaviour change that decouples the divisor from the target's Otsu floor. Under the
+    pre-v10 `reference_and_target` definition the control was capped at that floor, so the maximum
+    over it could not exceed the floor: measured median divisor/target_input_floor = 1.044 across the
+    49 Gate-3 donor-pairs.
+    """
+    kwargs = dict(
+        #                       cell:   0    1    2      3    4
+        target_raw=np.array([100.0, 90.0, 1.0, 2.0, 500.0]),
+        reference_raw=np.array([1.0, 2.0, 100.0, 80.0, 100.0]),
+        target_redsea=np.array([100.0, 90.0, 1.0, 2.0, 500.0]),
+        reference_redsea=np.array([1.0, 2.0, 100.0, 80.0, 100.0]),
+        #             cells 2,3,4 are in the reference component; cell 4 is DOUBLE-HIGH
+        labels=np.array([1, 1, 0, 0, 0]),
+        qc_retained=np.ones(5, dtype=bool),
+        target_group=1,
+        reference_group=0,
+        target_floor=10.0,
+        reference_floor=10.0,
+    )
+
+    legacy = rv.ordered_control_groups(**kwargs, control_definition="reference_and_target")
+    manuscript = rv.ordered_control_groups(**kwargs, control_definition="reference_only")
+
+    # Cell 4 (target_raw 500 > floor 10) is excluded by the legacy target-side cap, admitted by v10.
+    assert legacy.reference_candidates.tolist() == [False, False, True, True, False]
+    assert manuscript.reference_candidates.tolist() == [False, False, True, True, True]
+
+    legacy_divisor = rv.negative_control_statistics(
+        kwargs["target_redsea"][legacy.reference_control]
+    )["divisor"]
+    manuscript_divisor = rv.negative_control_statistics(
+        kwargs["target_redsea"][manuscript.reference_control]
+    )["divisor"]
+    assert legacy_divisor == 2.0            # capped at the target floor, as the defect predicts
+    assert manuscript_divisor == 500.0      # set by the real double-high control cell
+    assert manuscript_divisor > kwargs["target_floor"]
+
+
+def test_anchor_and_controls_stay_disjoint_without_the_target_side_gate():
+    """Removing the target-side gate cannot make the anchor and the control overlap.
+
+    Disjointness never rested on it: the anchor requires reference_raw <= reference_floor and the
+    candidates require reference_raw > reference_floor, which are mutually exclusive whatever the NNMF
+    labels do — even for a degenerate fit that collapses both groups onto one component.
+    """
+    result = rv.ordered_control_groups(
+        target_raw=np.array([100.0, 100.0]),
+        reference_raw=np.array([1.0, 100.0]),
+        target_redsea=np.array([100.0, 100.0]),
+        reference_redsea=np.array([1.0, 100.0]),
+        labels=np.array([0, 0]),              # collapsed fit: both groups are component 0
+        qc_retained=np.ones(2, dtype=bool),
+        target_group=0,
+        reference_group=0,
+        target_floor=10.0,
+        reference_floor=10.0,
+        control_definition="reference_only",
+    )
+    assert not np.any(result.target_population & result.reference_candidates)
+
+
+@pytest.mark.parametrize(
+    "statistic,expected",
+    [("max", 100.0), ("p999", 99.9), ("p99", 99.0), ("p95", 95.0)],
+)
+def test_divisor_statistic_selects_the_summary(statistic, expected):
+    values = np.arange(1, 101, dtype=float)      # 1..100
+    stats = rv.negative_control_statistics(values, statistic)
+    assert np.isclose(stats["divisor"], expected, rtol=0, atol=0.15)
+    assert stats["statistic"] == statistic
+    assert stats["maximum"] == 100.0             # manuscript value always reported
+    assert 0 < stats["control_fraction_le_1"] <= 1.0
+
+
+def test_manuscript_invariant_holds_only_for_the_maximum():
+    """negatives <= 1 is exact for `max` and false by construction for a quantile — that is the point."""
+    values = np.arange(1, 101, dtype=float)
+    assert rv.negative_control_statistics(values, "max")["control_fraction_le_1"] == 1.0
+    p95 = rv.negative_control_statistics(values, "p95")
+    assert p95["control_fraction_le_1"] < 1.0
+    assert (values > p95["divisor"]).sum() > 0
+
+
+def test_quantile_divisor_of_a_mostly_zero_control_fails_diagnosably():
+    """A REDSEA-clamped background can be 0 above the 95th percentile; fail here, not downstream."""
+    values = np.concatenate([np.zeros(99), [50.0]])
+    with pytest.raises(ValueError, match="zeros"):
+        rv.negative_control_statistics(values, "p95")
+    assert rv.negative_control_statistics(values, "max")["divisor"] == 50.0
+
+
+def test_unknown_control_definition_and_divisor_statistic_are_rejected():
+    with pytest.raises(ValueError, match="control_definition"):
+        rv.PairValidationConfig(control_definition="reference_or_target")
+    with pytest.raises(ValueError, match="divisor_statistic"):
+        rv.PairValidationConfig(divisor_statistic="p90")
+
+
 def test_method_specification_is_json_native_and_declares_data_roles():
     config = rv.PairValidationConfig()
     specification = config.specification()
@@ -556,11 +658,20 @@ def test_method_specification_is_json_native_and_declares_data_roles():
         rv.MAX_LINEAR_OTSU_TRIANGLE_FLOOR
     )
     assert specification["marker_input_floor_methods"]["CD31"] == rv.LINEAR_OTSU_FLOOR
-    assert "full maximum" in specification["divisor_policy"]
+    assert f"divisor_statistic={config.divisor_statistic}" in specification["divisor_policy"]
+    assert "manuscript_divisor" in specification["divisor_policy"]
+    assert (
+        f"control_definition={config.control_definition}"
+        in specification["control_definition_policy"]
+    )
     assert "vertical reference separator" in specification["ordered_control_policy"]
     assert "input-QC-retained" in specification["ordered_control_policy"]
     assert "double-low" in specification["calling_policy"]
-    assert "even below the horizontal divisor" in specification["calling_policy"]
+    # The call has been divisor-gated only since METHOD v7; the spec described the removed v6 rescue
+    # until v10. Pin the CORRECT semantics, and assert the stale phrasing is gone so it cannot return.
+    assert "positive if and only if normalized > 1" in specification["calling_policy"]
+    assert "NOT called positive" in specification["calling_policy"]
+    assert "even below the horizontal divisor" not in specification["calling_policy"]
     assert "ACCEPTED" in specification["pair_acceptance_policy"]
 
 
@@ -606,7 +717,6 @@ def test_locked_pair_assigns_all_cells_but_uses_double_low_qc_only_for_fitting()
         fit_cap=60,
         threshold_sample_sizes=(5, 10),
         threshold_resamples=10,
-        min_control_jaccard=0.8,
     )
     result = rv.evaluate_locked_pair(
         frame,
@@ -682,7 +792,6 @@ def test_reference_frequency_rule_is_pure_proportion_diagnostic():
         fit_cap=400,
         threshold_sample_sizes=(5, 10),
         threshold_resamples=10,
-        min_control_jaccard=0.8,
     )
     # reference arm smaller than target arm -> the inverted-fit case -> undersized
     undersized = rv.evaluate_locked_pair(
@@ -732,7 +841,6 @@ def test_reference_frequency_rule_has_no_absolute_floor():
         fit_cap=200,
         threshold_sample_sizes=(3, 5),
         threshold_resamples=10,
-        min_control_jaccard=0.8,
     )
     result = rv.evaluate_locked_pair(
         _asymmetric_pair_frame(rng, target_arm=8, reference_arm=40),
@@ -1168,9 +1276,23 @@ def test_review_figure_uses_large_fonts_and_nonoverlapping_legend_band():
 
 
 def test_review_shortlist_has_one_rationale_per_unique_pair():
-    assert len(rpr.SHORTLIST_PAIRS) == 11
+    assert len(rpr.SHORTLIST_PAIRS) == 13      # 11 + the two accepted pairs added 2026-07-25
     assert len(set(rpr.SHORTLIST_PAIRS)) == len(rpr.SHORTLIST_PAIRS)
     assert set(rpr.SHORTLIST_PAIRS) == set(rpr.PAIR_RATIONALE)
+
+
+def test_every_accepted_pair_has_a_review_surface():
+    """A pair cannot reach production without a PDF/QuPath review surface.
+
+    This silently failed between the Gate-2 reference freeze and 2026-07-25: SHORTLIST_PAIRS was
+    frozen beforehand, so CD68<-E_cadherin and CD11b<-EpCAM ran in production unreviewable, while the
+    shortlist reviewed the CD68/CD11b references the reference dossier went on to REJECT. Enforced at
+    import in restore_pair_review; asserted here so the intent is visible.
+    """
+    missing = set(rv.ACCEPTED_PAIRS) - set(rpr.SHORTLIST_PAIRS)
+    assert not missing, f"accepted pairs with no review surface: {sorted(missing)}"
+    assert ("CD68", "E_cadherin") in rpr.SHORTLIST_PAIRS
+    assert ("CD11b", "EpCAM") in rpr.SHORTLIST_PAIRS
 
 
 def test_qupath_importer_is_rendered_with_bundle_csv_path(tmp_path):

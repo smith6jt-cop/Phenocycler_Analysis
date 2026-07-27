@@ -25,6 +25,7 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
 from .restore_validation import (  # noqa: E402
+    ACCEPTED_PAIRS,
     ExpressionReview,
     MARKER_INPUT_FLOOR_METHODS,
     METHOD_VERSION,
@@ -51,6 +52,13 @@ SHORTLIST_PAIRS: tuple[tuple[str, str], ...] = (
     ("CD68", "CD3e"),
     ("CD11b", "Pan_Cytokeratin"),
     ("CD11b", "CD3e"),
+    # Added 2026-07-25. The shortlist was frozen BEFORE the Gate-2 reference decision and never
+    # re-synced, so the two references that were ultimately ACCEPTED for CD68 and CD11b had no review
+    # surface at all -- while the shortlist did review CD68<-CD3e, CD11b<-CD3e and
+    # CD11b<-Pan_Cytokeratin, which the reference dossier then REJECTED. Enforced by the
+    # ACCEPTED_PAIRS-subset invariant below.
+    ("CD68", "E_cadherin"),
+    ("CD11b", "EpCAM"),
 )
 
 PAIR_RATIONALE: dict[tuple[str, str], str] = {
@@ -65,7 +73,28 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
     ("CD68", "CD3e"): "lymphoid reference replacing CD20, which is too sparse to be a negative control",
     ("CD11b", "Pan_Cytokeratin"): "best fixed-reference availability; epithelial adjacency risk",
     ("CD11b", "CD3e"): "lymphoid reference replacing CD20; myeloid/T exclusion at a usable arm size",
+    ("CD68", "E_cadherin"): "ACCEPTED production pair (Gate-2 frozen, median reference/target ratio "
+                            "7.38x); epithelial adjacency risk. Added to the shortlist 2026-07-25 -- "
+                            "it had been in production with no image-review surface",
+    ("CD11b", "EpCAM"): "ACCEPTED production pair (Gate-2 maintainer override of the marginal "
+                        "E_cadherin baseline, median ratio 3.66x). Added to the shortlist "
+                        "2026-07-25 -- it had been in production with no image-review surface, and "
+                        "it carries the worst diagnostics in the accepted set (divisor spread 23x, "
+                        "anchor_recovery down to 0.146, and the 6591 inverted fit)",
 }
+
+# Every pair that reaches production MUST have an image-review surface. Enforced at import so the
+# shortlist can never drift away from ACCEPTED_PAIRS again (it silently did between the Gate-2
+# reference freeze and 2026-07-25, leaving CD68<-E_cadherin and CD11b<-EpCAM unreviewable).
+_missing_review_surface = sorted(set(ACCEPTED_PAIRS) - set(SHORTLIST_PAIRS))
+if _missing_review_surface:
+    raise ImportError(
+        "every accepted production pair needs a review surface; SHORTLIST_PAIRS is missing "
+        f"{_missing_review_surface}"
+    )
+_missing_rationale = sorted(set(SHORTLIST_PAIRS) - set(PAIR_RATIONALE))
+if _missing_rationale:
+    raise ImportError(f"SHORTLIST_PAIRS entries without a rationale: {_missing_rationale}")
 
 # 2026-07-23: the positive CALL is divisor-gated (target > Step 2 divisor). Cells in the NNMF target
 # component that sit at or below the Step 2 divisor are RETAINED and shown, but NOT called -- code 5's
@@ -162,6 +191,10 @@ def _config_from_specification(specification: dict) -> PairValidationConfig:
     parameters = dict(specification["parameters"])
     for key in ("feature_compartments", "seeds", "threshold_sample_sizes"):
         parameters[key] = tuple(parameters[key])
+    # Pre-v10 method_spec.json files predate these fields; default them to the v9 behaviour so an
+    # existing screen or pilot directory stays loadable and reproduces exactly what it recorded.
+    parameters.setdefault("control_definition", "reference_and_target")
+    parameters.setdefault("divisor_statistic", "max")
     return PairValidationConfig(**parameters)
 
 
@@ -459,12 +492,16 @@ def project_review_crop(
         & (target_raw > target_floor)
         & (reference_raw <= reference_floor)
     )
+    # Must mirror restore_validation.ordered_control_groups exactly, or _validate_projection_overlap
+    # raises "full-cell crop projection does not reproduce sample classifications" on any crop holding
+    # a reference-component double-high cell. The evaluation records which definition produced it.
     reference_candidates = (
         qc_retained
         & (labels == evaluation["reference_group"])
-        & (target_raw <= target_floor)
         & (reference_raw > reference_floor)
     )
+    if evaluation.get("control_definition", "reference_and_target") == "reference_and_target":
+        reference_candidates = reference_candidates & (target_raw <= target_floor)
     separator = evaluation["reference_separator"]
     if separator is None:
         target_supported = np.zeros(len(valid_idx), dtype=bool)

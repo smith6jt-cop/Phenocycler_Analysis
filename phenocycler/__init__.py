@@ -36,6 +36,11 @@ from .config import (
 )
 from . import marker_taxonomy
 
+# NB: `cell_qc` is deliberately NOT imported here. It is runnable as `python -m phenocycler.cell_qc`,
+# and an eager package-level import makes it appear in sys.modules before runpy executes it, which
+# raises a RuntimeWarning about unpredictable behaviour. Same reason redsea/restore_validation are
+# not imported here either. Import it explicitly: `from phenocycler import cell_qc`.
+
 __all__ = [
     "PipelineConfig", "load_config",
     "COMPARTMENT_ORDER", "COMPARTMENT_GATES", "COMPARTMENT_COLORS", "COMPARTMENT_ABBR", "OTHER_LABEL",

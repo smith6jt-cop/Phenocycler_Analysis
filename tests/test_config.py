@@ -32,7 +32,9 @@ def test_restore_apply_input_paths():
 
 def test_scientific_defaults():
     cfg = load_config()
-    assert cfg.redsea_comp_mode == 0
+    assert cfg.redsea_comp_mode == 1          # subtract + reinforce (METHOD v10, 2026-07-25)
+    assert cfg.redsea_norm_form == "donor"    # published mass-conserving contact normalisation
+    assert cfg.redsea_exclude_no_spillover is True
     assert cfg.redsea_alpha == 1.0
     assert cfg.redsea_edge_radius == 0
     assert cfg.restore_model == "SSC"

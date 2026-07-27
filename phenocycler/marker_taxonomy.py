@@ -78,10 +78,47 @@ TYPE = [
 # (PROCESS above), no longer an Endocrine gate. Endocrine = E-cadherin+ epithelial that is hormone+
 # (INS/GCG/SST); the old bright-CD99 gate + CD99_BRIGHT constant are removed.
 
+# --- NO_SPILLOVER markers: REDSEA must NOT correct these -------------------------------------------
+# REDSEA compensates *lateral* spillover across a shared cell boundary: it subtracts a contact-weighted
+# share of each neighbour's 1-px boundary-band signal. That model only makes sense for a marker whose
+# signal actually reaches the boundary. A nuclear marker's signal sits at the centre of the cell, so the
+# neighbour's band cannot contain its spillover — subtracting there removes real signal and nothing else.
+# Measured on the comp_mode=0 run: DAPI lost 23–30% of its cohort median and 4–10% of cells were clamped
+# to exactly zero, purely as an artifact of correcting a marker the method was never meant to touch.
+# Bai et al. 2021 expose ``markers_of_interest`` for exactly this reason; this list is our equivalent.
+#
+# Collagen IV is here for a different reason: it is basement-membrane ECM, already declared a ``MASK``
+# above, and is not a per-cell signal at all — its "spillover" is the whole measurement.
+#
+# Scope decision (maintainer, 2026-07-25): exclude nuclear + ECM ONLY. Cytoskeletal, filament, granule
+# and cytoplasmic markers KEEP the correction, because their signal is sub-membranous or fills the cell
+# body and therefore does reach the shared boundary. That also leaves all seven RESTORE gate markers
+# corrected, so a REDSEA change cannot confound a RESTORE threshold sweep.
+NO_SPILLOVER = [
+    # nuclear — signal is centred, never at the shared membrane
+    "DAPI", "Ki67", "PCNA", "FOXP3", "TCF_1", "TOX", "SOX2", "TP63",
+    # ECM — not a per-cell signal
+    "Collagen_IV",
+]
+
 _TYPE = set(TYPE)
 _PROCESS = set(PROCESS)
 _EXCLUDED = set(EXCLUDED)
 _MASK = set(MASK)
+_NO_SPILLOVER = set(NO_SPILLOVER)
+
+
+def spillover_corrected_mask(cols):
+    """Boolean mask over `cols`: True where REDSEA compensation should be applied.
+
+    `cols` are sanitized panel channel names in acquisition order (``redsea.SANITIZE`` output), so the
+    returned mask lines up with the columns of REDSEA's ``data``/``edge`` matrices. Unknown channels
+    default to True (corrected) — the conservative choice, matching the pre-2026-07-25 behaviour where
+    every channel was corrected.
+    """
+    import numpy as np
+
+    return np.array([c not in _NO_SPILLOVER for c in cols], dtype=bool)
 
 
 def heatmap_markers(available):
