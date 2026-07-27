@@ -6,11 +6,14 @@ Idempotent ``run_step`` (skips a stage when its outputs already exist unless
 ``force=True``) + a final status table, in-process against the ``phenocycler``
 package.  Stage order:
 
-    cells → redsea → restore → lineage → qupath → figures
+    cells → cell_qc → redsea → restore → proliferation → restore_diag → lineage → qupath → figures
 
-``restore`` thresholds every marker in ONE pass (curated directional pairs); ``lineage`` is the ordered
-residual gating tree (5 compartments + explicit ``Other``). The old ``restore_extra`` + ``hormone_floor``
-stages were removed with the curated multi-pair redesign.
+``cell_qc`` applies the Tier-1 single-cell exclusions to the canonical cell set BEFORE any parameter is
+estimated (every RESTORE floor, arm, separator and divisor is estimated over ``data/cells``, and the
+divisor is an order statistic, so one bad object sets a donor-wide threshold). ``restore`` thresholds
+every accepted pair in ONE pass; ``lineage`` is the ordered residual gating tree (5 compartments +
+explicit ``Other``). The old ``restore_extra`` + ``hormone_floor`` stages were removed with the curated
+multi-pair redesign.
 
     python -m phenocycler.pipeline                       # run every missing step
     python -m phenocycler.pipeline --only lineage figures
@@ -32,6 +35,7 @@ from .config import PipelineConfig, load_config
 # step name -> (output pattern under data_dir, human label) for the status table
 STAGES = [
     ("cells", "cells/donor_id=*", "Raw cells (DuckDB)"),
+    ("cell_qc", "cell_qc/donor_id=*", "Cell QC (Tier 1 applied)"),
     ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
     ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (accepted pairs)"),
     ("proliferation", "restore_gated_proliferation/donor_id=*", "Proliferation (Ki67/PCNA bimodal)"),
@@ -41,7 +45,8 @@ STAGES = [
     ("figures", "phenotype/celltype_marker_dotplot.png", "Identity QC figures"),
 ]
 
-ORDER = ["cells", "redsea", "restore", "proliferation", "restore_diag", "lineage", "qupath", "figures"]
+ORDER = ["cells", "cell_qc", "redsea", "restore", "proliferation", "restore_diag", "lineage",
+         "qupath", "figures"]
 
 
 def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
@@ -108,10 +113,26 @@ def _run_restore_diagnostic(cfg: PipelineConfig) -> None:
 
 
 def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
-    from . import (cells_parquet, redsea, restore, restore_apply, lineage, qupath_export, figures)
+    from . import (cells_parquet, cell_qc, redsea, restore, restore_apply, lineage, qupath_export,
+                   figures)
 
     def _cells():
         cells_parquet.build_cells_parquet(cfg)
+
+    def _cell_qc():
+        # `apply=True` filters data/cells in place, moving the originals to cells_preqc/. That is
+        # only correct against an UNfiltered canonical set: re-running it over already-filtered cells
+        # would recompute donor-relative thresholds (the 4x-median area ceiling) on the survivors and
+        # report a meaningless exclusion rate. The backup is never overwritten
+        # (`cell_qc.apply_qc_to_canonical`), so nothing is lost — but refuse rather than mislead.
+        if (cfg.data_dir / "cells_preqc").exists():
+            raise SystemExit(
+                f"[cell_qc] {cfg.data_dir / 'cells_preqc'} already exists, so data/cells is already "
+                "filtered. Re-running would estimate donor-relative thresholds on the survivors. "
+                "To genuinely redo QC, restore cells_preqc/ over cells/ first; to only refresh the "
+                "report, run `python -m phenocycler.cell_qc --all` (no --apply)."
+            )
+        cell_qc.run_cell_qc(cfg, cfg.discover_donors(), apply=True)
 
     def _redsea():
         params = redsea.RedseaParams.from_config(cfg)
@@ -141,6 +162,7 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
     # (func, existence-pattern, column-checker).
     steps = {
         "cells": (_cells, "cells/donor_id=*", None),
+        "cell_qc": (_cell_qc, "cell_qc/donor_id=*", None),
         "redsea": (_redsea, "cells_redsea/donor_id=*", None),
         "restore": (_restore, "restore_gated_redsea/donor_id=*", None),
         "proliferation": (_proliferation, "restore_gated_proliferation/donor_id=*", None),

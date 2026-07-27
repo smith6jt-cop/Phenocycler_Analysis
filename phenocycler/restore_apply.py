@@ -56,6 +56,8 @@ from .cohort import ensure_eligible_donors
 from .parallel import map_donors
 from .restore_validation import (
     ACCEPTED_PAIRS,
+    CONTROL_DEFINITIONS,
+    DIVISOR_STATISTICS,
     METHOD_VERSION,
     ExpressionReview,
     PairReview,
@@ -84,6 +86,30 @@ assert CALLABLE_STATES | HARD_FAIL_STATES == frozenset(PairState)
 
 # the 7 target markers emitted into the gated parquet (one per accepted pair), in ACCEPTED_PAIRS order
 REQUIRED_TARGETS: tuple[str, ...] = tuple(target for target, _ in ACCEPTED_PAIRS)
+
+
+def config_from_pipeline(cfg: PipelineConfig) -> PairValidationConfig:
+    """Build the frozen-method config from the pipeline config's ``[restore]`` policy keys.
+
+    Only the two METHOD_VERSION v10 policy knobs are configurable; every other
+    :class:`PairValidationConfig` field is part of the locked specification and is deliberately not
+    exposed to ``config.ini``. Validating here means a typo in the ini fails before any donor is
+    evaluated, with the allowed values named, rather than surfacing as a mid-run ``KeyError`` inside
+    ``negative_control_statistics``.
+    """
+    control = str(cfg.restore_control_definition)
+    statistic = str(cfg.restore_divisor_statistic)
+    if control not in CONTROL_DEFINITIONS:
+        raise SystemExit(
+            f"[restore] config.ini [restore] control_definition={control!r} is not one of "
+            f"{sorted(CONTROL_DEFINITIONS)}"
+        )
+    if statistic not in DIVISOR_STATISTICS:
+        raise SystemExit(
+            f"[restore] config.ini [restore] divisor_statistic={statistic!r} is not one of "
+            f"{sorted(DIVISOR_STATISTICS)}"
+        )
+    return PairValidationConfig(control_definition=control, divisor_statistic=statistic)
 
 
 def cell_calls_from_evaluation(ev: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -260,8 +286,13 @@ def run_apply(
 
     Returns the cohort donor x pair disposition/divisor table (also written to
     ``cfg.restore_apply_manifest_csv``).
+
+    When ``config`` is omitted the pair-method policy comes from ``cfg`` (``[restore]``
+    ``control_definition`` / ``divisor_statistic``), so a sweep arm accepted through
+    ``restore_validation evaluate-locked`` can be reproduced by the pipeline. Passing ``config``
+    explicitly overrides the file, for tests and one-off pilots.
     """
-    config = config or PairValidationConfig()
+    config = config if config is not None else config_from_pipeline(cfg)
 
     if not cfg.restore_allcells_sample_dir.exists():
         raise SystemExit(
@@ -294,6 +325,14 @@ def run_apply(
     )
     if not donor_ids:
         raise SystemExit(f"[restore] no eligible donors under {cfg.restore_allcells_sample_dir}")
+
+    # Echo the pair-method policy: it is the one thing about this run that is NOT determined by the
+    # frozen specification, and it changes every divisor.
+    print(
+        f"[restore] {METHOD_VERSION} | control_definition={config.control_definition} "
+        f"divisor_statistic={config.divisor_statistic} | {len(donor_ids)} donors "
+        f"x {len(ACCEPTED_PAIRS)} accepted pairs"
+    )
 
     cfg.restore_gated_dir.mkdir(parents=True, exist_ok=True)
     fn = functools.partial(
@@ -328,10 +367,28 @@ def main(argv=None):
     ap.add_argument("--config", type=Path, default=None)
     ap.add_argument("--jobs", type=int, default=None, help="per-donor process pool size")
     ap.add_argument("--donors", nargs="*", default=None)
+    # Same two knobs as `restore_validation evaluate-locked`, so a sweep arm and its production apply
+    # are invoked identically. Default None == take the value from config.ini.
+    ap.add_argument(
+        "--control-definition",
+        choices=sorted(CONTROL_DEFINITIONS),
+        default=None,
+        help="override config.ini [restore] control_definition",
+    )
+    ap.add_argument(
+        "--divisor-statistic",
+        choices=sorted(DIVISOR_STATISTICS),
+        default=None,
+        help="override config.ini [restore] divisor_statistic",
+    )
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     if a.jobs is not None:
         cfg.n_jobs = a.jobs
+    if a.control_definition is not None:
+        cfg.restore_control_definition = a.control_definition
+    if a.divisor_statistic is not None:
+        cfg.restore_divisor_statistic = a.divisor_statistic
     run_apply(cfg, donors=a.donors)
     return 0
 

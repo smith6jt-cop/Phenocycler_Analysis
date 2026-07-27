@@ -83,11 +83,34 @@ EPITHELIAL_REFERENCE_COMPARATOR_PAIRS: tuple[tuple[str, str], ...] = tuple(
     for target in ("CD3e", "CD68", "CD11b")
     for reference in ("Pan_Cytokeratin", "Ker8_18", "EpCAM")
 )
+# The three other epithelial markers as TARGETS (above they appear only as references).  Diagnostic
+# only -- these are NOT accepted pairs and emit no production call.
+#
+# Why: the Epithelial compartment is gated on E-cadherin alone, and E-cadherin cannot separate the two
+# epithelial populations this tissue contains.  Measured on all 20 eligible donors (REDSEA values
+# joined to the QuPath cell_region, which is validated as anatomy by INS 407 / GCG 1004 in islet core
+# vs 10 / 71 in tissue), the islet-core median E-cadherin is 630 against 762 in tissue -- endocrine
+# sits BELOW acinar -- while EpCAM runs the other way, 656 core against 516 tissue.  The
+# reference_only/p99 E-cadherin divisors span 486-1440 across the 7 pilot donors, i.e. at or above the
+# core median, so no single E-cadherin threshold covers both populations at any donor.  That is the
+# same argument docs/BroadLineageRevised.md already accepts for Immune ("with no CD45, immune can't be
+# one gate"); marker_taxonomy.TYPE lists seven epithelial markers and COMPARTMENT_GATES uses one.
+#
+# Two references per target, both biologically exclusive with epithelium and both already screened
+# markers: CD31 (endothelial -- E-cadherin's own frozen reference, so the comparison is like-for-like)
+# and Vimentin (mesenchymal -- far more abundant, which tests whether a target's divisor is driven by
+# its reference's population size).  Promotion to a gate requires its own Gate-1->3 validation.
+EPITHELIAL_TARGET_COMPARATOR_PAIRS: tuple[tuple[str, str], ...] = tuple(
+    (target, reference)
+    for target in ("Pan_Cytokeratin", "Ker8_18", "EpCAM", "E_cadherin")
+    for reference in ("CD31", "Vimentin")
+)
 CANDIDATE_PAIRS: tuple[tuple[str, str], ...] = tuple(
     dict.fromkeys(
         BASELINE_PAIRS
         + IMMUNE_REFERENCE_SCREEN_PAIRS
         + EPITHELIAL_REFERENCE_COMPARATOR_PAIRS
+        + EPITHELIAL_TARGET_COMPARATOR_PAIRS
     )
 )
 for _target, _reference in CANDIDATE_PAIRS:  # fail at import, not mid-screen
@@ -105,8 +128,9 @@ del _target, _reference, _marker, _role
 # EpCAM (a maintainer override of the marginal E_cadherin baseline; see
 # reference_selection.ACCEPTED_REFERENCE_OVERRIDES). E_cadherin<-CD31 is retained despite failing the
 # proportion because endothelium is the only biologically exclusive epithelial reference (advisory for
-# a structural target). Used by the Gate-3 full-cell pilot and Gate-5 all-donor validation. It is NOT
-# yet wired into lineage.py/config.py -- that is Gate 4.
+# a structural target). Used by the Gate-3 full-cell pilot and Gate-5 all-donor validation.
+# Wired into production as of Gate 4 (2026-07-24): restore_apply.REQUIRED_TARGETS is derived from this
+# tuple and config.COMPARTMENT_GATES uses exactly these seven targets (tests/test_config.py:121).
 ACCEPTED_PAIRS: tuple[tuple[str, str], ...] = (
     ("E_cadherin", "CD31"),
     ("CD31", "E_cadherin"),
@@ -125,6 +149,7 @@ del _t, _r
 PAIR_SETS: dict[str, tuple[tuple[str, str], ...]] = {
     "baseline": BASELINE_PAIRS,
     "immune-screen": IMMUNE_REFERENCE_SCREEN_PAIRS,
+    "epithelial-comparator": EPITHELIAL_TARGET_COMPARATOR_PAIRS,
     "accepted": ACCEPTED_PAIRS,
     "all": CANDIDATE_PAIRS,
 }

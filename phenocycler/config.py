@@ -138,6 +138,19 @@ class PipelineConfig:
     cell_qc_duplicate_radius_um: float = 1.0
     cell_qc_duplicate_area_tol: float = 0.15
 
+    # -- RESTORE pair method policy (Gate 4 production apply) ------------------
+    # These two are the METHOD_VERSION v10 knobs on restore_validation.PairValidationConfig. They were
+    # previously reachable ONLY from the `restore_validation evaluate-locked` CLI, so a production
+    # `restore_apply` run silently used the dataclass defaults regardless of which arm was chosen --
+    # i.e. the policy under review and the policy in production could not be made to agree. Threading
+    # them here is what makes an accepted sweep arm reproducible by the pipeline.
+    #   control_definition: "reference_only" | "reference_and_target"
+    #   divisor_statistic:  "max" | "p999" | "p99" | "p95"
+    # Defaults deliberately mirror PairValidationConfig so this indirection cannot change behaviour on
+    # its own; restore_validation remains the single source of truth for the allowed values.
+    restore_control_definition: str = "reference_only"
+    restore_divisor_statistic: str = "max"
+
     # -- RESTORE (scripts/senior/restore_normalize.py defaults) --------------
     restore_model: str = "SSC"       # SSC | GMM | KMeans
     restore_subsample: int = 15000
@@ -347,6 +360,9 @@ _INI_SCHEMA = {
         "duplicate_area_tol": ("cell_qc_duplicate_area_tol", float),
     },
     "restore": {
+        # METHOD_VERSION v10 pair-method policy (consumed by restore_apply -> evaluate_locked_pair).
+        "control_definition": ("restore_control_definition", str),
+        "divisor_statistic": ("restore_divisor_statistic", str),
         "model": ("restore_model", str),
         "subsample": ("restore_subsample", int),
         "robust": ("restore_robust", lambda s: str(s).lower() in ("1", "true", "yes", "on")),

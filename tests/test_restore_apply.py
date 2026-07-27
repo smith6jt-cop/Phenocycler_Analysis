@@ -217,3 +217,83 @@ def test_confirmed_absence_state_is_written_not_halted(tmp_path, monkeypatch):
     gated = pd.read_parquet(cfg.restore_gated_dir / "donor_id=TEST" / "data_0.parquet")
     assert (gated["CD11b_state"] == "negative").all()
     assert (gated["CD3e_state"] == "positive").sum() == 3     # other pairs unaffected
+
+
+# --------------------------------------------------------------------------- #
+# Tier 3 — the v10 pair-method policy reaches the frozen math
+#
+# Before this, `control_definition` / `divisor_statistic` were reachable ONLY from the
+# `restore_validation evaluate-locked` CLI, so a production apply always ran the dataclass defaults
+# no matter which sweep arm had been chosen. These tests pin the config -> evaluate_locked_pair path.
+# --------------------------------------------------------------------------- #
+
+def test_config_from_pipeline_reads_ini_policy(tmp_path):
+    cfg = load_config(data_dir=tmp_path)
+    cfg.restore_control_definition = "reference_and_target"
+    cfg.restore_divisor_statistic = "p99"
+    pvc = ra.config_from_pipeline(cfg)
+    assert pvc.control_definition == "reference_and_target"
+    assert pvc.divisor_statistic == "p99"
+
+
+def test_config_defaults_match_the_frozen_dataclass(tmp_path):
+    """The indirection must be behaviour-neutral: PipelineConfig defaults == PairValidationConfig."""
+    from phenocycler.restore_validation import PairValidationConfig
+
+    pvc = ra.config_from_pipeline(load_config(data_dir=tmp_path))
+    assert pvc.control_definition == PairValidationConfig.control_definition
+    assert pvc.divisor_statistic == PairValidationConfig.divisor_statistic
+
+
+@pytest.mark.parametrize(
+    "attr,value,match",
+    [
+        ("restore_control_definition", "reference_and_targe", "control_definition"),
+        ("restore_divisor_statistic", "p90", "divisor_statistic"),
+    ],
+)
+def test_invalid_policy_fails_before_any_donor(tmp_path, attr, value, match):
+    """A typo in config.ini must fail with the allowed values named, not mid-run inside the frozen math."""
+    cfg = load_config(data_dir=tmp_path)
+    setattr(cfg, attr, value)
+    with pytest.raises(SystemExit, match=match):
+        ra.config_from_pipeline(cfg)
+
+
+def test_run_apply_passes_ini_policy_to_evaluate_locked_pair(tmp_path, monkeypatch):
+    cfg = _setup(tmp_path, monkeypatch, sample_n=4)
+    cfg.restore_control_definition = "reference_and_target"
+    cfg.restore_divisor_statistic = "p95"
+
+    seen = []
+    inner = ra.evaluate_locked_pair
+
+    def capture(donor_df, donor, target, reference, *, config=None, **kw):
+        seen.append(config)
+        return inner(donor_df, donor, target, reference, config=config, **kw)
+
+    monkeypatch.setattr(ra, "evaluate_locked_pair", capture)
+    ra.run_apply(cfg, donors=["TEST"])
+
+    assert len(seen) == len(ACCEPTED_PAIRS)
+    assert {c.control_definition for c in seen} == {"reference_and_target"}
+    assert {c.divisor_statistic for c in seen} == {"p95"}
+
+
+def test_explicit_config_overrides_the_ini(tmp_path, monkeypatch):
+    """An explicitly passed PairValidationConfig wins over config.ini (pilots and tests)."""
+    from phenocycler.restore_validation import PairValidationConfig
+
+    cfg = _setup(tmp_path, monkeypatch, sample_n=4)
+    cfg.restore_divisor_statistic = "p95"
+
+    seen = []
+    inner = ra.evaluate_locked_pair
+
+    def capture(donor_df, donor, target, reference, *, config=None, **kw):
+        seen.append(config)
+        return inner(donor_df, donor, target, reference, config=config, **kw)
+
+    monkeypatch.setattr(ra, "evaluate_locked_pair", capture)
+    ra.run_apply(cfg, donors=["TEST"], config=PairValidationConfig(divisor_statistic="p999"))
+    assert {c.divisor_statistic for c in seen} == {"p999"}

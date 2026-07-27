@@ -47,6 +47,34 @@ def test_accepted_pairs_are_the_frozen_one_reference_per_target():
         assert reference not in rv.RESTORE_EXCLUDED_MARKERS
 
 
+def test_epithelial_target_comparator_is_diagnostic_only():
+    """Pan-CK / Ker8_18 / EpCAM as TARGETS (they appear elsewhere only as references), so the
+    single-marker Epithelial gate can be tested against alternatives. Diagnostic: these must NOT leak
+    into ACCEPTED_PAIRS, which would put an unvalidated pair into production."""
+    comparator = set(rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS)
+    assert comparator <= set(rv.CANDIDATE_PAIRS)
+    assert rv.PAIR_SETS["epithelial-comparator"] == rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS
+    assert comparator & set(rv.ACCEPTED_PAIRS) == {("E_cadherin", "CD31")}  # only the already-frozen one
+    assert {t for t, _ in comparator} == {"Pan_Cytokeratin", "Ker8_18", "EpCAM", "E_cadherin"}
+    # both references are biologically exclusive with epithelium and are themselves screened markers
+    assert {r for _, r in comparator} == {"CD31", "Vimentin"}
+    for target, reference in comparator:
+        assert target not in rv.RESTORE_EXCLUDED_MARKERS
+        assert reference not in rv.RESTORE_EXCLUDED_MARKERS
+        # every marker needs a declared raw input floor or the screen cannot form arms
+        assert target in rv.MARKER_INPUT_FLOOR_METHODS
+        assert reference in rv.MARKER_INPUT_FLOOR_METHODS
+
+
+def test_comparator_pairs_add_no_new_qupath_markers():
+    """The comparator must be answerable from the compartment sample already on disk — a new marker
+    would mean re-running the QuPath export for all 20 donors."""
+    assert set(rv.QUPATH_MARKERS) == {
+        "E_cadherin", "CD31", "CD3e", "CD20", "CD68", "CD11b", "B3TUBB", "EpCAM", "Vimentin",
+        "CD163", "Pan_Cytokeratin", "Ker8_18",
+    }
+
+
 def test_directional_groups_selects_reference_arm_not_cluster_number():
     target = np.array([10, 11, 9, 1, 2, 1, 1, 1], dtype=float)
     reference = np.array([1, 2, 1, 10, 9, 11, 1, 2], dtype=float)

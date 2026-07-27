@@ -47,6 +47,30 @@ def test_scientific_defaults():
     assert not hasattr(cfg, "cd99_bright")
 
 
+def test_restore_pair_method_policy_is_configurable():
+    """The METHOD v10 knobs must be reachable from config.ini, or the arm under review and the arm
+    production runs cannot be made to agree (they could not, before 2026-07-27)."""
+    from phenocycler.restore_validation import (CONTROL_DEFINITIONS, DIVISOR_STATISTICS,
+                                                PairValidationConfig)
+    cfg = load_config()
+    # defaults mirror the frozen dataclass, so exposing them changes nothing on its own
+    assert cfg.restore_control_definition == PairValidationConfig.control_definition
+    assert cfg.restore_divisor_statistic == PairValidationConfig.divisor_statistic
+    assert cfg.restore_control_definition in CONTROL_DEFINITIONS
+    assert cfg.restore_divisor_statistic in DIVISOR_STATISTICS
+    over = load_config(restore_control_definition="reference_and_target", restore_divisor_statistic="p99")
+    assert (over.restore_control_definition, over.restore_divisor_statistic) == (
+        "reference_and_target", "p99")
+
+
+def test_restore_policy_reaches_config_ini_schema():
+    """The keys must be in _INI_SCHEMA['restore'] — a dataclass field alone would be silently ignored
+    by config.ini."""
+    from phenocycler.config import _INI_SCHEMA
+    assert _INI_SCHEMA["restore"]["control_definition"] == ("restore_control_definition", str)
+    assert _INI_SCHEMA["restore"]["divisor_statistic"] == ("restore_divisor_statistic", str)
+
+
 def test_keyword_override():
     cfg = load_config(n_jobs=8, redsea_alpha=0.5)
     assert cfg.n_jobs == 8

@@ -203,11 +203,21 @@ The tests need no imaging data (they use synthetic masks/frames) and run in ~2 s
 
 ## Prerequisites (upstream of this repo)
 
-1. **Image processing** — [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)
-   (illumination correction → stitching → deconvolution → EDF → registration →
-   autofluorescence removal).
-2. **Segmentation** — QuPath cell detection, then export the per-cell measurement CSV
-   and full-resolution GeoJSON (`scripts/groovy/export_cells_geojson.groovy`).
+1. **Image processing** — for *this* cohort, the Akoya instrument only
+   (`ImageProcessingApplied=OffsetAndShading`, `AutofluorescenceSubtracted=True` in the qptiff XML;
+   maintainer, 2026-07-25). [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI) (illumination
+   correction → stitching → deconvolution → EDF → registration → autofluorescence removal) is the
+   general upstream chain but was **not used here** — see `DATA_README.md`.
+2. **Segmentation** — QuPath cell detection via **`scripts/groovy/0_cell_detection.groovy`**, then
+   export the per-cell measurement CSV and full-resolution GeoJSON
+   (`scripts/groovy/export_cells_geojson.groovy`).
+
+   > Use that script, not a hand-run detection. Detection was the one unscripted stage and it was run
+   > with `selectAnnotations()`, which selects the Tissue annotation **and** every nested `Islet_N`;
+   > InstanSeg runs inference per selected parent and does not deduplicate across parents, so every
+   > nucleus inside an islet was segmented twice. 311,340 duplicate detections across 7 donors, 100%
+   > inside islets, roughly doubling islet cell counts. The script selects Tissue by classification,
+   > refuses to run if anything else is selected, and verifies no two detections share a centroid.
 
 ## Citations
 
