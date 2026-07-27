@@ -66,13 +66,43 @@ def test_epithelial_target_comparator_is_diagnostic_only():
         assert reference in rv.MARKER_INPUT_FLOOR_METHODS
 
 
-def test_comparator_pairs_add_no_new_qupath_markers():
-    """The comparator must be answerable from the compartment sample already on disk — a new marker
-    would mean re-running the QuPath export for all 20 donors."""
-    assert set(rv.QUPATH_MARKERS) == {
-        "E_cadherin", "CD31", "CD3e", "CD20", "CD68", "CD11b", "B3TUBB", "EpCAM", "Vimentin",
-        "CD163", "Pan_Cytokeratin", "Ker8_18",
-    }
+# The markers the compartment sample actually contains. Its source QuPath CSV no longer exists, so
+# this set cannot grow without a manual re-export of all 20 donors — it is effectively frozen.
+COMPARTMENT_SAMPLED_MARKERS = {
+    "E_cadherin", "CD31", "CD3e", "CD20", "CD68", "CD11b", "B3TUBB", "EpCAM", "Vimentin",
+    "CD163", "Pan_Cytokeratin", "Ker8_18",
+}
+
+
+def test_epithelial_comparator_needs_no_new_qupath_marker():
+    """The epithelial comparator had to be answerable from the compartment sample already on disk."""
+    markers = {m for pair in rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS for m in pair}
+    assert markers <= COMPARTMENT_SAMPLED_MARKERS
+
+
+def test_level1_expansion_markers_are_whole_cell_only_and_declared():
+    """The expansion DOES add markers, which is why it runs on whole-cell features only.
+
+    They are absent from the compartment sample by construction — `load_validation_sample`
+    synthesises their `Cell__{marker}` from the canonical parquet, which is the same number. What must
+    hold is that they are honestly outside the sampled set (so nothing silently expects a Membrane
+    column for them) and that each declares an input floor, without which the screen cannot form arms.
+    """
+    new = {m for pair in rv.LEVEL1_EXPANSION_PAIRS for m in pair} - COMPARTMENT_SAMPLED_MARKERS
+    assert new, "the expansion is supposed to introduce markers"
+    assert new.isdisjoint(COMPARTMENT_SAMPLED_MARKERS)
+    for marker in rv.QUPATH_MARKERS:
+        assert marker in rv.MARKER_INPUT_FLOOR_METHODS, f"{marker} has no input-floor policy"
+    # every reference is drawn from the sampled set, so each pair keeps one well-characterised side
+    assert {r for _, r in rv.LEVEL1_EXPANSION_PAIRS} <= COMPARTMENT_SAMPLED_MARKERS
+
+
+def test_level1_expansion_excludes_the_promiscuous_markers():
+    """CD56 marks NK, neural AND endocrine cells; CD66 marks epithelium and granulocytes. Neither can
+    discriminate the compartments it spans, so neither may become a level-1 gate."""
+    targets = {t for t, _ in rv.LEVEL1_EXPANSION_PAIRS}
+    assert "CD56" not in targets
+    assert "CD66" not in targets
 
 
 def test_directional_groups_selects_reference_arm_not_cluster_number():

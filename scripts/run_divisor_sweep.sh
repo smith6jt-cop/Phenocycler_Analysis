@@ -35,11 +35,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PAIR_SET="accepted"
 DONORS=()
 ARMS=()
+# Default is the locked (Membrane, Cell). Markers added after the compartment sample was extracted have
+# only whole-cell values and need "Cell" alone -- see restore_validation.load_validation_sample.
+FEATURE_COMPARTMENTS=(Membrane Cell)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pair-set) PAIR_SET="$2"; shift 2 ;;
     --donor)    DONORS+=("$2"); shift 2 ;;
     --arm)      ARMS+=("$2"); shift 2 ;;
+    --feature-compartments) shift; FEATURE_COMPARTMENTS=()
+        while [[ $# -gt 0 && "$1" != --* ]]; do FEATURE_COMPARTMENTS+=("$1"); shift; done ;;
     *) echo "unknown argument: $1" >&2; usage 1 ;;
   esac
 done
@@ -89,6 +94,7 @@ for arm in "${ARMS[@]}"; do
     --pair-reviews "$PAIR_REVIEWS" \
     --control-definition "$ctrl" \
     --divisor-statistic "$stat" \
+    --feature-compartments "${FEATURE_COMPARTMENTS[@]}" \
     --output "$out" \
     "${DONOR_ARGS[@]}"
 done

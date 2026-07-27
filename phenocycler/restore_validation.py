@@ -105,12 +105,47 @@ EPITHELIAL_TARGET_COMPARATOR_PAIRS: tuple[tuple[str, str], ...] = tuple(
     for target in ("Pan_Cytokeratin", "Ker8_18", "EpCAM", "E_cadherin")
     for reference in ("CD31", "Vimentin")
 )
+# --- Level-1 gate expansion (2026-07-27) ------------------------------------------------------------
+# Maintainer decision: stop trying to perfect the broad classification against the known limits of a
+# 7-marker gate set, and move forward -- the remaining lineage markers will resolve most of the
+# residual. That is mechanically true here: `Other` is the ordered residual's terminal bucket, so a
+# cell whose only lineage marker is ungated CANNOT be typed. B cells (CD79a), plasma cells, DC (CD11c),
+# neutrophils (MPO), macrophage subsets (CD163/Iba1/CD206), endocrine cells (INS/GCG/SST), lymphatics
+# (Podoplanin) and smooth muscle (SMA) all currently land in `Other` by construction rather than by
+# evidence. Adding them to the level-1 gates is what converts that residual into calls.
+#
+# All 15 are screened on WHOLE-CELL features only: they post-date the compartment sample and its source
+# QuPath CSV no longer exists. Measured cost on the 7 accepted pairs (2026-07-27): states identical
+# 21/21, divisor ratio 0.96-1.05, call Jaccard median 0.997, call-rate |delta| median 0.04 pp. See
+# load_validation_sample.
+#
+# References are the abundant, biologically exclusive counterparts already in the web: immune and
+# stromal targets take E_cadherin (epithelium); epithelial targets take CD31 (endothelium); the
+# hormones take Pan_Cytokeratin, because exocrine tissue is both hormone-negative and abundant, which
+# a sparse endothelial reference is not.
+#
+# CD56 is deliberately excluded: it marks NK cells, neural tissue AND endocrine cells, so it cannot
+# discriminate three of the five compartments. CD66 likewise (epithelial and granulocyte).
+_IMMUNE_EXPANSION = ("CD79a", "CD11c", "CD163", "Iba1", "CD206", "MPO", "CD4", "CD8")
+_EPITHELIAL_EXPANSION = ("Keratin_5",)
+_ENDOCRINE_EXPANSION = ("INS", "GCG", "SST")
+_ENDOTHELIAL_EXPANSION = ("CD34", "Podoplanin")
+_MESENCHYMAL_EXPANSION = ("SMA",)
+LEVEL1_EXPANSION_PAIRS: tuple[tuple[str, str], ...] = (
+    *((t, "E_cadherin") for t in _IMMUNE_EXPANSION),
+    *((t, "CD31") for t in _EPITHELIAL_EXPANSION),
+    *((t, "Pan_Cytokeratin") for t in _ENDOCRINE_EXPANSION),
+    *((t, "E_cadherin") for t in _ENDOTHELIAL_EXPANSION),
+    *((t, "E_cadherin") for t in _MESENCHYMAL_EXPANSION),
+)
+
 CANDIDATE_PAIRS: tuple[tuple[str, str], ...] = tuple(
     dict.fromkeys(
         BASELINE_PAIRS
         + IMMUNE_REFERENCE_SCREEN_PAIRS
         + EPITHELIAL_REFERENCE_COMPARATOR_PAIRS
         + EPITHELIAL_TARGET_COMPARATOR_PAIRS
+        + LEVEL1_EXPANSION_PAIRS
     )
 )
 for _target, _reference in CANDIDATE_PAIRS:  # fail at import, not mid-screen
@@ -150,6 +185,7 @@ PAIR_SETS: dict[str, tuple[tuple[str, str], ...]] = {
     "baseline": BASELINE_PAIRS,
     "immune-screen": IMMUNE_REFERENCE_SCREEN_PAIRS,
     "epithelial-comparator": EPITHELIAL_TARGET_COMPARATOR_PAIRS,
+    "level1-expansion": LEVEL1_EXPANSION_PAIRS,
     "accepted": ACCEPTED_PAIRS,
     "all": CANDIDATE_PAIRS,
 }
@@ -194,6 +230,26 @@ MARKER_INPUT_FLOOR_METHODS: dict[str, str] = {
     "CD163": LINEAR_OTSU_FLOOR,
     "Pan_Cytokeratin": LINEAR_OTSU_FLOOR,
     "Ker8_18": LINEAR_OTSU_FLOOR,
+    # --- level-1 gate expansion (2026-07-27), PROVISIONAL floors pending their own marker-floor audit.
+    # Sparse immune markers take max(Otsu, Triangle) by analogy with CD3e: on a channel where the
+    # positive population is a few percent, Otsu alone places the split inside the negative mode and
+    # over-calls, which is why CD3e and CD20 were moved off it. Requiring both statistics to call a
+    # cell high is the conservative choice for a marker whose behaviour here is not yet measured.
+    # The hormones and SMA keep plain Otsu: they are bright and genuinely bimodal within their tissue.
+    "CD79a": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "CD11c": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "Iba1": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "CD206": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "MPO": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "CD4": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "CD8": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "CD34": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "Podoplanin": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "Keratin_5": MAX_LINEAR_OTSU_TRIANGLE_FLOOR,
+    "INS": LINEAR_OTSU_FLOOR,
+    "GCG": LINEAR_OTSU_FLOOR,
+    "SST": LINEAR_OTSU_FLOOR,
+    "SMA": LINEAR_OTSU_FLOOR,
 }
 
 
@@ -1633,6 +1689,16 @@ def load_validation_sample(
     )[0]
     markers = list(QUPATH_MARKERS)
     sample = pd.read_parquet(_sample_file(sample_root, donor))
+    # Markers with no compartment measurements in the sample. The QuPath measurement CSV that produced
+    # the sample no longer exists, so a marker added to the pair web after the extraction cannot get
+    # Nucleus/Cytoplasm/Membrane means without a manual re-export of all 20 donors. It CAN still be
+    # screened on whole-cell alone: `Cell__{marker}` is the QuPath whole-cell mean, which is the same
+    # number as the canonical `data/cells` column -- an identity this function already asserts below
+    # for every sampled marker (verified 2026-07-27: max relative delta 6e-8 over 2.36M cells, i.e.
+    # float32 round-trip). Such markers are synthesised here and recorded in the audit; pairs using
+    # them must run with `feature_compartments = ("Cell",)`, which `evaluate_locked_pair` enforces.
+    sampled_markers = [m for m in markers if compartment_column("Cell", m) in sample.columns]
+    whole_cell_only = [m for m in markers if m not in set(sampled_markers)]
     raw = pd.read_parquet(
         _canonical_file(raw_cells, donor),
         columns=["object_id", "X_centroid", "Y_centroid"] + markers,
@@ -1686,8 +1752,12 @@ def load_validation_sample(
         raise ValueError(f"donor {donor}: sampled ID absent from REDSEA cells")
     merged = merged.drop(columns=["_raw_present", "_redsea_present"])
 
+    # Synthesise the whole-cell feature for markers absent from the compartment sample (see above).
+    for marker in whole_cell_only:
+        merged[compartment_column("Cell", marker)] = merged[f"raw__{marker}"]
+
     max_delta = 0.0
-    for marker in markers:
+    for marker in sampled_markers:
         qupath = merged[compartment_column("Cell", marker)].to_numpy(float)
         canonical = merged[f"raw__{marker}"].to_numpy(float)
         finite = np.isfinite(qupath) & np.isfinite(canonical)
@@ -1716,7 +1786,14 @@ def load_validation_sample(
         "qupath_raw_max_abs_delta": max_delta,
         "image_n": int(merged["image"].nunique()),
         "image": str(merged["image"].iloc[0]),
+        # Recorded, not inferred: a reader must be able to tell which markers had only whole-cell
+        # features without diffing schemas against the extraction date.
+        "whole_cell_only_markers": ";".join(whole_cell_only),
+        "whole_cell_only_marker_n": len(whole_cell_only),
     }
+    # Completeness is over the SAMPLED markers only -- a synthesised marker has no Membrane or
+    # Cytoplasm column by construction, and counting its absence as incompleteness would report a
+    # data defect where there is a known, declared limitation.
     for name, compartments in {
         "membrane_cell": ("Membrane", "Cell"),
         "nonuclear": ("Cytoplasm", "Membrane", "Cell"),
@@ -1725,7 +1802,7 @@ def load_validation_sample(
         cols = [
             compartment_column(compartment, marker)
             for compartment in compartments
-            for marker in markers
+            for marker in sampled_markers
         ]
         audit[f"{name}_complete_fraction"] = float(
             merged[cols].notna().all(axis=1).mean()
@@ -2053,6 +2130,21 @@ def evaluate_locked_pair(
         for compartment in config.feature_compartments
         for marker in (target, reference)
     ]
+    # A marker added to the pair web after the compartment sample was extracted has only its
+    # whole-cell feature (load_validation_sample synthesises `Cell__{marker}` from the canonical
+    # parquet). Asking for Membrane/Cytoplasm/Nucleus on such a marker is not recoverable, and the
+    # generic "missing column" error below would send the reader looking for a corrupt parquet rather
+    # than at the real cause. Name it.
+    absent = [c for c in feature_columns if c not in donor_df.columns]
+    if absent and set(config.feature_compartments) - {"Cell"}:
+        raise ValueError(
+            f"{target} <- {reference}: no {sorted(set(config.feature_compartments) - {'Cell'})} "
+            f"measurements for these markers (missing {absent}). They post-date the compartment "
+            "sample, whose source QuPath CSV no longer exists. Run this pair with "
+            "feature_compartments=('Cell',) -- measured 2026-07-27 to reproduce the locked "
+            "(Membrane, Cell) result on the 7 accepted pairs: states identical 21/21, divisor ratio "
+            "0.96-1.05, call Jaccard median 0.997 -- or re-export the compartment measurements."
+        )
     required = [
         f"raw__{target}",
         f"raw__{reference}",
@@ -3324,6 +3416,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="statistic summarising the negative control into the divisor: max (manuscript, default) "
              "or a robust upper quantile p999/p99/p95",
     )
+    locked.add_argument(
+        "--feature-compartments",
+        nargs="+",
+        choices=list(COMPARTMENTS),
+        default=list(LOCKED_FEATURE_COMPARTMENTS),
+        help="QuPath compartments feeding the NNMF separator. Default is the locked (Membrane, Cell). "
+             "Markers added after the compartment sample was extracted have only whole-cell values, so "
+             "their pairs require 'Cell' alone; measured 2026-07-27 on the 7 accepted pairs, that "
+             "reproduces the locked result (states identical 21/21, divisor ratio 0.96-1.05, call "
+             "Jaccard median 0.997). Recorded in method_spec.json either way.",
+    )
 
     joint = sub.add_parser(
         "immune-joint",
@@ -3408,6 +3511,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seeds=tuple(args.seed or [0, 1, 2]),
                 control_definition=args.control_definition,
                 divisor_statistic=args.divisor_statistic,
+                feature_compartments=tuple(args.feature_compartments),
             ),
             expression_reviews=args.expression_reviews,
             pair_reviews=args.pair_reviews,
