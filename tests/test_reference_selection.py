@@ -102,3 +102,48 @@ def test_build_reference_matrix_requires_diagnostic_columns():
     pe = _synthetic_screen().drop(columns=["reference_to_target_ratio"])
     with pytest.raises(ValueError, match="reference_to_target_ratio"):
         rs.build_reference_matrix(pe)
+
+
+# --------------------------------------------------------------------------- #
+# Promotion candidates — Pan-CK / Ker8_18 / EpCAM as TARGETS (2026-07-27)
+#
+# These have no entry in BASELINE_PAIRS: nothing was predeclared for them, so the dossier must not
+# report "the baseline fails", which would read as though a reference had been tried and rejected.
+# --------------------------------------------------------------------------- #
+
+def _promotion_screen():
+    rows = []
+    for d in range(20):
+        donor = f"d{d:02d}"
+        # Pan_Cytokeratin: both candidate references pass; Vimentin is the stronger one.
+        rows.append(_screen_row("Pan_Cytokeratin", "CD31", 1.4, 2000, undersized=False, donor=donor))
+        rows.append(_screen_row("Pan_Cytokeratin", "Vimentin", 3.1, 2050, undersized=False, donor=donor))
+        # EpCAM: neither passes -> open, and still no baseline to blame.
+        rows.append(_screen_row("EpCAM", "CD31", 0.3, 800, undersized=True, donor=donor))
+        rows.append(_screen_row("EpCAM", "Vimentin", 0.6, 810, undersized=True, donor=donor))
+    return pd.DataFrame(rows)
+
+
+def test_promotion_candidates_are_in_the_target_order():
+    """Otherwise build_bundle silently drops them: it iterates _TARGET_ORDER, not the matrix."""
+    for target in ("Pan_Cytokeratin", "Ker8_18", "EpCAM"):
+        assert target in rs._TARGET_ORDER
+
+
+def test_promotion_candidate_recommendation_does_not_blame_a_baseline():
+    from phenocycler.restore_validation import BASELINE_PAIRS
+    assert "Pan_Cytokeratin" not in {t for t, _ in BASELINE_PAIRS}      # premise of this test
+    m = rs.build_reference_matrix(_promotion_screen())
+    d = {x.target: x for x in rs.recommend_references(m)}["Pan_Cytokeratin"]
+    assert d.status == "accepted"
+    assert d.recommended_reference == "Vimentin"                        # strongest passing
+    assert "no predeclared baseline" in d.rationale
+    assert "fails the frequency rule" not in d.rationale
+    assert "Gate-1->3" in d.rationale                                   # promotion is not automatic
+
+
+def test_promotion_candidate_with_no_passing_reference_is_open():
+    m = rs.build_reference_matrix(_promotion_screen())
+    d = {x.target: x for x in rs.recommend_references(m)}["EpCAM"]
+    assert d.status == "open"
+    assert d.recommended_reference is None

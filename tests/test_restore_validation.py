@@ -1304,9 +1304,25 @@ def test_review_figure_uses_large_fonts_and_nonoverlapping_legend_band():
 
 
 def test_review_shortlist_has_one_rationale_per_unique_pair():
-    assert len(rpr.SHORTLIST_PAIRS) == 13      # 11 + the two accepted pairs added 2026-07-25
+    # 11 original + the 2 accepted pairs added 2026-07-25 + the 7 epithelial promotion candidates
+    # added 2026-07-27 (Pan-CK / Ker8_18 / EpCAM x {CD31, Vimentin}, plus E_cadherin <- Vimentin as
+    # the comparator for the frozen E_cadherin <- CD31).
+    assert len(rpr.SHORTLIST_PAIRS) == 20
     assert len(set(rpr.SHORTLIST_PAIRS)) == len(rpr.SHORTLIST_PAIRS)
     assert set(rpr.SHORTLIST_PAIRS) == set(rpr.PAIR_RATIONALE)
+
+
+def test_epithelial_promotion_candidates_have_a_review_surface():
+    """The anatomy check made these promotion candidates; promotion needs a per-image review, which
+    needs a review surface. Both candidate references are shortlisted for each, so the reference
+    choice can be judged from images and not only from the frequency rule."""
+    for target in ("Pan_Cytokeratin", "Ker8_18", "EpCAM"):
+        for reference in ("CD31", "Vimentin"):
+            assert (target, reference) in rpr.SHORTLIST_PAIRS
+            assert (target, reference) in rv.CANDIDATE_PAIRS
+    assert ("E_cadherin", "Vimentin") in rpr.SHORTLIST_PAIRS   # comparator for the frozen CD31 pair
+    # ...but they must NOT be production pairs yet.
+    assert not (set(rv.EPITHELIAL_TARGET_COMPARATOR_PAIRS) - {("E_cadherin", "CD31")}) & set(rv.ACCEPTED_PAIRS)
 
 
 def test_every_accepted_pair_has_a_review_surface():

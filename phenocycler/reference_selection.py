@@ -35,7 +35,18 @@ from .restore_validation import (
 
 # Targets whose single candidate reference is structural and predeclared; the immune targets carry
 # several candidate references and are where the frequency rule does its work.
-_TARGET_ORDER = ("E_cadherin", "CD31", "Vimentin", "B3TUBB", "CD3e", "CD68", "CD11b")
+#
+# Pan_Cytokeratin / Ker8_18 / EpCAM were added 2026-07-27. They have NO predeclared baseline -- they
+# are candidates for promotion out of the epithelial comparator, not existing production targets whose
+# baseline is being re-examined (see restore_validation.EPITHELIAL_TARGET_COMPARATOR_PAIRS and
+# docs/ANATOMY_CHECK_2026-07-27.md). `recommend_references` handles the missing baseline explicitly.
+_TARGET_ORDER = (
+    "E_cadherin", "Pan_Cytokeratin", "Ker8_18", "EpCAM",
+    "CD31", "Vimentin", "B3TUBB", "CD3e", "CD68", "CD11b",
+)
+# Targets with no entry in BASELINE_PAIRS: nothing was predeclared for them, so "the baseline fails"
+# is not a meaningful statement about them.
+_NO_BASELINE = ("Pan_Cytokeratin", "Ker8_18", "EpCAM")
 
 # Frozen Gate-2 maintainer decisions (2026-07-24) that OVERRIDE the deterministic "keep the passing
 # baseline" recommendation. Any target not listed here uses its predeclared baseline reference where it
@@ -260,11 +271,20 @@ def recommend_references(
                 )
         else:
             chosen = passing.iloc[0]["reference"]
-            note = (
-                f"baseline {base} fails the frequency rule; "
-                f"strongest passing reference is {chosen} "
-                f"(median ratio {passing.iloc[0]['ratio_median']:.2f})"
-            )
+            if base is None:
+                # A promotion candidate, not a production target with a failing baseline. Say so, or
+                # the dossier reads as though something was tried and rejected.
+                note = (
+                    f"no predeclared baseline (promotion candidate); strongest passing reference is "
+                    f"{chosen} (median ratio {passing.iloc[0]['ratio_median']:.2f}). Promotion to a "
+                    "production target still requires its own Gate-1->3 validation."
+                )
+            else:
+                note = (
+                    f"baseline {base} fails the frequency rule; "
+                    f"strongest passing reference is {chosen} "
+                    f"(median ratio {passing.iloc[0]['ratio_median']:.2f})"
+                )
         decisions.append(
             ReferenceDecision(
                 target=target,

@@ -59,6 +59,20 @@ SHORTLIST_PAIRS: tuple[tuple[str, str], ...] = (
     # ACCEPTED_PAIRS-subset invariant below.
     ("CD68", "E_cadherin"),
     ("CD11b", "EpCAM"),
+    # Added 2026-07-27 — the epithelial promotion candidates. The anatomy check
+    # (docs/ANATOMY_CHECK_2026-07-27.md) found the single-marker Epithelial gate calls only 1-6% of
+    # islet-core (endocrine, hormone-validated) cells Epithelial and 82-94% Other, and that a union
+    # over these three plus E-cadherin recovers most of it. Promotion to production targets needs a
+    # per-image biological review, which needs a review surface, which is this. Both candidate
+    # references are shortlisted for each so the reference choice can be judged from the images and
+    # not only from the frequency rule.
+    ("Pan_Cytokeratin", "CD31"),
+    ("Pan_Cytokeratin", "Vimentin"),
+    ("Ker8_18", "CD31"),
+    ("Ker8_18", "Vimentin"),
+    ("EpCAM", "CD31"),
+    ("EpCAM", "Vimentin"),
+    ("E_cadherin", "Vimentin"),
 )
 
 PAIR_RATIONALE: dict[tuple[str, str], str] = {
@@ -81,6 +95,31 @@ PAIR_RATIONALE: dict[tuple[str, str], str] = {
                         "2026-07-25 -- it had been in production with no image-review surface, and "
                         "it carries the worst diagnostics in the accepted set (divisor spread 23x, "
                         "anchor_recovery down to 0.146, and the 6591 inverted fit)",
+    # --- epithelial promotion candidates (2026-07-27) --------------------------------------------
+    # The question for the reviewer is the same for all six: does the marker mark epithelium in the
+    # image, and does the reference's positive population genuinely exclude it? CD31 is E-cadherin's
+    # own frozen reference, so it makes the comparison like-for-like; Vimentin is far more abundant,
+    # which tests whether a divisor is being driven by its reference's population size.
+    ("Pan_Cytokeratin", "CD31"): "epithelial promotion candidate; endothelial reference (like-for-like "
+                                 "with the frozen E_cadherin<-CD31). Keratin-high in acinar, near-zero "
+                                 "in endocrine -- check it is not simply an acinar mask",
+    ("Pan_Cytokeratin", "Vimentin"): "epithelial promotion candidate; mesenchymal reference, ~10x the "
+                                     "control population of CD31. Genuine epithelial Vimentin (EMT, "
+                                     "ductal) is the contamination risk to look for",
+    ("Ker8_18", "CD31"): "epithelial promotion candidate; simple-epithelium keratin, the closest "
+                         "companion to Pan-Cytokeratin (Jaccard 0.75). Endothelial reference",
+    ("Ker8_18", "Vimentin"): "epithelial promotion candidate; mesenchymal reference. Same EMT/ductal "
+                             "contamination risk as Pan_Cytokeratin<-Vimentin",
+    ("EpCAM", "CD31"): "epithelial promotion candidate and the most important of the six: EpCAM is the "
+                       "Jaccard OUTLIER among the four epithelial markers (0.31-0.37 against the "
+                       "keratins) and is higher in islet core than in tissue, so it is what recovers "
+                       "endocrine epithelium. Its dynamic range is compressed -- check the arm is a "
+                       "real population and not a background band",
+    ("EpCAM", "Vimentin"): "epithelial promotion candidate; mesenchymal reference for the endocrine-"
+                           "recovering marker",
+    ("E_cadherin", "Vimentin"): "COMPARATOR for the frozen E_cadherin<-CD31, which was accepted despite "
+                                "failing the pure-proportion rule at 0.19x. Vimentin is abundant enough "
+                                "to pass it, so this is the test of whether that caveat matters",
 }
 
 # Every pair that reaches production MUST have an image-review surface. Enforced at import so the
