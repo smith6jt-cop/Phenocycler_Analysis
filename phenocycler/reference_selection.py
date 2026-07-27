@@ -129,14 +129,33 @@ def build_reference_matrix(
 
     # Per-donor consensus divisor over the rule-passing references of each target (used only to flag
     # divisor outliers, never to combine references into a threshold).
-    passing = pe[~pe["reference_undersized"].astype(bool)]
+    #
+    # Fallback (2026-07-27): for a MAJORITY-POSITIVE target no reference can pass the pure-proportion
+    # rule -- the target-positive population is simply larger than any non-target population in the
+    # tissue. Measured on the 20-donor QC-clean screen, every epithelial target (E_cadherin,
+    # Pan_Cytokeratin, Ker8_18, EpCAM) is undersized against every reference on every donor, ratios
+    # 0.03-0.18. Restricting the consensus to passing references then left it empty, so
+    # divisor_vs_consensus was NaN for exactly the targets whose reference choice most needs an
+    # independent cross-check. Fall back to all of that target's references and say so in
+    # `consensus_over_all_references`, rather than emitting nothing.
+    undersized = pe["reference_undersized"].astype(bool)
+    passing = pe[~undersized]
     consensus = (
         passing.groupby(["donor", "target"])["candidate_full_maximum"]
         .median()
         .rename("consensus_divisor")
         .reset_index()
     )
+    fallback = (
+        pe.groupby(["donor", "target"])["candidate_full_maximum"]
+        .median()
+        .rename("consensus_divisor_all")
+        .reset_index()
+    )
     pe = pe.merge(consensus, on=["donor", "target"], how="left")
+    pe = pe.merge(fallback, on=["donor", "target"], how="left")
+    pe["consensus_over_all_references"] = pe["consensus_divisor"].isna()
+    pe["consensus_divisor"] = pe["consensus_divisor"].fillna(pe["consensus_divisor_all"])
     pe["divisor_vs_consensus"] = pe["candidate_full_maximum"] / pe["consensus_divisor"]
 
     rows = []
@@ -159,6 +178,9 @@ def build_reference_matrix(
                 ),
                 "reference_fold_median": float(grp["reference_fold"].median()),
                 "called_frac_median": float(grp["called_frac"].median()),
+                "consensus_over_all_references": bool(
+                    grp["consensus_over_all_references"].all()
+                ),
                 "passes_frequency_rule": bool(
                     ratio.median() >= config.min_reference_to_target_ratio
                 ),
@@ -241,16 +263,31 @@ def recommend_references(
         base = baseline.get(target)
         base_row = grp[grp["reference"] == base]
         if passing.empty:
+            best = float(grp["ratio_median"].max())
+            note = (
+                f"no candidate reference satisfies reference>=target frequency "
+                f"(best median ratio {best:.2f}); reference is a Gate-2 design decision"
+            )
+            # EVERY candidate undersized on EVERY donor is a statement about the target, not about its
+            # references: a marker positive on a large share of cells cannot have a larger negative
+            # control unless some other marker is positive on more, and in pancreas none is. Saying
+            # only "no reference is good enough" would send the reviewer looking for a better
+            # reference that cannot exist. Keyed on the measured pattern rather than a cutoff on the
+            # ratio, so it fires exactly when the rule is inadmissible rather than merely unmet.
+            if float(grp["undersized_frac"].min()) >= 1.0:
+                note += (
+                    f". Every candidate is undersized on every donor, which for a majority-positive "
+                    f"structural target is inevitable rather than a property of the references -- the "
+                    f"pure-proportion rule has no admissible answer here. Compare "
+                    f"reference_fold_median (arm separation) and the absolute control size instead, "
+                    f"and note the same exception is already recorded for E_cadherin <- CD31"
+                )
             decisions.append(
                 ReferenceDecision(
                     target=target,
                     recommended_reference=None,
                     status="open",
-                    rationale=(
-                        f"no candidate reference satisfies reference>=target frequency "
-                        f"(best median ratio {grp['ratio_median'].max():.2f}); "
-                        f"reference is a Gate-2 design decision"
-                    ),
+                    rationale=note,
                 )
             )
             continue

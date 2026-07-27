@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -147,3 +148,24 @@ def test_promotion_candidate_with_no_passing_reference_is_open():
     d = {x.target: x for x in rs.recommend_references(m)}["EpCAM"]
     assert d.status == "open"
     assert d.recommended_reference is None
+
+
+def test_divisor_consensus_falls_back_when_no_reference_passes():
+    """A majority-positive target has no rule-passing reference, so the consensus set is empty and the
+    divisor cross-check silently vanished — for exactly the targets that most need it."""
+    pe = _promotion_screen()          # EpCAM: both references undersized on every donor
+    m = rs.build_reference_matrix(pe).set_index(["target", "reference"])
+    for reference in ("CD31", "Vimentin"):
+        row = m.loc[("EpCAM", reference)]
+        assert bool(row["consensus_over_all_references"]) is True
+        assert np.isfinite(row["divisor_vs_consensus_median"])     # not NaN any more
+    # a target WITH passing references keeps the strict consensus
+    assert bool(m.loc[("Pan_Cytokeratin", "CD31"), "consensus_over_all_references"]) is False
+
+
+def test_open_rationale_names_the_structural_cause_when_every_ratio_is_far_below_one():
+    m = rs.build_reference_matrix(_promotion_screen())
+    d = {x.target: x for x in rs.recommend_references(m)}["EpCAM"]
+    assert d.status == "open"
+    assert "inevitable rather than a property of the references" in d.rationale
+    assert "reference_fold_median" in d.rationale
