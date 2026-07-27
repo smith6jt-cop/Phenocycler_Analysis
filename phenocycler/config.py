@@ -37,7 +37,19 @@ from .cohort import filter_eligible_donors
 # calls emitted by restore_apply from the frozen ACCEPTED_PAIRS. Endocrine/exocrine + immune/mesenchymal
 # SUBTYPES are DEFERRED to a validated level-2 pass (docs/level2_hierarchy.md); this first deliverable is
 # the 5 broad compartments only. See phenocycler/lineage.py for the tree.
-COMPARTMENT_ORDER: list[str] = ["Immune", "Epithelial", "Endothelial", "Neural", "Mesenchymal"]
+# Endothelial moved AHEAD of Epithelial, 2026-07-27, when the Epithelial gate gained the hormones.
+# Measured cause: inside islets 67.8% of CD31-POSITIVE cells were being claimed by Epithelial, and 78%
+# of islet-core CD31+ cells were also hormone-positive -- against 1.8% in tissue. Islet capillaries sit
+# inside a dense mass of hormone-bright neighbours and pick up their signal; outside islets CD31 and
+# hormone are essentially exclusive. That asymmetry is spatial contamination, not biology, and inside an
+# islet CD31 (reference_fold ~30x, the panel's most specific structural marker) is the more trustworthy
+# evidence. Under the 7-marker gates endothelium was correctly ENRICHED in islets (8-13% vs 2-6% in
+# tissue); adding the hormones inverted that to 2.1% vs 10.2%.
+#
+# Both constraints from docs/BroadLineageRevised.md still hold: Immune stays FIRST (CD31 is expressed on
+# monocytes, neutrophils, NK and naive T cells, so endothelium must not precede immune), and Neural
+# still follows Epithelial (endocrine cells are TUBB3+).
+COMPARTMENT_ORDER: list[str] = ["Immune", "Endothelial", "Epithelial", "Neural", "Mesenchymal"]
 OTHER_LABEL: str = "Other"
 UNRESOLVED_LABEL: str = "Unresolved"   # blocked by an unavailable higher-priority gate (NOT a negative Other)
 

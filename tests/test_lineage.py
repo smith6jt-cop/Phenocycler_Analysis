@@ -44,7 +44,10 @@ def test_priority_order_and_other(tmp_path):
         {"id": "mes", "Vimentin": "positive"},
         {"id": "other"},                                                    # all gates negative -> Other
         {"id": "imm>epi", "CD3e": "positive", "E_cadherin": "positive"},    # Immune wins (first in order)
-        {"id": "epi>eth", "E_cadherin": "positive", "CD31": "positive"},    # Epithelial > Endothelial
+        # Endothelial > Epithelial as of 2026-07-27: inside islets, capillaries pick up hormone signal
+        # from their neighbours (78% of islet-core CD31+ cells were also hormone+, against 1.8% in
+        # tissue), so the Epithelial gate was claiming 67.8% of them. CD31 is the more specific marker.
+        {"id": "eth>epi", "E_cadherin": "positive", "CD31": "positive"},    # Endothelial > Epithelial
         {"id": "eth>mes", "CD31": "positive", "Vimentin": "positive"},      # Endothelial > Mesenchymal
         {"id": "nrl>mes", "B3TUBB": "positive", "Vimentin": "positive"},    # Neural > Mesenchymal
     ]
@@ -57,7 +60,7 @@ def test_priority_order_and_other(tmp_path):
     assert c["mes"] == "Mesenchymal"
     assert c["other"] == "Other"
     assert c["imm>epi"] == "Immune"
-    assert c["epi>eth"] == "Epithelial"
+    assert c["eth>epi"] == "Endothelial"
     assert c["eth>mes"] == "Endothelial"
     assert c["nrl>mes"] == "Neural"
     assert set(c.values()).issubset(set(CLASSES))

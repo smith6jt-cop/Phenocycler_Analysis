@@ -126,7 +126,11 @@ def test_excluded_donors_fail_closed_when_requested_explicitly():
 
 def test_compartment_constants_shape():
     # Gate 4 (2026-07-24): Immune is FIRST, and every gate marker is a divisor-backed ACCEPTED_PAIRS target.
-    assert COMPARTMENT_ORDER == ["Immune", "Epithelial", "Endothelial", "Neural", "Mesenchymal"]
+    # Endothelial precedes Epithelial as of 2026-07-27 (see config.py for the measurement). Immune
+    # stays first (CD31 is on leukocytes); Neural still follows Epithelial (endocrine is TUBB3+).
+    assert COMPARTMENT_ORDER == ["Immune", "Endothelial", "Epithelial", "Neural", "Mesenchymal"]
+    assert COMPARTMENT_ORDER.index("Immune") < COMPARTMENT_ORDER.index("Endothelial")
+    assert COMPARTMENT_ORDER.index("Epithelial") < COMPARTMENT_ORDER.index("Neural")
     assert OTHER_LABEL == "Other"
     assert UNRESOLVED_LABEL == "Unresolved"
     # Expanded 2026-07-27 from 7 gate markers to 24 (maintainer sign-off). `Other` is the ordered
