@@ -105,11 +105,18 @@ the filename carries, lowercased.
 
 `phenocycler/sections.py` is the single definition, shared by the DuckDB expression that
 *builds* the partitions and the Python parser that *takes them apart* — two languages, one
-rule, checked against each other in the test suite. A bare `pLN` resolves to `pln_1`, the
-only lymph-node region every donor in the manifest has (26/26; three donors have a second,
-one a third). An unrecognised token like `6539spleen` is refused rather than folded into the
-pancreas, and `redsea.donor_image` asserts its partition holds exactly one image as a
-backstop.
+rule, checked against each other in the test suite. An unrecognised token like `6539spleen` is
+refused rather than folded into the pancreas, and `redsea.donor_image` asserts its partition
+holds exactly one image as a backstop.
+
+A bare `pLN` resolves to `pln_1`. That is an **inference, not a measurement**: `pln_1` is the
+region every row of the vendored `xenium_paths.csv` carries (26 of the 26 donors listed there;
+three have a second, one a third). But that CSV is the upstream manifest, not the run cohort —
+the analysis cohort is 20 donors and **which 20 is not recorded anywhere in this repo**, so the
+statistic is drawn from a superset. The mapping is wrong for any donor whose single PhenoCycler
+lymph-node section corresponds to that donor's `pln_2` or `pln_3`. It would surface as a
+registration that will not align, not as silently wrong output; the fix is a per-donor override
+in `sections.REGION_TO_ROI`.
 
 This also makes pairing exact rather than assumed. The manifest now knows *which* PhenoCycler
 sections exist, so a donor whose lymph node was never scanned is `xenium_only` for that ROI
@@ -190,7 +197,8 @@ and tested on synthetic frames with no imaging data at all.
 ### The join key had to be built, not just read
 
 `donor_id` is a clean key on paper: both repos already share `donor_metadata_panc.xlsx`
-verbatim, same columns, same 26 nPOD donors. But:
+verbatim, with the same columns and the same nPOD donors (26 appear in the vendored
+`xenium_paths.csv`; the run cohort is a 20-donor subset of them). But:
 
 - **No Xenium artifact carries it.** Every Xenium output is keyed by the XETG slide serial
   (`0041323`), which encodes no donor, no region and no disease status.

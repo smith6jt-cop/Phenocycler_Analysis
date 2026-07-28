@@ -6,8 +6,10 @@ about what that problem is, because it is not obvious from either repo in isolat
 
 1. ``donor_id`` is a perfect join key *on paper*. Both repos already share
    ``donor_metadata_panc.xlsx`` verbatim, with the same ``donor_id`` and ``disease.status``
-   columns and the same 26 nPOD donors. PhenoCycler derives ``donor_id`` by regex from the
-   qptiff image name and hive-partitions everything by it.
+   columns and the same nPOD donors. PhenoCycler derives ``donor_id`` by regex from the
+   qptiff image name and hive-partitions everything by it. (``xenium_paths.csv`` lists 26
+   donors; the run cohort is a 20-donor subset, which nothing in this repo currently pins —
+   the extra Xenium donors surface as ``xenium_only`` rather than being filtered out.)
 
 2. But the join key never reaches the Xenium data. No Xenium h5ad carries ``obs['donor_id']``
    or ``obs['roi']`` — Xenium artifacts are keyed purely by the XETG slide serial
