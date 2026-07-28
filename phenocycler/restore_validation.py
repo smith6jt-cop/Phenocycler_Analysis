@@ -235,6 +235,69 @@ LOCKED_FEATURE_COMPARTMENTS: tuple[str, ...] = ("Membrane", "Cell")
 
 # How the target-negative control population is defined (see PairValidationConfig.control_definition).
 CONTROL_DEFINITIONS: frozenset[str] = frozenset({"reference_only", "reference_and_target"})
+
+# WHAT THE NNMF IS FITTED ON.
+#
+# The manuscript's design is to let the clustering FIND the groups: Lemma 1 says that for a mutually
+# exclusive pair, {Y1, Y2, Y3} cannot be written as positive combinations of one another, so a
+# 2-component non-negative factorisation of the pair's intensity profile recovers the split -- wherever
+# it happens to lie in that donor's distribution. That adaptivity is the entire reason the method
+# clusters instead of thresholding, and it is what lets one method serve markers with very different
+# frequencies and intensity ranges.
+#
+# This implementation departed from that: it selects a training set by raw per-marker Otsu floors
+# (target-high AND reference-low vs reference-high), samples the two arms to EQUAL SIZE, fits the NNMF
+# on that, and then predicts every other cell. The clustering can then only ratify the split the floors
+# already drew -- and when a floor lands in background the model is trained on mislabelled examples and
+# cannot recover (donor 6566 INS: 412,459 cells handed over as "INS-positive examples", of which a few
+# hundred are). The equal-size sampling is a second frequency assumption on top.
+#
+#   "arms"         the pre-selected balanced exclusive arms. What has shipped; kept as the default so
+#                  this option cannot change any existing result on its own.
+#   "qc_retained"  a deterministic sample of the input-QC-retained cells, i.e. those above at least one
+#                  of the two floors. The floors still drop double-negatives -- as the published
+#                  `idx_select` also does -- but no longer dictate which cells are which class.
+#   "all"          a deterministic sample of every valid cell, floors used for nothing at fit time.
+NNMF_FIT_BASES: frozenset[str] = frozenset({"arms", "qc_retained", "all"})
+
+# WHO DECIDES GROUP MEMBERSHIP, once the NNMF has run.
+#
+# Changing `nnmf_fit_basis` alone does NOT hand the decision to the clustering, because the raw floors
+# are ANDed into the membership predicates AFTER it (see `ordered_control_groups`):
+#
+#     target_population    = ... & (labels == target_group)    & (target_raw > target_floor)
+#                                                              & (reference_raw <= reference_floor)
+#     reference_candidates = ... & (labels == reference_group) & (reference_raw > reference_floor)
+#
+# So a cell the model calls target-positive is still discarded unless it clears the raw floor, and the
+# negative control that sets the divisor stays floor-defined. Measured on donor 6566 INS, where the
+# maintainer's image gives ground truth of a couple hundred INS+ cells: refitting on the data moved the
+# call from 4,135 to 7,697 ("qc_retained") to 14,299 ("all") -- further from the truth, not closer,
+# because the binding constraint was never the fit.
+#
+#   "floor_and_component"  what has shipped: floors AND component. Default; changes nothing on its own.
+#   "component"            the clustering decides, as Lemma 1 intends. `qc_retained` still drops
+#                          double-negatives (the role the published `idx_select` plays); the per-marker
+#                          Otsu floors no longer partition the cells.
+CONTROL_MEMBERSHIP_RULES: frozenset[str] = frozenset({"floor_and_component", "component"})
+
+# HOW THE FACTORISATION IS SOLVED.
+#
+# `beta_loss` is the objective. "frobenius" is least squares: the fit minimises the SUM OF SQUARED
+# differences between the data and its reconstruction, so it is dominated by the bulk and by large
+# absolute values. A rare bright population contributes almost nothing to that sum and is absorbed --
+# measured on donor 6566 INS, where the "target component" came out at 1,467,892 of 1,781,276 cells
+# (82% of the tissue) against a ground truth of a couple hundred INS+ cells.
+#
+# "kullback-leibler" weights RELATIVE error instead, so a proportional miss on a small population costs
+# what it costs on a large one. That is the objective suited to a rare target. "itakura-saito" goes
+# further still (scale-invariant) but is undefined at zero, and the scaled features contain exact zeros.
+#
+# sklearn requires solver="mu" (multiplicative update) for any beta_loss other than "frobenius";
+# "cd" (coordinate descent) supports frobenius only.
+NNMF_BETA_LOSSES: frozenset[str] = frozenset({"frobenius", "kullback-leibler", "itakura-saito"})
+NNMF_SOLVERS: frozenset[str] = frozenset({"cd", "mu"})
+NNMF_INITS: frozenset[str] = frozenset({"nndsvdar", "nndsvd", "nndsvda", "random"})
 # Divisor summary statistic -> quantile (None == the manuscript maximum).
 DIVISOR_STATISTICS: dict[str, float | None] = {
     "max": None,
@@ -341,6 +404,14 @@ class PairValidationConfig:
     n_components: int = 2
     seeds: tuple[int, ...] = (0, 1, 2)
     fit_cap: int = 50_000
+    # See NNMF_FIT_BASES. Default "arms" reproduces every shipped result exactly.
+    nnmf_fit_basis: str = "arms"
+    # See CONTROL_MEMBERSHIP_RULES. Default reproduces every shipped result exactly.
+    control_membership: str = "floor_and_component"
+    # See NNMF_BETA_LOSSES. Defaults reproduce every shipped result exactly.
+    nnmf_beta_loss: str = "frobenius"
+    nnmf_solver: str = "cd"
+    nnmf_init: str = "nndsvdar"
     input_qc_bins: int = 512
     input_qc_upper_quantile: float = 0.995
     input_qc_triangle_bins: int = 256
@@ -423,8 +494,33 @@ class PairValidationConfig:
         unknown = set(self.feature_compartments).difference(COMPARTMENTS)
         if unknown:
             raise ValueError(f"unknown feature compartments: {sorted(unknown)}")
-        if self.n_components != 2:
-            raise ValueError("the locked pair evaluation requires two NNMF components")
+        if self.n_components < 2:
+            raise ValueError("the locked pair evaluation requires at least two NNMF components")
+        # k=2 is the default and what has shipped. More is explicitly sanctioned by the manuscript, in
+        # the same sentence that specifies two: "by selecting the number of clusters is equal to 2
+        # (note that one could cluster more than 2 and assign each cluster into the group of interest
+        # for inferring background or autofluorescence signal)". `directional_groups` already selects
+        # the target/reference groups by highest mean over however many clusters exist, so a rare
+        # population can claim its own component instead of being absorbed into the bulk.
+        if self.nnmf_beta_loss not in NNMF_BETA_LOSSES:
+            raise ValueError(f"nnmf_beta_loss must be one of {sorted(NNMF_BETA_LOSSES)}")
+        if self.nnmf_solver not in NNMF_SOLVERS:
+            raise ValueError(f"nnmf_solver must be one of {sorted(NNMF_SOLVERS)}")
+        if self.nnmf_init not in NNMF_INITS:
+            raise ValueError(f"nnmf_init must be one of {sorted(NNMF_INITS)}")
+        if self.nnmf_beta_loss != "frobenius" and self.nnmf_solver != "mu":
+            raise ValueError(
+                f"beta_loss={self.nnmf_beta_loss!r} requires solver='mu'; 'cd' supports frobenius only"
+            )
+        if self.nnmf_fit_basis not in NNMF_FIT_BASES:
+            raise ValueError(
+                f"nnmf_fit_basis must be one of {sorted(NNMF_FIT_BASES)}; got {self.nnmf_fit_basis!r}"
+            )
+        if self.control_membership not in CONTROL_MEMBERSHIP_RULES:
+            raise ValueError(
+                f"control_membership must be one of {sorted(CONTROL_MEMBERSHIP_RULES)}; "
+                f"got {self.control_membership!r}"
+            )
         if not self.seeds or len(set(self.seeds)) != len(self.seeds):
             raise ValueError("seeds must be a nonempty unique sequence")
         if self.fit_cap < 2 * self.min_arm_n:
@@ -1235,6 +1331,7 @@ def ordered_control_groups(
     target_floor: float,
     reference_floor: float,
     control_definition: str = "reference_only",
+    control_membership: str = "floor_and_component",
 ) -> OrderedControlGroups:
     """Infer the vertical separator before selecting target-negative controls.
 
@@ -1271,19 +1368,26 @@ def ordered_control_groups(
         & (target_redsea >= 0)
         & (reference_redsea >= 0)
     )
-    target_population = (
-        finite
-        & qc_retained
-        & (labels == target_group)
-        & (target_raw > target_floor)
-        & (reference_raw <= reference_floor)
-    )
-    reference_candidates = (
-        finite
-        & qc_retained
-        & (labels == reference_group)
-        & (reference_raw > reference_floor)
-    )
+    if control_membership == "component":
+        # Lemma 1's intent: the clustering identifies the groups. `qc_retained` still drops
+        # double-negatives -- the role the published `idx_select` plays -- but the per-marker Otsu
+        # floors no longer partition the cells.
+        target_population = finite & qc_retained & (labels == target_group)
+        reference_candidates = finite & qc_retained & (labels == reference_group)
+    else:
+        target_population = (
+            finite
+            & qc_retained
+            & (labels == target_group)
+            & (target_raw > target_floor)
+            & (reference_raw <= reference_floor)
+        )
+        reference_candidates = (
+            finite
+            & qc_retained
+            & (labels == reference_group)
+            & (reference_raw > reference_floor)
+        )
     if control_definition == "reference_and_target":
         # Pre-v10: additionally cap the control at the target's own input floor. This is what made the
         # divisor (a maximum over this set) collapse onto that floor. Retained to reproduce v9.
@@ -1577,6 +1681,9 @@ def fit_nnmf(
     n_components: int,
     seed: int,
     max_iter: int = 2000,
+    beta_loss: str = "frobenius",
+    solver: str = "cd",
+    init: str = "nndsvdar",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | int | bool]]:
     """Fit manuscript NNMF and return scale-invariant dominant-component labels."""
     from sklearn.decomposition import NMF
@@ -1594,9 +1701,9 @@ def fit_nnmf(
 
     model = NMF(
         n_components=n_components,
-        init="nndsvdar",
-        solver="cd",
-        beta_loss="frobenius",
+        init=init,
+        solver=solver,
+        beta_loss=beta_loss,
         random_state=seed,
         max_iter=max_iter,
         tol=1e-5,
@@ -1632,6 +1739,9 @@ def fit_nnmf_predict(
     fit_cap: int | None,
     fit_indices: np.ndarray | None = None,
     max_iter: int = 2000,
+    beta_loss: str = "frobenius",
+    solver: str = "cd",
+    init: str = "nndsvdar",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | int | bool]]:
     """Fit NNMF on a deterministic subset and assign every supplied cell."""
     from sklearn.decomposition import NMF
@@ -1663,9 +1773,9 @@ def fit_nnmf_predict(
 
     model = NMF(
         n_components=n_components,
-        init="nndsvdar",
-        solver="cd",
-        beta_loss="frobenius",
+        init=init,
+        solver=solver,
+        beta_loss=beta_loss,
         random_state=seed,
         max_iter=max_iter,
         tol=1e-5,
@@ -2118,7 +2228,9 @@ def _locked_fit_once(
     seed: int,
     probe_fraction: float | None = None,
 ) -> dict:
-    fit_indices, arm_counts = balanced_arm_fit_indices(
+    # The arm counts are reported on every row regardless of what the NNMF is fitted on, because they
+    # describe the floors and stay comparable across bases.
+    arm_fit_indices, arm_counts = balanced_arm_fit_indices(
         target_raw,
         reference_raw,
         target_floor,
@@ -2128,6 +2240,20 @@ def _locked_fit_once(
         min_arm_n=config.min_arm_n,
         probe_fraction=probe_fraction,
     )
+    if config.nnmf_fit_basis == "arms":
+        fit_indices = arm_fit_indices
+    else:
+        # Let the clustering find the split rather than being handed it. The floors either drop
+        # double-negatives only ("qc_retained", the role the published idx_select plays) or are unused
+        # at fit time ("all"). Deterministic subsample at the same fit_cap, so the only thing that
+        # differs from the "arms" basis is WHICH cells the model learns from.
+        pool = np.flatnonzero(qc_retained) if config.nnmf_fit_basis == "qc_retained" \
+            else np.arange(len(target_raw))
+        if len(pool) < 2 * config.min_arm_n:
+            raise ValueError(f"nnmf_fit_basis={config.nnmf_fit_basis!r} left too few cells to fit")
+        cap = config.fit_cap if probe_fraction is None else max(
+            2 * config.min_arm_n, int(round(probe_fraction * config.fit_cap)))
+        fit_indices = pool[_fit_indices(len(pool), cap, seed)]
     bound_lower_q, bound_upper_q, bound_adapted, bound_support = adaptive_bound_quantiles(
         len(fit_indices),
         lower_quantile=config.scale_lower_quantile,
@@ -2147,6 +2273,9 @@ def _locked_fit_once(
         seed=seed,
         fit_cap=None,
         fit_indices=fit_indices,
+        beta_loss=config.nnmf_beta_loss,
+        solver=config.nnmf_solver,
+        init=config.nnmf_init,
     )
     direction = directional_groups(
         target_raw[qc_retained],
@@ -2308,6 +2437,7 @@ def evaluate_locked_pair(
             target_floor=target_floor,
             reference_floor=reference_floor,
             control_definition=config.control_definition,
+            control_membership=config.control_membership,
         )
     controls: OrderedControlGroups = primary["ordered_controls"]
     target_population = controls.target_population

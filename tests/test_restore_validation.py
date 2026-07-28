@@ -1687,9 +1687,36 @@ def test_immune_joint_comparator_pools_arms_and_emits_no_calls():
     assert all(r["anchor_recovery"] is not None for r in rows)
 
 
-def test_locked_path_still_requires_exactly_two_components():
-    with pytest.raises(ValueError, match="two NNMF components"):
-        rv.PairValidationConfig(n_components=4)
+def test_more_than_two_components_is_allowed_but_two_remains_the_default():
+    """k>2 is explicitly sanctioned by the manuscript and is the untried lever for rare targets.
+
+    This replaces `test_locked_path_still_requires_exactly_two_components`, which pinned k==2. The
+    manuscript permits more in the same sentence that specifies two: "by selecting the number of
+    clusters is equal to 2 (note that one could cluster more than 2 and assign each cluster into the
+    group of interest for inferring background or autofluorescence signal)". It matters because a
+    2-component Frobenius factorisation cannot isolate a group that is a fraction of a percent of the
+    data -- on donor 6566 INS the "target component" came out at 1,467,892 of 1,781,276 cells (82% of
+    the tissue) against a ground truth of a couple hundred INS+ cells. `directional_groups` already
+    picks the target/reference groups by highest mean over however many clusters exist.
+    """
+    assert rv.PairValidationConfig().n_components == 2          # default unchanged
+    assert rv.PairValidationConfig(n_components=4).n_components == 4
+    with pytest.raises(ValueError, match="at least two NNMF components"):
+        rv.PairValidationConfig(n_components=1)
+
+
+def test_beta_loss_and_solver_are_tunable_and_consistent():
+    """Frobenius is least squares and is dominated by the bulk; KL weights relative error. sklearn
+    requires the multiplicative-update solver for anything but frobenius, so an inconsistent pair must
+    fail at construction rather than deep inside the fit."""
+    assert rv.PairValidationConfig().nnmf_beta_loss == "frobenius"
+    assert rv.PairValidationConfig().nnmf_solver == "cd"
+    cfg = rv.PairValidationConfig(nnmf_beta_loss="kullback-leibler", nnmf_solver="mu")
+    assert cfg.nnmf_beta_loss == "kullback-leibler"
+    with pytest.raises(ValueError, match="requires solver='mu'"):
+        rv.PairValidationConfig(nnmf_beta_loss="kullback-leibler")
+    with pytest.raises(ValueError, match="nnmf_beta_loss must be one of"):
+        rv.PairValidationConfig(nnmf_beta_loss="nonsense", nnmf_solver="mu")
 
 
 def test_review_shortlist_only_names_pairs_the_screen_produces():
