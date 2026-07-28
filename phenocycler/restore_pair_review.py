@@ -207,6 +207,7 @@ CATEGORY_LEGEND = {
     "Unavailable": "Unavailable required measurements",
 }
 THRESHOLD_COLOR = "#005A42"
+FLOOR_COLOR = "#8C6D1F"        # raw input-floor guide lines; deliberately unlike the Step 1/2 green
 PDF_SUPTITLE_FONT_SIZE = 20
 PDF_ROW_TITLE_FONT_SIZE = 12
 PDF_AXIS_LABEL_FONT_SIZE = 14
@@ -222,6 +223,11 @@ PDF_LEGEND_HEIGHT_IN = 3.2
 MARKER_IMAGE_MAX_WIDTH_PX = 1_000
 MARKER_IMAGE_MAX_HEIGHT_PX = 600
 REPRESENTATIVE_ZOOM_SPAN_FRACTION = 0.10
+# MARKER_DISPLAY_LOWER_QUANTILE and MARKER_DISPLAY_GAMMA are the LEGACY fallback window only, used when
+# no measured background floor is available. They must not be reinstated as the default: a 1st-percentile
+# black point sits below the background rather than at it, and gamma < 1 lifts the dim end, so together
+# they render background as signal — the one thing these panels exist to let a reviewer distinguish.
+# See _display_marker_channel and tests/test_restore_validation.py.
 MARKER_DISPLAY_LOWER_QUANTILE = 0.01
 MARKER_DISPLAY_UPPER_QUANTILE = 0.998
 MARKER_DISPLAY_GAMMA = 0.65
@@ -950,20 +956,100 @@ def load_marker_zoom(
     )
 
 
+def _control_contamination_note(evaluation: dict) -> str:
+    """How much of the reference control arm is itself above the TARGET's own background floor.
+
+    The control arm is the population whose target intensity sets the divisor, so it is supposed to be
+    target-negative. Under `control_definition = reference_only` nothing requires that, and the review
+    colours cannot show it: a control cell that is also double-high is painted only as a control. This
+    is the number a reviewer needs to judge whether the divisor is being set by background or by real
+    target signal, so it is stated in words rather than left to be inferred from the cloud."""
+    control = evaluation.get("reference_control")
+    floor = evaluation.get("target_input_floor")
+    if control is None or floor is None or not np.isfinite(floor):
+        return "Control arm vs target floor: unavailable"
+    control = np.asarray(control, dtype=bool)
+    n = int(control.sum())
+    if not n:
+        return "Control arm vs target floor: no control cells"
+    above = int((np.asarray(evaluation["target_raw"])[control] > floor).sum())
+    # Kept within the width of the longest existing title line; a longer string clips off the panel.
+    return (
+        f"Control arm above TARGET floor: {above:,}/{n:,} ({100 * above / n:.1f}%) "
+        "— divisor set by target-positive cells"
+    )
+
+
+def _display_floors(evaluation: dict | None) -> tuple[float | None, float | None]:
+    """The (target, reference) per-donor raw input floors this pair's method computed.
+
+    FAIL LOUD on a missing floor. Silently falling back to the percentile window is exactly how these
+    panels came to render background as signal: the fallback is indistinguishable from working, and
+    nobody looks at a display path until the images are already wrong."""
+    if evaluation is None:
+        return None, None
+    floors = []
+    for key in ("target_input_floor", "reference_input_floor"):
+        if key not in evaluation:
+            raise KeyError(
+                f"evaluation has no {key}; the marker panels must be windowed on the measured "
+                "background floor, never on a percentile of the raw pixels"
+            )
+        value = evaluation[key]
+        floors.append(None if value is None or not np.isfinite(value) else float(value))
+    return floors[0], floors[1]
+
+
 def _display_marker_channel(
     pixels: np.ndarray,
+    background_floor: float | None = None,
 ) -> tuple[np.ndarray, tuple[float, float]]:
+    """Window one marker crop for display, with the BLACK POINT AT THE MEASURED BACKGROUND.
+
+    These panels exist so the reviewer can judge background. The previous window did the opposite of
+    that: the black point was the 1st percentile of positive pixels -- which sits BELOW the background,
+    not at it, so ~99% of pixels rendered non-black -- and gamma 0.65 then LIFTED the dim end, making
+    background brighter still. A weak channel rendered as a bright wash and the reviewer could not tell
+    background from signal, which is the one thing the panel is for.
+
+    The workflow already measures this marker's background on this donor: ``background_floor`` is the
+    per-donor, per-marker raw input floor (``linear_otsu``, or ``max(otsu, triangle)`` for the markers
+    with that policy) that the method itself uses to separate the arms. Anchoring the black point to it
+    means anything the method calls background renders as background, and the stretch spans only the
+    range above it. Gamma is 1.0 -- linear, no lifting.
+
+    ``background_floor=None`` falls back to the old percentile window and is only for callers with no
+    floor available; every review path supplies one.
+    """
     values = np.asarray(pixels, dtype=np.float32)
-    positive = values[np.isfinite(values) & (values > 0)]
-    if positive.size == 0:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
         return np.zeros(values.shape, dtype=np.float32), (0.0, 0.0)
-    lower, upper = np.quantile(
-        positive,
-        [MARKER_DISPLAY_LOWER_QUANTILE, MARKER_DISPLAY_UPPER_QUANTILE],
-    )
-    if upper <= lower:
-        lower = 0.0
-        upper = float(positive.max())
+
+    if background_floor is not None and np.isfinite(background_floor):
+        lower = float(background_floor)
+        above = finite[finite > lower]
+        # Stretch across the SIGNAL above the floor. If nothing clears the floor there is genuinely no
+        # signal in this crop, and the panel should render black rather than amplify the noise into one.
+        upper = (
+            float(np.quantile(above, MARKER_DISPLAY_UPPER_QUANTILE))
+            if above.size
+            else lower + 1.0
+        )
+        gamma = 1.0
+    else:
+        positive = finite[finite > 0]
+        if positive.size == 0:
+            return np.zeros(values.shape, dtype=np.float32), (0.0, 0.0)
+        lower, upper = (
+            float(x)
+            for x in np.quantile(
+                positive,
+                [MARKER_DISPLAY_LOWER_QUANTILE, MARKER_DISPLAY_UPPER_QUANTILE],
+            )
+        )
+        gamma = MARKER_DISPLAY_GAMMA
+
     if upper <= lower:
         return np.zeros(values.shape, dtype=np.float32), (
             float(lower),
@@ -971,7 +1057,7 @@ def _display_marker_channel(
         )
     scaled = np.clip((values - lower) / (upper - lower), 0.0, 1.0)
     scaled[~np.isfinite(scaled)] = 0.0
-    return np.power(scaled, MARKER_DISPLAY_GAMMA), (
+    return (scaled if gamma == 1.0 else np.power(scaled, gamma)), (
         float(lower),
         float(upper),
     )
@@ -997,9 +1083,10 @@ def _marker_panel_axes(
     )
 
 
-def _marker_zoom_metadata(marker_zoom: MarkerZoom) -> dict:
-    _, target_window = _display_marker_channel(marker_zoom.target_pixels)
-    _, reference_window = _display_marker_channel(marker_zoom.reference_pixels)
+def _marker_zoom_metadata(marker_zoom: MarkerZoom, evaluation: dict | None = None) -> dict:
+    target_floor, reference_floor = _display_floors(evaluation)
+    _, target_window = _display_marker_channel(marker_zoom.target_pixels, target_floor)
+    _, reference_window = _display_marker_channel(marker_zoom.reference_pixels, reference_floor)
     return {
         "source_qptiff": str(marker_zoom.source_path),
         "pyramid_level": marker_zoom.pyramid_level,
@@ -1097,8 +1184,9 @@ def _draw_review_row(
         edgecolors="none",
         rasterized=True,
     )
-    target_display, _ = _display_marker_channel(marker_zoom.target_pixels)
-    reference_display, _ = _display_marker_channel(marker_zoom.reference_pixels)
+    target_floor, reference_floor = _display_floors(evaluation)
+    target_display, _ = _display_marker_channel(marker_zoom.target_pixels, target_floor)
+    reference_display, _ = _display_marker_channel(marker_zoom.reference_pixels, reference_floor)
     target_rgb = _tinted_marker(target_display, TARGET_MARKER_RGB)
     reference_rgb = _tinted_marker(reference_display, REFERENCE_MARKER_RGB)
     merged_rgb = np.clip(target_rgb + reference_rgb, 0.0, 1.0)
@@ -1144,15 +1232,37 @@ def _draw_review_row(
         rasterized=True,
     )
     if evaluation["target_full_stats"]:
+        # Step 2 is the ACTIVE divisor (`divisor_statistic`, frozen at p99), not the manuscript maximum.
+        # Drawing the maximum put the line at ~0.95 of the axis on every panel by construction and
+        # showed the reviewer a threshold production does not use -- median 6x, up to 200x above the
+        # real one. Step 1 (the vertical) IS a maximum by definition and is unchanged.
         cloud.axhline(
             _scaled(
-                [evaluation["target_full_stats"]["maximum"]],
+                [evaluation["target_full_stats"]["divisor"]],
                 evaluation["display_target_bounds"],
             )[0],
             color=THRESHOLD_COLOR,
             lw=2.2,
             ls="-",
         )
+    # The RAW input floors, drawn as guide lines. The review categories are assigned by a chain of
+    # OVERWRITES, so they are mutually exclusive and a cell that is both double-high AND a reference
+    # control is painted only as a reference control. That hides the single most important diagnostic on
+    # the panel: how much of the control arm -- the population whose target intensity DEFINES the
+    # divisor -- is itself above the target's own background floor. Drawing the floors lets the reviewer
+    # read the double-high region directly, independent of the colour precedence.
+    for value, bounds, axline in (
+        (evaluation.get("target_input_floor"), evaluation["display_target_bounds"], cloud.axhline),
+        (evaluation.get("reference_input_floor"), evaluation["display_reference_bounds"], cloud.axvline),
+    ):
+        if value is not None and np.isfinite(value):
+            axline(
+                _scaled([value], bounds)[0],
+                color=FLOOR_COLOR,
+                lw=1.1,
+                ls=(0, (2, 3)),
+                zorder=1,
+            )
     if evaluation["reference_full_stats"]:
         cloud.axvline(
             _scaled(
@@ -1192,6 +1302,7 @@ def _draw_review_row(
             f"anchor (sets Step 1) n={evaluation['target_anchor_n']:,}\n"
             "Retained at/below Step 2 (component, NOT called) "
             f"n={evaluation['target_supported_below_divisor_n']:,}\n"
+            f"{_control_contamination_note(evaluation)}\n"
             f"Scale tails {'WIDENED' if evaluation.get('scale_bound_adapted') else 'as configured'} "
             f"({evaluation.get('scale_bound_lower_quantile', 0.005):.3f}-"
             f"{evaluation.get('scale_bound_upper_quantile', 0.995):.3f} on n="
@@ -1315,7 +1426,10 @@ def _create_review_figure(
     return fig, axes, legend_axis
 
 
-def _review_legend_handles() -> list[Line2D]:
+def _review_legend_handles(*, wrap: int | None = None) -> list[Line2D]:
+    def _label(text: str) -> str:
+        return "\n".join(textwrap.wrap(text, wrap)) if wrap else text
+
     handles = [
         Line2D(
             [0],
@@ -1323,7 +1437,7 @@ def _review_legend_handles() -> list[Line2D]:
             marker="o",
             color="none",
             markerfacecolor=CATEGORY_COLOR[category],
-            label=CATEGORY_LEGEND[category],
+            label=_label(CATEGORY_LEGEND[category]),
             markersize=9,
         )
         for category in CATEGORY_ORDER
@@ -1336,7 +1450,7 @@ def _review_legend_handles() -> list[Line2D]:
                 marker="s",
                 color="none",
                 markerfacecolor=TARGET_MARKER_RGB,
-                label="Raw target-marker pixels (magenta)",
+                label=_label("Raw target-marker pixels (magenta)"),
                 markersize=9,
             ),
             Line2D(
@@ -1345,7 +1459,7 @@ def _review_legend_handles() -> list[Line2D]:
                 marker="s",
                 color="none",
                 markerfacecolor=REFERENCE_MARKER_RGB,
-                label="Raw reference-marker pixels (cyan)",
+                label=_label("Raw reference-marker pixels (cyan)"),
                 markersize=9,
             ),
             Line2D(
@@ -1354,7 +1468,7 @@ def _review_legend_handles() -> list[Line2D]:
                 color=THRESHOLD_COLOR,
                 lw=2.2,
                 ls="--",
-                label=(
+                label=_label(
                     "Step 1 vertical: max reference MFI in high-confidence "
                     "target anchor"
                 ),
@@ -1365,9 +1479,20 @@ def _review_legend_handles() -> list[Line2D]:
                 color=THRESHOLD_COLOR,
                 lw=2.2,
                 ls="-",
-                label=(
+                label=_label(
                     "Step 2 horizontal: RESTORE target divisor; not a "
                     "lower-confidence-target exclusion"
+                ),
+            ),
+            Line2D(
+                [0],
+                [0],
+                color=FLOOR_COLOR,
+                lw=1.1,
+                ls=(0, (2, 3)),
+                label=_label(
+                    "Raw input floors (both axes): the per-donor background floor for each marker. "
+                    "Above BOTH = double-high, whatever colour the cell is painted"
                 ),
             ),
         ]
@@ -1376,9 +1501,15 @@ def _review_legend_handles() -> list[Line2D]:
 
 
 def _add_review_legend(legend_axis: plt.Axes):
-    """Place the complete legend inside its dedicated non-data axis."""
+    """Place the complete legend inside its dedicated non-data axis.
+
+    The labels run to ~150 characters. A ``loc="center"`` legend is NOT shrunk to fit its axis, so on a
+    3-column layout the box grew wider than the page and was clipped at BOTH edges — the legend that
+    defines every colour in the bundle was unreadable at exactly the ends of the lines. Fixed by hard-
+    wrapping each label and then measuring the drawn legend, shrinking the font only if it still
+    overflows, so the layout is deterministic and never depends on the renderer guessing."""
     legend = legend_axis.legend(
-        handles=_review_legend_handles(),
+        handles=_review_legend_handles(wrap=52),
         loc="center",
         ncol=3,
         fontsize=PDF_LEGEND_FONT_SIZE,
@@ -1392,7 +1523,28 @@ def _add_review_legend(legend_axis: plt.Axes):
         labelspacing=0.9,
         borderpad=0.9,
     )
+    _shrink_legend_to_fit(legend, legend_axis)
     return legend
+
+
+def _shrink_legend_to_fit(legend, legend_axis: plt.Axes, *, min_font: float = 6.5) -> None:
+    """Shrink the legend font until its drawn box fits inside its axis. No-op when it already fits."""
+    figure = legend_axis.get_figure()
+    try:
+        renderer = figure.canvas.get_renderer()
+    except AttributeError:                                  # backend without a live renderer
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+    available = legend_axis.get_window_extent(renderer).width
+    size = float(PDF_LEGEND_FONT_SIZE)
+    while size > min_font:
+        width = legend.get_window_extent(renderer).width
+        if width <= available:
+            return
+        size = max(min_font, size * min(0.94, available / width))
+        for text in legend.get_texts():
+            text.set_fontsize(size)
+        figure.canvas.draw()
 
 
 def _add_review_suptitle(
@@ -1701,7 +1853,14 @@ def build_review_bundle(
     )
     _write_review_workflow(temp_dir / REVIEW_WORKFLOW_NAME)
     donor_cache: dict[str, pd.DataFrame] = {}
+    donor_audit_cache: dict[str, dict] = {}
     full_donor_cache: dict[str, pd.DataFrame] = {}
+    # The 5% compartment sample (`qupath_compartment_sample_20donor/`) no longer exists and cannot be
+    # regenerated — the QuPath measurement CSV it was extracted from is gone — so a bundle is now built
+    # with `--sample` and `--full-compartment-cells` pointing at the SAME full-cell directory. Loading
+    # each donor twice then holds two identical frames (~1.7 GB per donor across 20 donors). Reuse the
+    # frame when the sources are the same path; the full-cell completeness assertion below still runs.
+    same_source = Path(sample_root).resolve() == full_compartment_cells
     export_manifest = []
     try:
         pair_summary.to_csv(temp_dir / "pair_summary.csv", index=False)
@@ -1715,7 +1874,7 @@ def build_review_bundle(
             for row_index, row in enumerate(pair_queue.itertuples(index=False)):
                 donor = str(row.donor)
                 if donor not in donor_cache:
-                    donor_cache[donor], _ = load_validation_sample(
+                    donor_cache[donor], donor_audit_cache[donor] = load_validation_sample(
                         Path(sample_root),
                         Path(raw_cells),
                         Path(redsea_cells),
@@ -1748,12 +1907,16 @@ def build_review_bundle(
                     zoom_y,
                 )
                 if donor not in full_donor_cache:
-                    full_donor_df, full_audit = load_validation_sample(
-                        full_compartment_cells,
-                        Path(raw_cells),
-                        Path(redsea_cells),
-                        donor,
-                    )
+                    if same_source:
+                        full_donor_df = donor_cache[donor]
+                        full_audit = donor_audit_cache[donor]
+                    else:
+                        full_donor_df, full_audit = load_validation_sample(
+                            full_compartment_cells,
+                            Path(raw_cells),
+                            Path(redsea_cells),
+                            donor,
+                        )
                     if full_audit["n"] != full_audit["canonical_n"]:
                         raise ValueError(
                             f"donor {donor}: full-cell review source contains "
@@ -1789,7 +1952,7 @@ def build_review_bundle(
                     evaluation,
                     qupath_dir / f"{stem}.csv",
                 )
-                export_record["marker_zoom"] = _marker_zoom_metadata(marker_zoom)
+                export_record["marker_zoom"] = _marker_zoom_metadata(marker_zoom, evaluation)
                 export_record["model_sample_overlap_n"] = sample_overlap_n
                 export_record["model_sample_category_match"] = True
                 export_manifest.append(export_record)
@@ -1882,11 +2045,17 @@ def build_review_bundle(
                 "Only QPTIFF tiles overlapping the physical crop are decoded. The first "
                 "tiled pyramid level producing at most 1000 x 600 crop pixels is used. "
                 "If no tiled level reaches that target, the deepest tiled level is used. "
-                "Each channel is independently windowed from the 1st to 99.8th percentile "
-                "of positive crop pixels and displayed with gamma 0.65. Target pixels are "
-                "magenta and reference pixels cyan; this contrast transform affects only "
-                "display, never RESTORE fitting or calls. Exact source, level, crop, and "
-                "display windows are recorded per row in qupath_exports.marker_zoom."
+                "Each channel is windowed with its BLACK POINT AT THE MEASURED BACKGROUND: "
+                "the lower bound is that donor-marker's own raw input floor (linear Otsu, or "
+                "max(Otsu, Triangle) where that is the marker's policy) -- the same floor the "
+                "method uses to separate the arms -- and the upper bound is the 99.8th "
+                "percentile of pixels ABOVE that floor, displayed LINEARLY (gamma 1.0). "
+                "Anything the method calls background therefore renders as background, and a "
+                "crop with nothing above the floor renders black instead of having its noise "
+                "amplified into apparent signal. Target pixels are magenta and reference "
+                "cyan; this affects only display, never RESTORE fitting or calls. Exact "
+                "source, level, crop, floor and window are recorded per row in "
+                "qupath_exports.marker_zoom."
             ),
             "figure_layout": (
                 "expression_cloud_plus_all_cell_target_reference_overlay_and_merged_closeup"

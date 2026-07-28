@@ -1216,8 +1216,14 @@ def test_review_row_combines_marker_images_overlay_and_merged_view():
         "reference_redsea": np.linspace(0, 10, 12),
         "display_target_bounds": (0.0, 10.0),
         "display_reference_bounds": (0.0, 10.0),
-        "target_full_stats": {"maximum": 2.0},
-        "reference_full_stats": {"maximum": 2.0},
+        # `divisor` is the active statistic and is what the Step-2 line draws; `maximum` is the
+        # manuscript value, kept so the row stays representative of a real evaluation.
+        "target_full_stats": {"maximum": 2.0, "divisor": 1.5},
+        "reference_full_stats": {"maximum": 2.0, "divisor": 1.5},
+        # Every real evaluation carries these; the marker panels are windowed on them and
+        # `_display_floors` raises without them, by design.
+        "target_input_floor": 1.0,
+        "reference_input_floor": 1.0,
         "state": rv.PairState.PAIR_REVIEW_PENDING.value,
         "target_fold": 2.0,
         "reference_fold": 3.0,
@@ -1777,3 +1783,85 @@ def test_cell_is_always_required():
     with pytest.raises(ValueError, match="no usable feature compartment"):
         rv.evaluate_locked_pair(df, "TEST", "CD68", "E_cadherin", config=cfg,
                                 pair_review=rv.PairReview.ACCEPTED)
+
+
+# --------------------------------------------------------------------------- #
+# Review-display invariants. Both of these shipped broken and were caught only by a reviewer looking
+# at the finished PDFs, so they are asserted here rather than trusted.
+# --------------------------------------------------------------------------- #
+def test_step2_line_and_axis_use_the_active_divisor_not_the_manuscript_maximum():
+    """The drawn Step-2 threshold must be the divisor production uses.
+
+    While `divisor_statistic` was `max` these coincided. Frozen at p99 they diverge by a median 6x
+    (up to 200x), and both the line and the axis top were still taken from `maximum` -- so every panel
+    showed a threshold production does not use, and the data cloud was crushed into the bottom few
+    percent of the axis."""
+    source = Path(rpr.__file__).read_text()
+    drawn = source.split("cloud.axhline(", 1)[1][:260]
+    assert '["target_full_stats"]["divisor"]' in drawn, (
+        "Step 2 must be drawn at target_full_stats['divisor'] (the active statistic)"
+    )
+    assert '["target_full_stats"]["maximum"]' not in drawn, (
+        "Step 2 must NOT be drawn at the manuscript maximum"
+    )
+
+    validation = Path(rv.__file__).read_text()
+    assert '1.05 * float(target_full_stats["divisor"])' in validation, (
+        "the display y-axis must be scaled by the active divisor"
+    )
+    assert '1.05 * float(target_full_stats["maximum"])' not in validation, (
+        "the display y-axis must NOT be scaled by the manuscript maximum"
+    )
+
+
+def test_marker_panels_are_windowed_on_the_measured_background_floor():
+    """Background must render as background. These panels exist to judge background handling.
+
+    The black point is the donor-marker's own raw input floor, and the transform is linear. A
+    percentile black point sits BELOW the background so nearly every pixel renders non-black, and a
+    gamma under 1 lifts the dim end -- together they turn a weak channel into a bright wash."""
+    rng = np.random.default_rng(0)
+    floor = 500.0
+    # A crop that is 97% background just under the floor and 3% real signal well above it.
+    pixels = rng.normal(300.0, 40.0, size=(200, 200)).astype(np.float32)
+    signal = rng.integers(0, 200, size=(2, 600))
+    pixels[signal[0], signal[1]] = rng.normal(3000.0, 200.0, size=600)
+
+    shown, window = rpr._display_marker_channel(pixels, floor)
+    assert window[0] == floor, "the black point must be the measured background floor"
+    background = shown[pixels <= floor]
+    assert background.max() == 0.0, "every pixel at or below the floor must render pure black"
+    assert shown[pixels > floor].mean() > 0.0, "signal above the floor must still render"
+
+    # ... and the old percentile+gamma window is what it must never silently fall back to. Pin the two
+    # mechanisms that made it wrong, so the guard fails if anyone reinstates either.
+    legacy, legacy_window = rpr._display_marker_channel(pixels)
+    assert legacy_window[0] < floor, "the legacy black point sat BELOW the background, not at it"
+    legacy_background = legacy[pixels <= floor]
+    assert legacy_background.mean() > 0.05, (
+        "sanity: under the legacy window background rendered visibly non-black — the defect guarded here"
+    )
+    # gamma < 1 LIFTS the dim end: the displayed background is brighter than its linear position.
+    linear_position = (
+        (pixels[pixels <= floor].mean() - legacy_window[0])
+        / (legacy_window[1] - legacy_window[0])
+    )
+    assert legacy_background.mean() > 2 * linear_position, "gamma 0.65 amplified background"
+
+
+def test_marker_panel_with_no_signal_above_the_floor_renders_black():
+    """A crop with nothing above the floor must go black, not have its noise stretched into signal."""
+    rng = np.random.default_rng(1)
+    pixels = rng.normal(200.0, 30.0, size=(64, 64)).astype(np.float32)
+    shown, _ = rpr._display_marker_channel(pixels, 900.0)
+    assert shown.max() == 0.0
+
+
+def test_display_floors_fail_loud_when_the_evaluation_has_none():
+    """A missing floor must raise, not silently revert to the percentile window."""
+    with pytest.raises(KeyError, match="target_input_floor"):
+        rpr._display_floors({"reference_input_floor": 1.0})
+    assert rpr._display_floors(None) == (None, None)
+    assert rpr._display_floors(
+        {"target_input_floor": 5.0, "reference_input_floor": None}
+    ) == (5.0, None)

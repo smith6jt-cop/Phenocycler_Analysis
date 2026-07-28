@@ -6,7 +6,7 @@ from phenocycler import reference_selection as rs
 
 
 def _screen_row(target, reference, ratio, divisor, *, undersized, donor, fold=5.0,
-                called=0.1, n_assigned=10_000, target_n=2000):
+                called=0.1, n_assigned=10_000, target_n=2000, double_high=0.001):
     return {
         "donor": donor,
         "target": target,
@@ -19,6 +19,9 @@ def _screen_row(target, reference, ratio, divisor, *, undersized, donor, fold=5.
         "reference_fold": fold,
         "threshold_positive_n": int(called * n_assigned),
         "n_assigned": n_assigned,
+        # Mutual-exclusivity violation rate. Default is the ~0.1% every sound accepted pair shows on
+        # the real screen; tests that exercise the exclusivity veto pass a large value explicitly.
+        "double_high_fraction": double_high,
     }
 
 
@@ -169,3 +172,82 @@ def test_open_rationale_names_the_structural_cause_when_every_ratio_is_far_below
     assert d.status == "open"
     assert "inevitable rather than a property of the references" in d.rationale
     assert "reference_fold_median" in d.rationale
+
+
+# --------------------------------------------------------------------------- #
+# Mutual exclusivity (added 2026-07-28). The manuscript's Lemma 1 partitions a pair into
+# reference-positive / target-positive / negative-for-both. A cell positive for BOTH contradicts that,
+# so a reference sharing a population with its target cannot be a negative control at all. This was
+# measured on every screen as `double_high_fraction` but never used to select, which is how
+# `CD11b <- EpCAM` (17.3% median, max 41.1%) reached production while every other accepted pair sat
+# at 0.12%.
+# --------------------------------------------------------------------------- #
+def _exclusivity_screen(double_high_for_epcam):
+    rows = []
+    for d in range(20):
+        donor = f"d{d:02d}"
+        # EpCAM: large control, passes the frequency rule easily — but may not be exclusive.
+        rows.append(_screen_row("CD11b", "EpCAM", 3.6, 1000.0, undersized=False, donor=donor,
+                                double_high=double_high_for_epcam))
+        # CD3e: exclusive, but a sparse control that fails the frequency rule.
+        rows.append(_screen_row("CD11b", "CD3e", 0.04, 700.0, undersized=True, donor=donor,
+                                double_high=0.001))
+    return pd.DataFrame(rows)
+
+
+def test_exclusivity_is_measured_and_reported():
+    m = rs.build_reference_matrix(_exclusivity_screen(0.173))
+    epcam = m[(m.target == "CD11b") & (m.reference == "EpCAM")].iloc[0]
+    assert epcam["double_positive_median"] == pytest.approx(0.173)
+    assert not epcam["passes_exclusivity_rule"]
+    cd3e = m[(m.target == "CD11b") & (m.reference == "CD3e")].iloc[0]
+    assert cd3e["passes_exclusivity_rule"]
+
+
+def test_a_maintainer_override_cannot_rescue_a_non_exclusive_reference():
+    """The real CD11b case: EpCAM was frozen by override while 17.3% double-positive.
+
+    An override expresses a preference between admissible references. It cannot make the manuscript's
+    premise hold, so it must be voided rather than obeyed."""
+    m = rs.build_reference_matrix(_exclusivity_screen(0.173),
+                                  overrides={"CD11b": "EpCAM"})
+    decision = {d.target: d for d in rs.recommend_references(m, overrides={"CD11b": "EpCAM"})}["CD11b"]
+    assert decision.status == "open"
+    assert decision.recommended_reference != "EpCAM"
+    assert "OVERRIDE VOIDED" in decision.rationale
+    # and the non-exclusive row must never render as accepted
+    assert (m[(m.target == "CD11b") & (m.reference == "EpCAM")].iloc[0]["recommendation"]
+            == "rejected (not exclusive)")
+
+
+def test_an_exclusive_override_is_still_honoured():
+    """The veto must be specific to exclusivity, not a blanket refusal of overrides."""
+    m = rs.build_reference_matrix(_exclusivity_screen(0.001), overrides={"CD11b": "EpCAM"})
+    decision = {d.target: d for d in rs.recommend_references(m, overrides={"CD11b": "EpCAM"})}["CD11b"]
+    assert decision.status == "accepted" and decision.recommended_reference == "EpCAM"
+
+
+def test_target_with_no_exclusive_reference_is_open_not_patched():
+    """No admissible reference must surface as `open` with an explicit do-not-patch-the-gate note."""
+    rows = []
+    for d in range(20):
+        for ref, dh in (("EpCAM", 0.17), ("E_cadherin", 0.16)):
+            rows.append(_screen_row("CD11b", ref, 3.0, 1000.0, undersized=False,
+                                    donor=f"d{d:02d}", double_high=dh))
+    m = rs.build_reference_matrix(pd.DataFrame(rows))
+    decision = {d.target: d for d in rs.recommend_references(m)}["CD11b"]
+    assert decision.status == "open" and decision.recommended_reference is None
+    assert "mutual exclusivity" in decision.rationale
+    assert "lineage gate" in decision.rationale
+
+
+def test_double_positive_max_is_reported_because_the_median_hides_donor_blowups():
+    """INS <- Pan_CK is 0.04% median and 56.6% on one donor. A median-only rule would miss it."""
+    rows = [_screen_row("INS", "Pan_Cytokeratin", 3.0, 500.0, undersized=False,
+                        donor=f"d{d:02d}", double_high=0.566 if d == 0 else 0.0004)
+            for d in range(20)]
+    row = rs.build_reference_matrix(pd.DataFrame(rows)).iloc[0]
+    assert row["double_positive_median"] == pytest.approx(0.0004)
+    assert row["double_positive_max"] == pytest.approx(0.566)
+    assert row["double_positive_donors_over_limit"] == pytest.approx(0.05)
+    assert row["passes_exclusivity_rule"]      # passes on the median, but the max is on the record

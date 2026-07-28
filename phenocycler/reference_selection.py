@@ -115,6 +115,7 @@ def build_reference_matrix(
         "reference_fold",
         "threshold_positive_n",
         "n_assigned",
+        "double_high_fraction",
     }
     missing = required.difference(pair_evaluations.columns)
     if missing:
@@ -161,6 +162,7 @@ def build_reference_matrix(
     rows = []
     for (target, reference), grp in pe.groupby(["target", "reference"]):
         ratio = grp["reference_to_target_ratio"].astype(float)
+        double = grp["double_high_fraction"].astype(float)
         rows.append(
             {
                 "target": target,
@@ -169,6 +171,15 @@ def build_reference_matrix(
                 "ratio_median": float(ratio.median()),
                 "ratio_min": float(ratio.min()),
                 "ratio_max": float(ratio.max()),
+                # Mutual exclusivity: the manuscript's premise, measured. The per-donor MAX is reported
+                # beside the median because three pairs are clean at the median and catastrophic on a
+                # single donor (INS <- Pan_CK max 56.6%, SST <- Pan_CK 46.1%, B3TUBB <- EpCAM 26.5%),
+                # which a cohort median hides entirely.
+                "double_positive_median": float(double.median()),
+                "double_positive_max": float(double.max()),
+                "double_positive_donors_over_limit": float(
+                    (double > config.max_double_positive_fraction).mean()
+                ),
                 "undersized_frac": float(grp["reference_undersized"].astype(bool).mean()),
                 "divisor_median": float(grp["candidate_full_maximum"].median()),
                 "divisor_vs_consensus_median": (
@@ -183,6 +194,13 @@ def build_reference_matrix(
                 ),
                 "passes_frequency_rule": bool(
                     ratio.median() >= config.min_reference_to_target_ratio
+                ),
+                # HARD criterion, unlike the frequency rule. A reference that is not mutually exclusive
+                # with its target cannot serve as a negative control at all -- the premise fails, so no
+                # divisor derived from it means what the method says it means. The frequency rule is
+                # advisory (a sparse-but-valid control is still a control); this one is not.
+                "passes_exclusivity_rule": bool(
+                    double.median() <= config.max_double_positive_fraction
                 ),
                 "is_baseline_reference": (target, reference) in set(BASELINE_PAIRS),
             }
@@ -204,8 +222,12 @@ def build_reference_matrix(
 
 
 def _row_recommendation(row: pd.Series, recommended: str | None) -> str:
-    # The maintainer-accepted reference wins even if it fails the frequency rule (E_cadherin <- CD31),
-    # so check the recommendation before the rule.
+    # Mutual exclusivity is checked FIRST and outranks the recommendation: a non-exclusive reference is
+    # inadmissible however it was chosen, so it must never render as "accepted".
+    if not row["passes_exclusivity_rule"]:
+        return "rejected (not exclusive)"
+    # The maintainer-accepted reference then wins even if it fails the frequency rule
+    # (E_cadherin <- CD31), so check the recommendation before that advisory rule.
     if row["reference"] == recommended:
         return "accepted"
     if not row["passes_frequency_rule"]:
@@ -227,6 +249,54 @@ def recommend_references(
     baseline = _baseline_reference()
     decisions: list[ReferenceDecision] = []
     for target, grp in matrix.groupby("target"):
+        # MUTUAL EXCLUSIVITY IS A HARD VETO and is applied BEFORE the override branch, because a
+        # maintainer override cannot make a non-exclusive pair into a valid negative control -- the
+        # manuscript's premise either holds or it does not. `CD11b <- EpCAM` was frozen by exactly such
+        # an override on 2026-07-24 while carrying a 17.3% double-positive rate that nothing tested.
+        exclusive = grp[grp["passes_exclusivity_rule"]]
+        if exclusive.empty:
+            worst = float(grp["double_positive_median"].min())
+            decisions.append(
+                ReferenceDecision(
+                    target=target,
+                    recommended_reference=None,
+                    status="open",
+                    rationale=(
+                        f"NO admissible reference: every candidate violates mutual exclusivity "
+                        f"(best median double-positive {worst:.1%}). The manuscript partitions a pair "
+                        "into reference-positive / target-positive / negative-for-both, so a shared "
+                        "population means no reference-positive cell can be assumed target-negative "
+                        "and no divisor from it is interpretable. Defer this target or find an "
+                        "exclusive reference; do NOT patch it in the lineage gate."
+                    ),
+                )
+            )
+            continue
+        if target in overrides and overrides[target] not in set(exclusive["reference"]):
+            row = grp[grp["reference"] == overrides[target]]
+            dp = float(row.iloc[0]["double_positive_median"]) if not row.empty else float("nan")
+            best = exclusive.sort_values("ratio_median", ascending=False).iloc[0]
+            decisions.append(
+                ReferenceDecision(
+                    target=target,
+                    recommended_reference=str(best["reference"]),
+                    status="open",
+                    rationale=(
+                        f"OVERRIDE VOIDED: the frozen choice {overrides[target]} violates mutual "
+                        f"exclusivity ({dp:.1%} double-positive). {best['reference']} is exclusive "
+                        f"({float(best['double_positive_median']):.2%}) but fails the frequency rule "
+                        f"(median ratio {float(best['ratio_median']):.2f}) -- the two criteria "
+                        "disagree, so this is a maintainer decision, not a computation."
+                        if not bool(best["passes_frequency_rule"])
+                        else
+                        f"OVERRIDE VOIDED: the frozen choice {overrides[target]} violates mutual "
+                        f"exclusivity ({dp:.1%} double-positive); {best['reference']} is exclusive "
+                        f"({float(best['double_positive_median']):.2%}) and passes the frequency rule."
+                    ),
+                )
+            )
+            continue
+        grp = exclusive
         if target in overrides:
             chosen = overrides[target]
             chosen_row = grp[grp["reference"] == chosen]
@@ -369,7 +439,8 @@ def plot_target_diagnostic(
 
     def _color(r: str) -> str:
         rr = tmatrix.loc[r, "recommendation"] if r in tmatrix.index else "comparator"
-        return {"accepted": "#228833", "rejected": "#CC3311", "comparator": "#4477AA"}.get(
+        return {"accepted": "#228833", "rejected": "#CC3311", "rejected (not exclusive)": "#882255",
+         "comparator": "#4477AA"}.get(
             rr, "#4477AA"
         )
 

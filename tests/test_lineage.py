@@ -6,7 +6,8 @@ import pandas as pd
 import pytest
 
 from phenocycler import lineage
-from phenocycler.config import COMPARTMENT_ORDER, COMPARTMENT_GATES, OTHER_LABEL, UNRESOLVED_LABEL
+from phenocycler.config import (COMPARTMENT_ORDER, COMPARTMENT_GATES, OTHER_LABEL, UNRESOLVED_LABEL,
+                                PipelineConfig)
 
 CLASSES = COMPARTMENT_ORDER + [OTHER_LABEL, UNRESOLVED_LABEL]
 GATE_MARKERS = sorted({m for gate in COMPARTMENT_GATES.values() for m in gate})
@@ -164,3 +165,28 @@ def test_assign_and_write_atomic(tmp_path):
     part = out_dir / "donor_id=TEST"
     assert (part / "data_0.parquet").exists()
     assert not list(part.glob("*.tmp*"))                       # atomic write left no temp file
+
+
+def test_run_lineage_persists_the_composition_table(tmp_path, monkeypatch):
+    """run_lineage writes broad_lineage_composition.csv beside the figure.
+
+    Gate 5 signs off per donor, so the composition has to survive as a joinable table and not only as
+    a PNG. Percentages must agree with the absolute counts in the same row."""
+    _write(tmp_path, [{"id": "a", "CD3e": "positive"}, {"id": "b", "E_cadherin": "positive"},
+                      {"id": "c"}, {"id": "d", "CD3e": "unavailable"}])
+    cfg = PipelineConfig(data_dir=tmp_path, donor_metadata=tmp_path / "absent.xlsx", n_jobs=1)
+    monkeypatch.setattr(lineage, "_composition_figure", lambda *a, **k: None)   # no matplotlib in the unit test
+
+    table = lineage.run_lineage(cfg)
+
+    csv = cfg.phenotype_dir / "broad_lineage_composition.csv"
+    assert csv.exists() and not list(csv.parent.glob("*.tmp*"))
+    saved = pd.read_csv(csv, dtype={"donor": str}).set_index("donor")
+    assert list(saved.index) == ["TEST"]
+    assert saved.loc["TEST", "n_cells"] == 4
+    assert saved.loc["TEST", "n_other"] == 1 and saved.loc["TEST", "n_unresolved"] == 1
+    assert saved.loc["TEST", OTHER_LABEL] == pytest.approx(25.0)
+    assert saved.loc["TEST", UNRESOLVED_LABEL] == pytest.approx(25.0)
+    assert saved.loc[:, CLASSES].sum(axis=1).iloc[0] == pytest.approx(100.0)
+    # the returned frame is the same composition, so a caller need not re-read the file
+    assert table.loc["TEST", CLASSES].tolist() == saved.loc["TEST", CLASSES].tolist()

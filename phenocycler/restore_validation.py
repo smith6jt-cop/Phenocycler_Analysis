@@ -368,6 +368,16 @@ class PairValidationConfig:
     # reviewer uses it and records any reject as a human decision (so E_cadherin <- CD31 stays
     # reviewable rather than auto-failed).
     min_reference_to_target_ratio: float = 1.0
+    # MUTUAL-EXCLUSIVITY PREMISE (added 2026-07-28). The manuscript's Lemma 1 partitions a pair's cells
+    # into exactly three groups -- reference-positive, target-positive, negative for both -- so a cell
+    # positive for BOTH members contradicts the premise the whole method rests on. `double_high_fraction`
+    # measures that violation and was recorded but never used as a selection criterion, which is how
+    # `CD11b <- EpCAM` reached production: 17.3% median (max 41.1%) against 0.12% for the other 23
+    # accepted pairs, i.e. its "negative control" is 17% target-positive.
+    # 0.05 is an order-of-magnitude separator, not a tuned value: 23 of 24 accepted pairs sit below
+    # 1.1% and the failing one is at 17.3%. Used by reference_selection; like the frequency rule it is
+    # DIAGNOSTIC at screen time and never gates PairState or alters a divisor.
+    max_double_positive_fraction: float = 0.05
     # Minimum cells each robust min-max tail must span for the balanced fit sample to estimate the
     # scaling bounds. Below it the quantile degenerates into an order statistic of a handful of cells
     # (a sparse-marker arm), so bounds fall back to the input-QC-retained population instead.
@@ -453,6 +463,8 @@ class PairValidationConfig:
             raise ValueError("min_divisor_reproducibility must be in [0, 1]")
         if self.min_reference_to_target_ratio <= 0:
             raise ValueError("min_reference_to_target_ratio must be > 0")
+        if not 0 < self.max_double_positive_fraction <= 1:
+            raise ValueError("max_double_positive_fraction must be in (0, 1]")
         if self.min_quantile_support_cells < 1:
             raise ValueError("min_quantile_support_cells must be >= 1")
         if self.degenerate_tail_support_cells < self.min_quantile_support_cells:
@@ -2558,8 +2570,15 @@ def evaluate_locked_pair(
         upper_quantile=display_upper_q,
     )
     if target_full_stats is not None:
+        # The ACTIVE divisor under the configured `divisor_statistic`, NOT the manuscript maximum.
+        # These coincided while the policy was `max`; when it was frozen to `p99` (2026-07-27) they
+        # diverged by a median 6x and up to 200x, and this line kept stretching the axis to the max.
+        # A single outlier control cell then compressed every real cell into the bottom few percent of
+        # the panel -- e.g. 6591 CD11b <- Pan_Cytokeratin: max 54,104 against a p99 divisor of 1,532,
+        # so the whole cloud sat below y = 0.04 and looked empty. The axis must be scaled by the
+        # threshold the reviewer is actually judging.
         display_upper[0] = max(
-            float(display_upper[0]), 1.05 * float(target_full_stats["maximum"])
+            float(display_upper[0]), 1.05 * float(target_full_stats["divisor"])
         )
     if controls.reference_separator is not None:
         display_upper[1] = max(

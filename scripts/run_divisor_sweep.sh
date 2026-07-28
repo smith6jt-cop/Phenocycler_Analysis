@@ -64,8 +64,13 @@ SAMPLE="${REPO_ROOT}/data/restore_pair_validation/qupath_compartment_full_20dono
 RAW_CELLS="${REPO_ROOT}/data/cells"
 REDSEA_CELLS="${REPO_ROOT}/data/cells_redsea"
 PAIR_REVIEWS="${REPO_ROOT}/data/restore_pair_validation/pair_reviews_accepted.csv"
+# The SAME expression reviews the production apply reads (config.restore_expression_reviews_csv).
+# Omitting this does not merely lose provenance -- it changes states: without it donor 6566 INS returns
+# MODEL_UNSTABLE instead of the NO_TARGET_EXPRESSION_CONFIRMED that production records, so a sweep arm
+# would silently disagree with the run it is meant to explain.
+EXPRESSION_REVIEWS="${REPO_ROOT}/data/restore_pair_validation/expression_reviews.csv"
 
-for p in "$SAMPLE" "$RAW_CELLS" "$REDSEA_CELLS" "$PAIR_REVIEWS"; do
+for p in "$SAMPLE" "$RAW_CELLS" "$REDSEA_CELLS" "$PAIR_REVIEWS" "$EXPRESSION_REVIEWS"; do
   [[ -e "$p" ]] || { echo "[err] missing required input: $p" >&2; exit 1; }
 done
 
@@ -92,6 +97,7 @@ for arm in "${ARMS[@]}"; do
     --redsea-cells "$REDSEA_CELLS" \
     --pair-set "$PAIR_SET" \
     --pair-reviews "$PAIR_REVIEWS" \
+    --expression-reviews "$EXPRESSION_REVIEWS" \
     --control-definition "$ctrl" \
     --divisor-statistic "$stat" \
     --feature-compartments "${FEATURE_COMPARTMENTS[@]}" \

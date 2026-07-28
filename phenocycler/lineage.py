@@ -13,13 +13,20 @@ could not rule out of a higher-priority compartment. A cell valid-and-NEGATIVE f
 ``Other`` (a real panel gap — mast/Schwann/adipocyte/quiescent-stellate — NOT force-assigned).
 Priority high->low:
 
-  1. Immune      <- ANY(CD3e, CD68, CD11b) positive   (T / macrophage / myeloid — the 3 screened anchors)
-  2. Epithelial  <- E_cadherin positive               (the only epithelial marker that stays + on endocrine)
-  3. Endothelial <- CD31 positive
+  1. Immune      <- ANY(CD3e, CD68, CD11b, CD79a, CD11c, Iba1, CD206, MPO, CD4, CD8) positive
+  2. Endothelial <- ANY(CD31, CD34, Podoplanin) positive   (ahead of Epithelial since 2026-07-27: islet
+                    capillaries pick up hormone signal from their neighbours, so Epithelial was claiming
+                    67.8% of islet-core CD31+ cells)
+  3. Epithelial  <- ANY(E_cadherin, Pan_Cytokeratin, Ker8_18, EpCAM, Keratin_5, INS, GCG, SST) positive
+                    (no single marker spans it: endocrine sits BELOW acinar on E-cadherin and ABOVE it
+                    on EpCAM)
   4. Neural      <- B3TUBB positive                    (residual, after epithelial -> islet TUBB3 removed)
-  5. Mesenchymal <- Vimentin positive
+  5. Mesenchymal <- ANY(Vimentin, SMA) positive
   6. Other       <- valid-and-negative for every gate
      Unresolved  <- blocked by an unavailable higher-priority gate (NOT a negative Other)
+
+``COMPARTMENT_ORDER`` / ``COMPARTMENT_GATES`` in ``config.py`` are the single source of truth for both
+the order and the marker lists above; the tree reads them, it does not hardcode them.
 
 Gate marker calls come straight from RESTORE (``{m}_state``). Subtypes (endocrine/exocrine, immune/
 mesenchymal fine types, NK) are DEFERRED to a validated level-2 pass (docs/level2_hierarchy.md); this
@@ -31,6 +38,8 @@ Inputs : <restore_gated_dir>/donor_id=*/data_0.parquet   ({m}_pos, {m}_norm, {m}
 Outputs: <phenotype_dir>/broad/donor_id=*/data_0.parquet  (object_id, donor_id, compartment, cell_type,
                                                             assignment_reason, blocked_by, {m}_state)
          <phenotype_dir>/broad_lineage_composition.png
+         <phenotype_dir>/broad_lineage_composition.csv  (the figure's source table — donor x class %,
+                                                          status, n, other, unresolved)
 
     python -m phenocycler.lineage --jobs 8
 """
@@ -119,6 +128,19 @@ def _atomic_write_parquet(df: pd.DataFrame, dst: Path) -> None:
     tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
     try:
         df.to_parquet(tmp, index=False)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _atomic_write_csv(df: pd.DataFrame, dst: Path, *, index_label: str | None = None) -> None:
+    """Write a CSV via a per-process temp file then ``os.replace`` (atomic on the same filesystem)."""
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
+    try:
+        df.to_csv(tmp, index=index_label is not None, index_label=index_label)
         os.replace(tmp, dst)
     finally:
         if tmp.exists():
@@ -231,6 +253,19 @@ def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFram
     print(f"\n[total] {n_total:,} cells | {100*other_total/max(n_total,1):.1f}% Other "
           "(valid-and-negative for every gate — real panel gaps, NOT force-assigned) | "
           f"{100*unresolved_total/max(n_total,1):.1f}% Unresolved (blocked by an unavailable gate)")
+
+    # Persist the figure's source table. Gate 5 signs off per donor, and a PNG is not a reviewable
+    # surface: the composition has to be joinable to the donor x marker manifest and to the
+    # acquisition-batch covariate. Columns beyond the classes carry the absolute counts the
+    # percentages were derived from, so a reader never has to recompute them from the parquet.
+    counts = {r["donor"]: (r["n"], r["other"], r["unresolved"]) for r in results}
+    table = C.copy()
+    table["n_cells"] = [counts[d][0] for d in table.index]
+    table["n_other"] = [counts[d][1] for d in table.index]
+    table["n_unresolved"] = [counts[d][2] for d in table.index]
+    composition_csv = cfg.phenotype_dir / "broad_lineage_composition.csv"
+    _atomic_write_csv(table, composition_csv, index_label="donor")
+    print(f"[saved] {composition_csv}")
 
     _composition_figure(C, cfg.phenotype_dir / "broad_lineage_composition.png")
     print("\ncomposition by status (mean %):")
