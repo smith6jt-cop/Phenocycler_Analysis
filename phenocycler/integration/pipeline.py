@@ -54,6 +54,8 @@ STAGES: list[tuple[str, str, str]] = [
     ("structures", "integration/structures/*/donor_id=*", "Islets / ducts / vessels"),
     ("register", "integration/registration/donor_id=*", "Serial-section registration"),
     ("match", "integration/paired/islets.parquet", "Islet matching [sequential]"),
+    ("cellmatch", "integration/paired/islet_cells.parquet",
+     "Endocrine cell pairing in matched islets [sequential]"),
     ("sameslide", "integration/paired/cells.parquet", "Cell pairing [same_slide]"),
     ("grid", "integration/niches/niche_profiles.csv", "Niches + registered grid"),
     ("donor", "integration/qc/composition.csv", "Donor-level concordance"),
@@ -64,7 +66,8 @@ STAGES: list[tuple[str, str, str]] = [
 ]
 
 ORDER_SEQUENTIAL = ["manifest", "export_pheno", "import_xenium", "vocab", "structures",
-                    "register", "match", "grid", "donor", "crossmodal", "qc", "figures"]
+                    "register", "match", "cellmatch", "grid", "donor", "crossmodal", "qc",
+                    "figures"]
 ORDER_SAME_SLIDE = ["manifest", "export_pheno", "import_xenium", "vocab", "structures",
                     "register", "sameslide", "grid", "donor", "qc", "figures"]
 
@@ -75,7 +78,7 @@ REGISTRATION_FREE = {"manifest", "export_pheno", "import_xenium", "vocab", "stru
 #: Stages that need a structural unit (islets). Not applicable to a tissue that has none —
 #: see ``tissues.STRUCTURE_KINDS``. They are skipped per-tissue, never per-run: a combined
 #: pancreas + lymph-node run still matches islets in the pancreas half.
-NEEDS_STRUCTURES = {"structures", "match"}
+NEEDS_STRUCTURES = {"structures", "match", "cellmatch"}
 
 #: Stages that run once for the whole selection rather than once per ROI.
 COHORT_WIDE = {"manifest", "vocab", "structures", "donor", "qc"}
@@ -215,6 +218,9 @@ def run_pipeline(
         elif name == "match":
             from .match import run_match
             _run(name, lambda: run_match(cfg, donors, roi=roi, tissue=stage_tissue))
+        elif name == "cellmatch":
+            from .cellmatch import run_cellmatch
+            _run(name, lambda: run_cellmatch(cfg, donors, roi=roi, tissue=stage_tissue))
         elif name == "sameslide":
             from .sameslide import run_sameslide
             _run(name, lambda: run_sameslide(cfg, donors, roi=roi, tissue=stage_tissue))

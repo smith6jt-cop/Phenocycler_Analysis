@@ -1,11 +1,14 @@
 """
 S2 — harmonising two label vocabularies and two molecular alphabets.
 
-Both pipelines call eight broad classes, which makes them look comparable. They are not the
-same partition of the tissue:
+Both pipelines call broad classes, which makes them look comparable. They are not the same
+partition of the tissue:
 
-    PhenoCycler   Epithelial  Fibroblast  Muscle  Immune            Endocrine  Endothelial  Neural  Neutrophil
-    Xenium        Exocrine    Stromal ----------  Immune_T/B/Myeloid  Endocrine  Vascular     Neural  (folded into Myeloid)
+    PhenoCycler   Epithelial  Fibroblast  Muscle  Immune              Endocrine  Endothelial  Neural
+    Xenium        Exocrine    Stromal ----------  Immune_T/B/Myeloid  Endocrine  Vascular     Neural
+
+(PhenoCycler additionally carries a ``Neutrophil`` class while MPO is gated separately; see
+the granulocyte note below for what happens when it is folded into ``Immune``.)
 
 Four specific mismatches, each handled explicitly rather than averaged away:
 
@@ -22,10 +25,22 @@ not in the Xenium 5K reference at all — it arrives only via the custom-100 add
 common vocabulary keeps ``Stromal`` as the comparable unit and marks the finer
 Fibroblast/Muscle split PhenoCycler-only.
 
-*Neutrophil.* PhenoCycler has a dedicated MPO gate and a ``Neutrophil`` lineage. Xenium
-folds ``07_immune_granulocyte`` into ``Myeloid`` at broad level, so a like-for-like
-comparison needs the granulocyte identity-core genes promoted to a fine score rather than a
-broad class.
+*Granulocytes.* This one tracks the core pipeline rather than asserting a fixed answer.
+While a dedicated ``Neutrophil`` lineage exists (MPO gate), PhenoCycler resolves granulocytes
+at broad level and Xenium does not — Xenium folds ``07_immune_granulocyte`` into ``Myeloid``,
+reaching ``Granulocyte`` only through a fine label. When MPO is instead folded into ``Immune``
+(neutrophils are immune cells), PhenoCycler stops resolving them too: ``immune_subclass``
+gates CD3e/CD20/CD163 only, so an MPO-only cell has no subclass and lands in ``Myeloid`` —
+exactly where Xenium puts it. The two sides then agree, at the cost of the distinction.
+
+So ``PHENO_TO_COMMON`` and ``RESOLVABLE`` are *derived* from ``config.LINEAGES`` instead of
+hardcoded. A mapping for a class the pipeline no longer emits is not harmless: it survives as
+a dead entry while the crosswalk CSV keeps advertising a capability that is gone. Either way
+``Granulocyte`` never enters the comparable set, because Xenium cannot call it at broad level
+— a lineage only one side can see is not evidence of a difference between modalities.
+
+Restoring the distinction later is additive on both sides: an ``MPO`` entry in
+``export_pheno.IMMUNE_GATES`` for protein, the granulocyte identity-core score for RNA.
 
 *Epithelial.* Xenium deliberately has no epithelial mask — ``16_epithelial_general`` is
 ``embedding_extra``, not ``broad_mask``, because KRT/EPCAM are shared by ductal, acinar and
@@ -57,6 +72,7 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from ..config import LINEAGES as _CORE_LINEAGES
 from ..config import PipelineConfig
 from ..marker_taxonomy import PROCESS, TYPE
 
@@ -81,10 +97,12 @@ COMMON_LINEAGES: tuple[str, ...] = (
     "Unassigned",
 )
 
-#: PhenoCycler broad_lineage -> common. `Immune` is intentionally absent: it is resolved
-#: through `immune_subclass` by :func:`pheno_to_common`, because mapping it to a single
-#: common class would throw away information both modalities have.
-PHENO_TO_COMMON: dict[str, str] = {
+#: Every PhenoCycler broad class this repo has ever emitted. `PHENO_TO_COMMON` below is this
+#: filtered to the classes the *current* `config.LINEAGES` actually produces, so the crosswalk
+#: tracks the core pipeline instead of drifting from it. `Neutrophil` is the live example:
+#: folding MPO into `Immune` deletes the class, and a hardcoded mapping would have been left
+#: behind pointing at a lineage nothing emits.
+_PHENO_BROAD_TO_COMMON: dict[str, str] = {
     "Epithelial": "Exocrine",
     "Fibroblast": "Stromal",
     "Muscle": "Stromal",
@@ -94,13 +112,20 @@ PHENO_TO_COMMON: dict[str, str] = {
     "Neutrophil": "Granulocyte",
 }
 
+#: PhenoCycler broad_lineage -> common. `Immune` is intentionally absent: it is resolved
+#: through `immune_subclass` by :func:`pheno_to_common`, because mapping it to a single
+#: common class would throw away information both modalities have.
+PHENO_TO_COMMON: dict[str, str] = {
+    k: v for k, v in _PHENO_BROAD_TO_COMMON.items() if k in _CORE_LINEAGES
+}
+
 #: PhenoCycler `immune_subclass` (from CD3e/CD20/CD163 `_pos`) -> common.
 PHENO_IMMUNE_TO_COMMON: dict[str, str] = {
     "T": "T_NK",
     "B": "B_Plasma",
     "Myeloid": "Myeloid",
     "Mixed": "Myeloid",     # multi-gate-positive; myeloid is the least-specific bucket
-    "": "Myeloid",
+    "": "Myeloid",           # includes MPO-only neutrophils — see the module docstring
 }
 
 #: Xenium celltype_broad -> common. Mirrors `panel_roles.csv` `lineage_or_group`, which is
@@ -130,6 +155,10 @@ XENIUM_FINE_TO_COMMON: dict[str, str] = {
 #: check this before reporting a lineage — a class only one side can see is not evidence of
 #: a difference between modalities.
 RESOLVABLE: dict[str, dict[str, str]] = {
+    # Panel-only default: INS/GCG/SST are absent from the 5K panel, so Xenium infers
+    # endocrine identity from surrogate cores (PDX1, ISL1, NEUROD1, ABCC8...). Post-Xenium IF
+    # staining for INS/GCG makes it a direct protein measurement on the same cells — see
+    # `resolvable_for`, which upgrades this when [integration] xenium_hormone_if is set.
     "Endocrine":   {"phenocycler": "yes", "xenium": "surrogate"},
     "Exocrine":    {"phenocycler": "default_sink", "xenium": "yes"},
     "Stromal":     {"phenocycler": "yes", "xenium": "yes"},
@@ -137,7 +166,12 @@ RESOLVABLE: dict[str, dict[str, str]] = {
     "T_NK":        {"phenocycler": "subclass", "xenium": "yes"},
     "B_Plasma":    {"phenocycler": "subclass", "xenium": "yes"},
     "Myeloid":     {"phenocycler": "subclass", "xenium": "yes"},
-    "Granulocyte": {"phenocycler": "yes", "xenium": "fine_only"},
+    # Tracks the core pipeline. While a dedicated `Neutrophil` lineage exists, PhenoCycler
+    # resolves granulocytes at broad level; once MPO is folded into `Immune` it does not, and
+    # an MPO-only cell lands in Myeloid — exactly where Xenium puts a granulocyte. Hardcoding
+    # "yes" would publish a capability the pipeline had stopped having.
+    "Granulocyte": {"phenocycler": "yes" if "Neutrophil" in _CORE_LINEAGES else "fine_only",
+                    "xenium": "fine_only"},
     "Neural":      {"phenocycler": "yes", "xenium": "yes"},
     "Unassigned":  {"phenocycler": "never", "xenium": "no"},
 }
@@ -506,6 +540,21 @@ def usable_anchors(pairs: Iterable[MarkerPair], *, type_only: bool = False) -> l
     out = [p for p in pairs if p.usable_anchor]
     if type_only:
         out = [p for p in out if p.role == "TYPE"]
+    return out
+
+
+def resolvable_for(cfg: Optional[PipelineConfig] = None) -> dict[str, dict[str, str]]:
+    """`RESOLVABLE`, adjusted for what this run's Xenium sections actually carry.
+
+    Post-Xenium immunofluorescence for INS/GCG turns Xenium's endocrine call from a surrogate
+    inference into a direct protein measurement *on the same cells as the RNA* — the single
+    biggest gap in the panel crosswalk, since the hormones are the markers that define the
+    compartment a T1D study is about. Reported rather than assumed: with the flag off, the
+    crosswalk keeps saying `surrogate`, which is the truthful answer for panel-only data.
+    """
+    out = {k: dict(v) for k, v in RESOLVABLE.items()}
+    if cfg is not None and getattr(cfg, "xenium_hormone_if", False):
+        out["Endocrine"]["xenium"] = "yes"
     return out
 
 
