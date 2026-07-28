@@ -229,4 +229,19 @@ data/*.h5ad
 data/*.pkl
 data/*.png
 data/*.npz
+
+# --- integration outputs (data/integration/) ---
+# Everything generated is ignored; the four small hand-maintained/derived inputs and the
+# crosswalk are tracked, because they are the reproducibility record of which donors were
+# paired and how the two label vocabularies were reconciled.
+data/integration/
+!data/integration/
+data/integration/*
+!data/integration/xenium_paths.csv
+!data/integration/donor_overrides.csv
+!data/integration/manifest.csv
+!data/integration/vocab_crosswalk.csv
 .pytest_cache/
+
+# setuptools-scm generated (version comes from git tags, never committed)
+phenocycler/_version.py

@@ -130,6 +130,43 @@ class PipelineConfig:
     use_gpu: bool = False            # opt-in CuPy backend for REDSEA
     gpu_device: int = 0
 
+    # -- integration (PhenoCycler <-> Xenium; phenocycler/integration/) -------
+    # Nothing in steps 1-7 reads these; the core pipeline is unaffected.
+    integration_mode: str = "sequential"          # sequential | same_slide
+    xenium_paths_csv: Path = _REPO_ROOT / "data" / "integration" / "xenium_paths.csv"
+    donor_overrides_csv: Path = _REPO_ROOT / "data" / "integration" / "donor_overrides.csv"
+    xenium_root: str = ""                         # optional prefix rewrite for bundle paths
+    panel_explorer: Path = _REPO_ROOT / "external" / "XeniumPanelExplorer"
+    # Tissue is a property of the DATASET, fixed when it is imported, not of the analysis.
+    # The cohort is 20 donors x {PhenoCycler, Xenium} x {pancreas, pancreatic lymph node}, and
+    # every stage can run on one tissue or on both pooled — so `tissue` rides through the cell
+    # table as a column and the stage runners filter on it, rather than being a global mode.
+    tissue: str = "pancreas"                      # default for datasets that do not declare one
+    tissues: str = "pancreas,pancreatic_lymph_node"   # comma-separated; the cohort's tissues
+    # Where each tissue's PhenoCycler core-pipeline output lives, as
+    # `tissue=/path/to/data,tissue=/path/to/data`. Needed because the core pipeline derives
+    # donor_id as the first digit-run of the qptiff name, so a donor's pancreas and lymph-node
+    # images both land in `data/cells/donor_id=6539` and cannot be told apart afterwards. The
+    # fix is one core-pipeline data dir per tissue; this maps tissue -> that dir. Empty means
+    # every tissue shares `data_dir`, which is correct for a single-tissue cohort and is
+    # detected and refused for a multi-tissue one rather than silently duplicating cells.
+    pheno_tissue_dirs: str = ""
+    fixed_modality: str = "phenocycler"           # which frame registration targets
+    reg_pixel_um: float = 2.0                     # raster resolution for registration
+    reg_nonrigid: bool = True
+    reg_max_disp_um: float = 200.0                # displacement cap (prevents folding)
+    islet_eps_um: float = 50.0                    # = insulitis_analysis.EPS_UM
+    islet_min_samples: int = 10                   # = insulitis_analysis.MIN_SAMPLES
+    niche_k: int = 50                             # = nb03 K_COMP
+    niche_n: int = 12                             # = nb03 n_niches
+    niche_smooth_k: int = 30                      # = nb03 K_SMOOTH
+    grid_um: float = 100.0
+    match_max_dist_um: float = 200.0
+    match_area_ratio: float = 2.5
+    crossmodal_min_anchors: int = 8               # refuse pseudo-cell linking below this
+    qc_tissue_dice_min: float = 0.80
+    qc_islet_rmse_max_um: float = 150.0
+
     # cached derived-path store (not a config field)
     _config_path: Optional[Path] = field(default=None, repr=False, compare=False)
 
@@ -203,6 +240,124 @@ class PipelineConfig:
     def qupath_class_dir(self) -> Path:
         return self.phenotype_dir / "qupath_class"
 
+    # ---- derived integration directories (data/integration/*) --------------
+    @property
+    def integration_dir(self) -> Path:
+        return self.data_dir / "integration"
+
+    @property
+    def manifest_csv(self) -> Path:
+        return self.integration_dir / "manifest.csv"
+
+    @property
+    def vocab_crosswalk_csv(self) -> Path:
+        return self.integration_dir / "vocab_crosswalk.csv"
+
+    @property
+    def cells_pheno_dir(self) -> Path:
+        return self.integration_dir / "cells_pheno"
+
+    @property
+    def cells_xen_dir(self) -> Path:
+        return self.integration_dir / "cells_xen"
+
+    @property
+    def structures_dir(self) -> Path:
+        return self.integration_dir / "structures"
+
+    @property
+    def registration_dir(self) -> Path:
+        return self.integration_dir / "registration"
+
+    @property
+    def paired_dir(self) -> Path:
+        return self.integration_dir / "paired"
+
+    @property
+    def niches_dir(self) -> Path:
+        return self.integration_dir / "niches"
+
+    @property
+    def crossmodal_dir(self) -> Path:
+        return self.integration_dir / "crossmodal"
+
+    @property
+    def integration_qc_dir(self) -> Path:
+        return self.integration_dir / "qc"
+
+    @property
+    def integration_figures_dir(self) -> Path:
+        return self.integration_dir / "figures"
+
+    @property
+    def integration_export_dir(self) -> Path:
+        return self.integration_dir / "export"
+
+    # ---- tissue helpers ----------------------------------------------------
+    @property
+    def tissue_list(self) -> list[str]:
+        """The cohort's tissues, in declaration order."""
+        return [t.strip() for t in str(self.tissues).split(",") if t.strip()]
+
+    def tissue_for_roi(self, roi: str) -> str:
+        """Which tissue an ROI belongs to.
+
+        ROIs are the Xenium naming (``panc``, ``pln_1`` .. ``pln_3``); tissue is the
+        biological class they map onto. Kept as a function rather than a literal dict so a new
+        ROI (``pln_4``) needs no config change, and unknown ROIs fall back to the declared
+        default rather than silently becoming their own tissue.
+        """
+        r = str(roi).strip().lower()
+        if r.startswith("pln") or r.startswith("ln"):
+            return "pancreatic_lymph_node"
+        if r.startswith("pan"):
+            return "pancreas"
+        return self.tissue
+
+    def rois_for_tissue(self, tissue: str) -> list[str]:
+        """Known ROI names for a tissue. ``pln_1..3`` because one donor can have several."""
+        if tissue == "pancreatic_lymph_node":
+            return ["pln_1", "pln_2", "pln_3"]
+        if tissue == "pancreas":
+            return ["panc"]
+        return []
+
+    def pheno_dir_for_tissue(self, tissue: str) -> Path:
+        """The PhenoCycler core-pipeline data dir holding this tissue's donors.
+
+        Falls back to ``data_dir`` when no per-tissue mapping is configured. Callers must
+        treat two tissues resolving to the same directory as a configuration gap, not as
+        permission to export the same cells twice — see ``pheno_tissue_dirs``.
+        """
+        for entry in str(self.pheno_tissue_dirs).split(","):
+            name, _, path = entry.partition("=")
+            if name.strip() and name.strip() == tissue and path.strip():
+                return Path(path.strip()).expanduser()
+        return self.data_dir
+
+    def resolve_rois(self, roi=None, tissues=None) -> list[str]:
+        """Turn a ``--roi`` / ``--tissue`` selection into the ROI list to iterate.
+
+        The three ways a run is scoped, in precedence order:
+
+        * ``--roi pln_2``  -> exactly that ROI (the escape hatch for one section);
+        * ``--tissue pancreatic_lymph_node`` -> every ROI of that tissue (a *separate* run);
+        * neither -> every ROI of every configured tissue (a *combined* run).
+
+        Defaulting to combined is deliberate. The cohort is 20 donors x 2 platforms x 2
+        tissues, so a bare ``python -m phenocycler.integration.pipeline`` should process the
+        whole dataset rather than silently doing pancreas and leaving the lymph nodes out.
+        """
+        if roi:
+            return [str(roi)]
+        names = list(tissues) if tissues else self.tissue_list
+        out: list[str] = []
+        for t in names:
+            for r in self.rois_for_tissue(str(t).strip()):
+                if r not in out:
+                    out.append(r)
+        return out
+
     # ---- helpers -----------------------------------------------------------
     def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
         """Donor ids by globbing ``<dir>/donor_id=*`` (defaults to cells_dir)."""
@@ -217,6 +372,10 @@ class PipelineConfig:
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
+
+def _as_bool(s) -> bool:
+    return str(s).lower() in ("1", "true", "yes", "on")
+
 
 # config.ini [section] -> {ini_key: (attr_name, caster)}
 _INI_SCHEMA = {
@@ -256,6 +415,31 @@ _INI_SCHEMA = {
         "use_gpu": ("use_gpu", lambda s: str(s).lower() in ("1", "true", "yes", "on")),
         "gpu_device": ("gpu_device", int),
     },
+    "integration": {
+        "mode": ("integration_mode", str),
+        "xenium_paths_csv": ("xenium_paths_csv", Path),
+        "donor_overrides_csv": ("donor_overrides_csv", Path),
+        "xenium_root": ("xenium_root", str),
+        "panel_explorer": ("panel_explorer", Path),
+        "tissue": ("tissue", str),
+        "tissues": ("tissues", str),
+        "pheno_tissue_dirs": ("pheno_tissue_dirs", str),
+        "fixed_modality": ("fixed_modality", str),
+        "reg_pixel_um": ("reg_pixel_um", float),
+        "reg_nonrigid": ("reg_nonrigid", _as_bool),
+        "reg_max_disp_um": ("reg_max_disp_um", float),
+        "islet_eps_um": ("islet_eps_um", float),
+        "islet_min_samples": ("islet_min_samples", int),
+        "niche_k": ("niche_k", int),
+        "niche_n": ("niche_n", int),
+        "niche_smooth_k": ("niche_smooth_k", int),
+        "grid_um": ("grid_um", float),
+        "match_max_dist_um": ("match_max_dist_um", float),
+        "match_area_ratio": ("match_area_ratio", float),
+        "crossmodal_min_anchors": ("crossmodal_min_anchors", int),
+        "qc_tissue_dice_min": ("qc_tissue_dice_min", float),
+        "qc_islet_rmse_max_um": ("qc_islet_rmse_max_um", float),
+    },
 }
 
 # attr_name -> environment variable that overrides it
@@ -266,8 +450,14 @@ _ENV_OVERRIDES = {
     "donor_metadata": ("PHENOCYCLER_DONOR_METADATA", Path),
     "restore_vendor": ("PHENOCYCLER_RESTORE_VENDOR", Path),
     "n_jobs": ("PHENOCYCLER_JOBS", int),
-    "use_gpu": ("PHENOCYCLER_USE_GPU", lambda s: str(s).lower() in ("1", "true", "yes", "on")),
+    "use_gpu": ("PHENOCYCLER_USE_GPU", _as_bool),
     "hormone_min_norm": ("PHENOCYCLER_HORMONE_MIN_NORM", float),
+    # integration
+    "integration_mode": ("PHENOCYCLER_INTEGRATION_MODE", str),
+    "xenium_paths_csv": ("PHENOCYCLER_XENIUM_PATHS_CSV", Path),
+    "xenium_root": ("PHENOCYCLER_XENIUM_ROOT", str),
+    "panel_explorer": ("PHENOCYCLER_PANEL_EXPLORER", Path),
+    "tissue": ("PHENOCYCLER_TISSUE", str),
 }
 
 
@@ -314,10 +504,21 @@ def load_config(config_path: Optional[os.PathLike | str] = None, **overrides) ->
     # config file's directory (the repo root) — not the cwd — so the pipeline works
     # from notebooks/, SLURM jobs, or anywhere the package is imported.
     base = ini_path.parent if ini_path.exists() else _REPO_ROOT
-    for name in ("data_dir", "images_dir", "cells_csv", "donor_metadata", "restore_vendor"):
+    for name in ("data_dir", "images_dir", "cells_csv", "donor_metadata", "restore_vendor",
+                 "xenium_paths_csv", "donor_overrides_csv", "panel_explorer"):
         p = Path(getattr(cfg, name)).expanduser()
         if not p.is_absolute():
             p = (base / p).resolve()
         setattr(cfg, name, p)
+
+    if cfg.integration_mode not in ("sequential", "same_slide"):
+        raise ValueError(
+            f"[integration] mode must be 'sequential' or 'same_slide', got {cfg.integration_mode!r}"
+        )
+    if cfg.fixed_modality not in ("phenocycler", "xenium"):
+        raise ValueError(
+            f"[integration] fixed_modality must be 'phenocycler' or 'xenium', "
+            f"got {cfg.fixed_modality!r}"
+        )
 
     return cfg

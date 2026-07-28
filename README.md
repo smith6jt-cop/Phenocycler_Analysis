@@ -31,6 +31,9 @@ and then assigns every cell to one of **eight** mutually-exclusive lineages with
                                                      │
                             [6] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
                             [7] identity figures ─────▶ data/phenotype/celltype_marker_*.png
+                                                     │
+ Xenium run ──────────────▶ [8] INTEGRATION ─────────▶ data/integration/
+ (10x spatial RNA)              (optional, separate env)   paired islets / niches / QC
 ```
 
 ## Scope
@@ -38,11 +41,16 @@ and then assigns every cell to one of **eight** mutually-exclusive lineages with
 **In scope (this repo):** raw QuPath outputs → cells parquet → REDSEA → RESTORE →
 broad lineage → optional QuPath re-import for visual QC.
 
+**Also in this repo (optional, separate environment):** PhenoCycler ↔ Xenium integration —
+`phenocycler/integration/`, see **[docs/INTEGRATION.md](docs/INTEGRATION.md)**. It starts
+from `data/phenotype/broad/` and integrates it with 10x Xenium spatial transcriptomics in two
+modes, `sequential` (serial sections) and `same_slide`. The core pipeline is unaffected: it
+gains no dependencies and still runs in the lean environment.
+
 **Out of scope / downstream:** image processing before segmentation (illumination
 correction, stitching, registration, autofluorescence removal — use
 [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)), scVI embedding, trajectory /
-pseudotime, islet aggregation, spatial neighborhood analysis, per-lineage
-subclustering, and the interactive R Shiny app.
+pseudotime, per-lineage subclustering, and the interactive R Shiny app.
 
 ## What REDSEA and RESTORE do
 
@@ -115,6 +123,11 @@ notebooks/03_restore_normalize.ipynb
 notebooks/04_broad_lineage.ipynb
 notebooks/05_qupath_export.ipynb
 notebooks/00_run_full_pipeline.ipynb      # thin orchestrator
+
+notebooks/06_integration_prep.ipynb       # PhenoCycler <-> Xenium (optional)
+notebooks/07_sequential_registration.ipynb
+notebooks/08_sequential_integration.ipynb
+notebooks/09_same_slide_integration.ipynb
 ```
 
 Every step is also a module CLI, e.g. `python -m phenocycler.redsea --all --jobs 4`.
@@ -160,12 +173,32 @@ phenocycler/            installable package
   pipeline.py           idempotent orchestrator + status table
   parallel.py           per-donor process pool
   gpu.py                optional CuPy/RAPIDS backend with CPU fallback
+phenocycler/integration/  PhenoCycler <-> Xenium integration (optional extra)
+  contract.py           modality-agnostic cell-table schema
+  manifest.py           S0  donor <-> Xenium-run pairing (+ donor_id stamping)
+  export_pheno.py       S1a phenotype/broad + cells + gates -> contract
+  import_xenium.py      S1b h5ad | SpatialData zarr | raw bundle -> contract
+  vocab.py              S2  harmonised lineages + protein<->gene crosswalk
+  structures.py         S3  islets / ducts / vessels (hormone-seeded DBSCAN)
+  rasterize.py          S3b common micron grid; qptiff + morphology_focus readers
+  register.py           S4  rigid -> affine -> B-spline; image + point-set tracks
+  transform.py          S5  micron-space affine + displacement field
+  match.py              S6  islet <-> islet Hungarian assignment [sequential]
+  grid.py               S7  joint niches + registered hex grid
+  donor.py              S8  donor-level concordance (no registration)
+  crossmodal.py         S9  pseudo-cell linking [sequential, inference]
+  sameslide.py          S11 cell <-> cell pairing [same_slide]
+  qc.py / figures.py    S10 gates, nulls, report, overlays
+  pipeline.py           idempotent orchestrator (--mode, --status)
 external/RESTORE/       vendored RESTORE (git submodule, commit 38df59b)
+external/XeniumPanelExplorer/  vendored panel taxonomy (submodule, commit 076d1192)
 notebooks/              thin step notebooks + orchestrator
 scripts/groovy/         QuPath export/import Groovy scripts
 scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
 tests/                  pytest: REDSEA math, RESTORE guard, 8-class lineage invariants
-config.ini              paths + tunables
+config.ini              paths + tunables (+ [integration])
+environment-integration.yml  union env for the integration extra
+docs/INTEGRATION.md     integration design + data caveats
 pyproject.toml          editable-install metadata (pip install -e .)
 ```
 
@@ -173,10 +206,15 @@ pyproject.toml          editable-install metadata (pip install -e .)
 
 ```bash
 pytest tests/            # REDSEA compensation, contact matrix, rasterize; RESTORE robust
-                         # guard; lineage hierarchy (zero Unassigned); config; parallel
+                         # guard; lineage hierarchy (zero Unassigned); config; parallel;
+                         # integration: contract, manifest crosswalk, vocabulary totality,
+                         # structure calling, registration recovery, matching, mode guards
 ```
 
-The tests need no imaging data (they use synthetic masks/frames) and run in ~2 s.
+The tests need no imaging data (they use synthetic masks/frames) and run in ~15 s. The
+integration tests apply *known* transforms to synthetic sections and assert that
+registration recovers them — including the mirrored case and the non-rigid displacement
+sign, which fails silently by doubling the misalignment rather than removing it.
 
 ## Prerequisites (upstream of this repo)
 

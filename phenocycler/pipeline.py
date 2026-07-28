@@ -154,6 +154,15 @@ def print_status(cfg: PipelineConfig) -> None:
         print(f"{label:<30}{n:>10}   {state}")
     print("=" * 60)
 
+    # The optional PhenoCycler <-> Xenium integration layer picks up from `phenotype/broad/`.
+    # It is a separate orchestrator with its own (heavier) environment, so it is only
+    # mentioned here — never run as part of this pipeline, whose stage list and dependencies
+    # are deliberately unchanged by it.
+    n_integration = _has_outputs(cfg, "integration/*")
+    if n_integration:
+        print(f"[integration] {n_integration} artifact(s) under {cfg.data_dir/'integration'} — "
+              f"`python -m phenocycler.integration.pipeline --status` for detail")
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,

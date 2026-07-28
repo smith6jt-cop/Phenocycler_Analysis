@@ -7,8 +7,9 @@ echo "=========================================="
 echo "Phenocycler_Analysis — setup"
 echo "=========================================="
 
-# 1) Vendored RESTORE (git submodule at external/RESTORE)
-echo "[1/4] Fetching the vendored RESTORE submodule ..."
+# 1) Vendored submodules: RESTORE (normalization) + XeniumPanelExplorer (the curated
+#    identity_core / panel_roles CSVs the integration crosswalk is derived from).
+echo "[1/4] Fetching vendored submodules (RESTORE, XeniumPanelExplorer) ..."
 git submodule update --init --recursive
 
 # 2) Conda environment
@@ -57,4 +58,9 @@ echo "  2. conda activate phenocycler_analysis"
 echo "  3. Run the pipeline:  python -m phenocycler.pipeline --status"
 echo "     or open notebooks/00_run_full_pipeline.ipynb"
 echo "  4. Run the tests:     pytest tests/"
+echo ""
+echo "  For PhenoCycler <-> Xenium integration (a separate, heavier environment):"
+echo "     conda env create -f environment-integration.yml"
+echo "     conda activate phenocycler_integration && pip install -e ."
+echo "     python -m phenocycler.integration.manifest --report"
 echo "=========================================="

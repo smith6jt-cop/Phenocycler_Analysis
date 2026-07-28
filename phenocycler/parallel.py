@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable
 
 
 def resolve_jobs(n_jobs: int, n_items: int) -> int:

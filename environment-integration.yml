@@ -1,0 +1,67 @@
+# Union environment for phenocycler/integration/ — PhenoCycler <-> Xenium.
+#
+# The core `phenocycler_analysis` env (environment.yml) is deliberately lean: it has no
+# scanpy/anndata because steps 1-7 do not need them. The Xenium side, conversely, has no
+# DuckDB/RESTORE. Integration has to read BOTH sides in one process (export_pheno reads
+# hive parquet, import_xenium reads h5ad/zarr/bundle), so it needs the union.
+#
+#   conda env create -f environment-integration.yml
+#   conda activate phenocycler_integration
+#   pip install -e .            # phenocycler + phenocycler.integration
+#   pip install spams-bin       # only if you also want to run RESTORE in this env
+#
+# Use the lean env for the core pipeline and this one for integration; the package is
+# importable in both. Versions track the resolved Xenium_Analysis environment
+# (docs/installed_freeze.yml there) so h5ad/zarr artifacts read back identically.
+name: phenocycler_integration
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Python 3.12 matches the Xenium env; the core package requires >=3.10.
+  - python=3.12
+
+  # --- core phenocycler stack (mirrors environment.yml) ---
+  - numpy
+  - pandas
+  - pyarrow
+  - scipy
+  - scikit-learn
+  - scikit-image
+  - matplotlib
+  - statsmodels
+  - tifffile
+  - imagecodecs
+  - duckdb
+  - openpyxl
+  - h5py
+
+  # --- single-cell / spatial (the Xenium side) ---
+  - anndata
+  - scanpy
+  - spatialdata
+  - zarr
+  - geopandas
+  - shapely
+
+  # --- registration ---
+  # opencv: log-polar coarse alignment + findTransformECC (rigid -> affine).
+  # SimpleITK: the B-spline / demons non-rigid stage. Neither is in either upstream env —
+  # Xenium_Analysis ships opencv but never imports it, and has no ITK at all.
+  - opencv
+  - simpleitk
+
+  # --- notebooks ---
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
+  - tqdm
+  - pytest
+
+  - pip
+  - pip:
+      - spatialdata-io
+      # NOT maxfuse: its only release is 0.0.2 (Feb 2023) with unpinned deps and it is
+      # unmaintained. phenocycler.integration.crossmodal implements the algorithm
+      # (fuzzy smoothing -> CCA -> linear assignment -> refinement) directly. Install it
+      # manually if you want the reference implementation as a cross-check.

@@ -1,0 +1,136 @@
+name: CI
+
+# The scientific stack this repo runs on is heavy — DuckDB over a 138 GB CSV, the vendored
+# RESTORE (which needs spams), and for the integration extra scanpy/spatialdata/SimpleITK.
+# Reinstalling that on every push would make CI slow enough that people stop reading it.
+#
+# So CI runs the slice that is actually cheap and actually catches things: ruff, then the
+# full test suite, which is synthetic by design — no imaging data, no GPU, ~15 s locally.
+# The core tests need only the base dependencies; the integration tests need the extra, so
+# they run in a second job that installs it. Anything needing real data runs on HiPerGator.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - run: python -m pip install --upgrade pip && pip install -r requirements-ci.txt
+
+      # Lint is ADVISORY for now, deliberately. `ruff check` currently reports ~247 findings
+      # across the pre-existing codebase, dominated by the author's `a; b` one-liner style
+      # (E702) and `zip()` without `strict=` (B905). None of it is a bug, all of it predates
+      # this workflow, and hard-failing on it would mean every PR opens red for reasons the
+      # author did not introduce — which trains people to ignore CI.
+      #
+      # The cleanup is a decision to make on its own terms (auto-fix the 149 fixable and
+      # hand-fix the rest, or narrow the ruleset to what the code already satisfies). Once
+      # that lands, drop `continue-on-error` here and lint becomes a real gate.
+      # The test jobs below are NOT advisory and will fail the build.
+      - name: ruff check (advisory — see comment)
+        run: ruff check --output-format=github .
+        continue-on-error: true
+      - name: ruff format --check (advisory)
+        run: ruff format --check --diff .
+        continue-on-error: true
+
+  test:
+    name: Core tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor and ceiling of requires-python. The package is installed editable into
+        # other projects' environments (Islet-Explorer-Senior's is 3.13), so the upper
+        # bound matters as much as the lower one.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm derives the version from tags, so a shallow clone with none
+          # would silently build as 0.0.0+unknown.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install (core only, no integration extra)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+      - name: Version is derived from git, not hardcoded
+        run: |
+          python -c "import phenocycler; v = phenocycler.__version__; print('version:', v); assert v != '0.0.0+unknown', 'setuptools-scm did not resolve a version'"
+      - name: Core pipeline imports in the lean environment
+        # The integration layer must not leak dependencies into the core pipeline. If this
+        # step fails, something in phenocycler/ started importing scanpy/spatialdata at
+        # module load and the lean environment is broken.
+        run: |
+          python -c "
+          import phenocycler
+          from phenocycler import load_config
+          for m in ('cells_parquet', 'redsea', 'restore', 'hormone_floor', 'lineage',
+                    'qupath_export', 'figures', 'pipeline', 'parallel', 'gpu'):
+              __import__(f'phenocycler.{m}')
+          print('core modules import OK')
+          "
+      - name: Core tests
+        # Deselect the integration suite: it needs the extra, which the next job covers.
+        run: pytest tests/ -q --ignore-glob='tests/test_integration_*.py'
+
+  test-integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The vocabulary crosswalk is derived from the pinned XeniumPanelExplorer
+          # submodule, so the tests asserting crosswalk totality and the upstream-drift
+          # guard need it checked out. Both submodules are public.
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with the integration extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[integration,test]'
+
+      - name: Panel taxonomy is actually present
+        # The crosswalk tests skip gracefully when the submodule is missing (right behaviour
+        # for a local checkout), which means a silent submodule failure would look identical
+        # to a pass. Assert it is there so CI cannot quietly stop testing the crosswalk.
+        run: test -f external/XeniumPanelExplorer/data/panel_roles.csv
+
+      - name: Full suite
+        # -rs lists skip reasons, so anything that does stop running is visible in the log.
+        run: pytest tests/ -q -rs
+
+      - name: Stage tables render without any data
+        run: |
+          python -m phenocycler.pipeline --status
+          python -m phenocycler.integration.pipeline --status
+          python -m phenocycler.integration.manifest --report
