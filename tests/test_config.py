@@ -93,10 +93,11 @@ def test_discover_donors(tmp_path):
 
 
 def test_constants_shape():
-    assert len(LINEAGES) == 8
-    assert {"Neural", "Neutrophil"}.issubset(LINEAGES)
+    assert len(LINEAGES) == 7
+    assert "Neural" in LINEAGES and "Neutrophil" not in LINEAGES   # Neutrophil folded into Immune
     assert "CD99" in LINEAGES["Endocrine"]
-    assert LINEAGES["Neural"] == ["B3TUBB"] and LINEAGES["Neutrophil"] == ["MPO"]
+    assert "MPO" in LINEAGES["Immune"]                             # neutrophils (MPO) are Immune
+    assert LINEAGES["Neural"] == ["B3TUBB"]
     assert set(STRUCT_LINEAGES) == {"Epithelial", "Fibroblast", "Muscle"}
     assert len(DEFAULT_MARKER_PAIRS) == 10          # the validated 10-marker gates stay unchanged
     assert len(EXTRA_MARKER_PAIRS) == 3
@@ -104,7 +105,7 @@ def test_constants_shape():
 
 
 def test_config_matches_science_modules():
-    """Guard the two independent definitions against 6-vs-8 / CD99 drift."""
+    """Guard the two independent definitions against class-count / CD99 drift."""
     from phenocycler import lineage, marker_taxonomy
     assert list(lineage.LNAMES) == list(LINEAGES)                 # lineage uses config's LINEAGES
     assert load_config().cd99_bright == marker_taxonomy.CD99_BRIGHT

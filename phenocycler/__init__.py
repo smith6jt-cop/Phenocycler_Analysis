@@ -9,8 +9,8 @@ notebook-friendly Python package:
     redsea                (pixel spillover) qptiff + GeoJSON  -> data/cells_redsea/
     restore               (RESTORE norm)    cells_redsea      -> data/restore_gated_redsea/
     restore  (extra pass) (RESTORE norm)    cells_redsea      -> data/restore_gated_redsea_extra/
-    hormone_floor         (false-endo fix)  restore_gated     -> data/restore_gated_redsea/ (floored)
-    lineage               (8 broad classes) restore_gated     -> data/phenotype/broad/
+    hormone_floor         (endo+immune fix) restore_gated     -> data/restore_gated_redsea/ (floored)
+    lineage               (7 broad classes) restore_gated     -> data/phenotype/broad/
     qupath_export         (QC round-trip)   broad             -> data/phenotype/qupath_class/
     figures               (identity QC)     restore_gated     -> data/phenotype/celltype_marker_*.png
 
