@@ -53,11 +53,15 @@ def test_restore_pair_method_policy_is_configurable():
     from phenocycler.restore_validation import (CONTROL_DEFINITIONS, DIVISOR_STATISTICS,
                                                 PairValidationConfig)
     cfg = load_config()
-    # defaults mirror the frozen dataclass, so exposing them changes nothing on its own
-    assert cfg.restore_control_definition == PairValidationConfig.control_definition
-    assert cfg.restore_divisor_statistic == PairValidationConfig.divisor_statistic
-    assert cfg.restore_control_definition in CONTROL_DEFINITIONS
-    assert cfg.restore_divisor_statistic in DIVISOR_STATISTICS
+    # UNSET by default, deliberately. These used to mirror the frozen dataclass "so exposing them
+    # changes nothing on its own" -- but PairValidationConfig defaults to divisor_statistic="max",
+    # which restore_apply cannot run, while the frozen production p99 lives only in the PARENT repo's
+    # config.ini. Mirroring therefore made "forgot --config" silently select the unrunnable policy.
+    # See test_restore_apply.test_unset_policy_refuses_rather_than_defaulting.
+    assert cfg.restore_control_definition == ""
+    assert cfg.restore_divisor_statistic == ""
+    assert PairValidationConfig.control_definition in CONTROL_DEFINITIONS
+    assert PairValidationConfig.divisor_statistic in DIVISOR_STATISTICS
     over = load_config(restore_control_definition="reference_and_target", restore_divisor_statistic="p99")
     assert (over.restore_control_definition, over.restore_divisor_statistic) == (
         "reference_and_target", "p99")

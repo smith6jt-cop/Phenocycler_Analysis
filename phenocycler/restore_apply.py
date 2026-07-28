@@ -100,6 +100,19 @@ def config_from_pipeline(cfg: PipelineConfig) -> PairValidationConfig:
     """
     control = str(cfg.restore_control_definition)
     statistic = str(cfg.restore_divisor_statistic)
+    # An UNSET policy is the dangerous case, not a typo. Both keys are frozen in the parent repo's
+    # config.ini and absent from the submodule's, so a run launched without `--config config.ini` from
+    # the repo root used to fall through to the dataclass defaults -- and the default statistic was
+    # `max`, which halts MODEL_UNSTABLE on three donor-pairs. Refuse rather than silently pick.
+    missing = [name for name, value in
+               (("control_definition", control), ("divisor_statistic", statistic)) if not value]
+    if missing:
+        raise SystemExit(
+            f"[restore] config.ini [restore] {' and '.join(missing)} is not set. The frozen production "
+            "policy (control_definition = reference_only, divisor_statistic = p99) lives in the PARENT "
+            "repo's config.ini -- run with `--config config.ini` from the repository root, or pass "
+            "--control-definition/--divisor-statistic explicitly."
+        )
     if control not in CONTROL_DEFINITIONS:
         raise SystemExit(
             f"[restore] config.ini [restore] control_definition={control!r} is not one of "

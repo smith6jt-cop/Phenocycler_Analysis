@@ -10,6 +10,8 @@ Two tiers:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -130,6 +132,11 @@ def _stub_frozen(monkeypatch, *, sample_n=6, canonical_n=None, state_for=None):
 
 def _setup(tmp_path, monkeypatch, *, make_sample=True, make_manifest=True, drop=(), **stub):
     cfg = load_config(data_dir=tmp_path)
+    # The policy keys are UNSET by default and config_from_pipeline refuses to guess -- see
+    # test_unset_policy_refuses_rather_than_defaulting. Every test that actually runs an apply must
+    # therefore state the policy, exactly as a real run does via the parent repo's config.ini.
+    cfg.restore_control_definition = "reference_only"
+    cfg.restore_divisor_statistic = "p99"
     if make_sample:
         cfg.restore_allcells_sample_dir.mkdir(parents=True, exist_ok=True)
     if make_manifest:
@@ -236,13 +243,46 @@ def test_config_from_pipeline_reads_ini_policy(tmp_path):
     assert pvc.divisor_statistic == "p99"
 
 
-def test_config_defaults_match_the_frozen_dataclass(tmp_path):
-    """The indirection must be behaviour-neutral: PipelineConfig defaults == PairValidationConfig."""
-    from phenocycler.restore_validation import PairValidationConfig
+def test_unset_policy_refuses_rather_than_defaulting(tmp_path):
+    """An UNSET policy must fail loudly and name the file to fix.
 
-    pvc = ra.config_from_pipeline(load_config(data_dir=tmp_path))
-    assert pvc.control_definition == PairValidationConfig.control_definition
-    assert pvc.divisor_statistic == PairValidationConfig.divisor_statistic
+    This replaces `test_config_defaults_match_the_frozen_dataclass`, which asserted that PipelineConfig
+    mirrored PairValidationConfig's defaults so the indirection would be "behaviour-neutral". That
+    reasoning is what created the trap: PairValidationConfig defaults to `divisor_statistic="max"`,
+    which restore_apply CANNOT run (MODEL_UNSTABLE on 115 Vimentin<-E_cadherin, 6436 B3TUBB<-EpCAM,
+    6591 CD68<-E_cadherin), while the frozen production `p99` lives only in the PARENT repo's
+    config.ini. A run launched without `--config config.ini` therefore silently selected the unrunnable
+    policy instead of the frozen one. Behaviour-neutral defaults are not neutral when the default is
+    wrong.
+    """
+    cfg = load_config(data_dir=tmp_path)          # submodule config.ini declares neither key
+    assert cfg.restore_control_definition == ""
+    assert cfg.restore_divisor_statistic == ""
+    with pytest.raises(SystemExit, match="is not set"):
+        ra.config_from_pipeline(cfg)
+
+
+def test_each_policy_key_is_named_individually_when_missing(tmp_path):
+    """Half-configured is as dangerous as unconfigured, so each key is checked on its own."""
+    cfg = load_config(data_dir=tmp_path)
+    cfg.restore_control_definition = "reference_only"
+    with pytest.raises(SystemExit, match="divisor_statistic is not set"):
+        ra.config_from_pipeline(cfg)
+
+    cfg = load_config(data_dir=tmp_path)
+    cfg.restore_divisor_statistic = "p99"
+    with pytest.raises(SystemExit, match="control_definition is not set"):
+        ra.config_from_pipeline(cfg)
+
+
+def test_the_repo_root_config_ini_carries_the_frozen_policy(tmp_path):
+    """The guard is only safe if the parent config.ini really does set both keys."""
+    root_ini = Path(__file__).resolve().parents[2] / "config.ini"
+    if not root_ini.exists():                      # submodule checked out standalone
+        pytest.skip("parent repository config.ini is not present")
+    pvc = ra.config_from_pipeline(load_config(root_ini))
+    assert pvc.control_definition == "reference_only"
+    assert pvc.divisor_statistic == "p99"
 
 
 @pytest.mark.parametrize(

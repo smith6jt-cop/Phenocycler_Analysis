@@ -166,10 +166,17 @@ class PipelineConfig:
     # them here is what makes an accepted sweep arm reproducible by the pipeline.
     #   control_definition: "reference_only" | "reference_and_target"
     #   divisor_statistic:  "max" | "p999" | "p99" | "p95"
-    # Defaults deliberately mirror PairValidationConfig so this indirection cannot change behaviour on
-    # its own; restore_validation remains the single source of truth for the allowed values.
-    restore_control_definition: str = "reference_only"
-    restore_divisor_statistic: str = "max"
+    #
+    # UNSET BY DEFAULT, deliberately. These previously defaulted to PairValidationConfig's own values
+    # so that "this indirection cannot change behaviour on its own" -- but that made the DEFAULT
+    # `divisor_statistic = "max"`, which is a policy that cannot complete (restore_apply halts
+    # MODEL_UNSTABLE on 115 Vimentin<-E_cadherin, 6436 B3TUBB<-EpCAM, 6591 CD68<-E_cadherin). The
+    # frozen production value `p99` lives only in the PARENT repo's config.ini, so a run launched
+    # without `--config config.ini` from the repo root silently selected the unrunnable policy. An
+    # empty value makes restore_apply.config_from_pipeline fail loudly and name the file to fix.
+    # restore_validation remains the single source of truth for the ALLOWED values.
+    restore_control_definition: str = ""
+    restore_divisor_statistic: str = ""
     # QuPath compartments feeding the NNMF separator, comma-separated. The locked value is
     # "Membrane,Cell", but 14 of the 24 accepted targets post-date the compartment sample and have only
     # whole-cell values, so a production run over the full accepted set REQUIRES "Cell". Measured
