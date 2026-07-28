@@ -11,15 +11,21 @@ downstream rests on which of these two situations holds: "these two measurements
 one cell" is true in same-slide mode and false in sequential mode, and no amount of
 registration quality changes that. A warning would be too easy to ignore.
 
-Assignment proceeds from the strongest evidence available:
+**What ``pair_donor`` currently does:** mutual-nearest-centroid assignment within
+``max_dist_um``. Mutual rather than one-way, because one-way nearest-neighbour assignment
+produces many-to-one collisions exactly where segmentation disagrees most.
 
-1. **Polygon IoU**, when PhenoCycler's QuPath GeoJSON and Xenium's ``cell_boundaries`` are
-   both present. Two segmentations of the same cell overlap substantially; two neighbouring
-   cells do not. This is the most reliable criterion and the only one that handles the case
-   of two adjacent nuclei whose centroids are closer to each other than to their own partner.
-2. **Mutual nearest centroid** within ``max_dist_um`` otherwise. Mutual rather than one-way,
-   because one-way nearest-neighbour assignment produces many-to-one collisions exactly where
-   segmentation disagrees most.
+**What is available but not yet wired in:** :func:`match_by_iou` does polygon-overlap
+assignment, which is the better criterion — two segmentations of one cell overlap
+substantially, two neighbouring cells do not, and IoU therefore handles the case that defeats
+centroids, where adjacent nuclei sit closer to each other than to their own partners. It is
+implemented and callable, but ``pair_donor`` does not use it because the missing piece is the
+*polygon loader*: PhenoCycler boundaries live in ``data/redsea_scratch/geojson/`` and
+Xenium's in the SpatialData zarr, and both would need reading, warping through the transform
+(including the non-rigid field), and handing over as GeoSeries. Building that now would be
+unvalidated code — this cohort is serial-section, so there is no same-slide data to check it
+against. Pass polygons to :func:`match_by_iou` directly if you have them; wiring the loader
+in is the natural follow-up once same-slide data exists.
 
 Unmatched cells are reported, not hidden. The two pipelines segment independently — QuPath
 on a qptiff, Xenium's own algorithm on DAPI plus the multimodal stains — so they will not

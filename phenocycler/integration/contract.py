@@ -118,7 +118,8 @@ class CellTable:
             if "x_um_reg" not in self.df.columns or self.df["x_um_reg"].isna().all():
                 raise ContractError(
                     f"{self.modality}/{self.donor_id}: registered coordinates requested but "
-                    "x_um_reg is empty — run the register + transform stages first"
+                    "x_um_reg is empty — run the 'register' stage, then 'grid' (which "
+                    "applies the stored transform and writes the registered coordinates)"
                 )
             cols = ("x_um_reg", "y_um_reg")
         else:

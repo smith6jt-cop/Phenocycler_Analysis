@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -123,6 +125,27 @@ def test_registered_coordinates_guard(tmp_path):
     t = CellTable(df=df, modality="xenium", donor_id="1", roi="panc")
     with pytest.raises(ContractError, match="register"):
         t.xy(registered=True)
+
+
+def test_registered_coordinate_error_names_real_stages():
+    """The guidance must name stages that exist, so it cannot rot as the pipeline changes.
+
+    It previously said "run the register + transform stages", but `transform` is a library
+    module, not a stage — and `x_um_reg` is actually written by `grid`.
+    """
+    from phenocycler.integration.pipeline import STAGES
+
+    df = coerce_cell_table(_minimal(), modality="xenium", donor_id="1", roi="panc")
+    t = CellTable(df=df, modality="xenium", donor_id="1", roi="panc")
+    with pytest.raises(ContractError) as exc:
+        t.xy(registered=True)
+
+    message = str(exc.value)
+    stage_names = {name for name, _pattern, _label in STAGES}
+    quoted = set(re.findall(r"'([a-z_]+)'", message))
+    assert quoted, "the error should name the stages to run, in quotes"
+    assert quoted <= stage_names, f"error names non-existent stage(s): {quoted - stage_names}"
+    assert {"register", "grid"} <= quoted
 
 
 def test_empty_table_has_full_schema():

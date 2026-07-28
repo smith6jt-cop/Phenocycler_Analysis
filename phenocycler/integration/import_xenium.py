@@ -69,9 +69,28 @@ def _require(module: str, extra: str = "integration"):
 
 
 def _obs_str(obs: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+    """One obs column as strings, with nulls replaced by ``default``.
+
+    Order matters here. ``astype(str)`` converts NaN to the literal string ``"nan"``, after
+    which ``fillna`` has nothing left to fill — so nulls must be replaced *first*. Getting
+    this backwards has two consequences, and the second is worse than it looks:
+
+    * ``"nan"`` leaks into ``lineage_native`` / ``celltype_fine`` and shows up as a phantom
+      label in the "did not map to the common vocabulary" warning;
+    * the ``celltype`` -> ``celltype_fine`` fallback in :func:`import_sample` tests
+      ``fine.eq("").all()``, and an all-``"nan"`` series is not all-empty — so an h5ad with
+      a null ``celltype`` but populated ``celltype_fine`` would silently lose its fine
+      labels rather than falling back.
+
+    ``where`` rather than ``fillna`` because obs columns are frequently Categorical, and
+    ``fillna`` on a Categorical raises unless the fill value is already a category.
+    """
     if col not in obs.columns:
         return pd.Series([default] * len(obs), index=obs.index, dtype="object")
-    return obs[col].astype(str).fillna(default)
+    s = obs[col]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        s = s.astype(object)
+    return s.where(s.notna(), default).astype(str)
 
 
 def _obs_num(obs: pd.DataFrame, col: str) -> pd.Series:

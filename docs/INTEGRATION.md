@@ -39,6 +39,13 @@ happens at four levels, none of which claims a cell-to-cell correspondence:
 **`same_slide`** — one physical section imaged twice. Cells *are* the same cells, so a
 genuine paired protein+RNA matrix is recoverable and `sameslide.py` produces it.
 
+`pair_donor` assigns by **mutual-nearest centroid** within a 5 µm cap. `match_by_iou` does
+the better polygon-overlap assignment and is callable if you can supply GeoSeries, but is not
+wired into `pair_donor`: the missing piece is a loader for PhenoCycler's GeoJSON and Xenium's
+zarr boundaries, warped through the transform. This cohort is serial-section, so there is no
+same-slide data to validate such a loader against — it is a follow-up, not a gap being
+papered over.
+
 Every mode-specific module refuses to run in the wrong mode, as a hard error rather than a
 warning. The validity of every downstream claim rests on which situation holds, and a
 warning is too easy to scroll past.
