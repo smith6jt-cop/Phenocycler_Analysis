@@ -71,10 +71,14 @@ STRUCTURE_SEEDS: dict[str, tuple[str, str]] = {
 #: Common lineages worth comparing per tissue. A lymph node has no endocrine or exocrine
 #: compartment, so reporting a near-zero fraction for those would be noise dressed as a
 #: finding; a pancreas has all of them.
+#: Granulocyte is absent from both: neither modality calls it at broad level (PhenoCycler
+#: folds MPO into Immune, Xenium folds granulocytes into Myeloid), so it is `fine_only` on
+#: both sides and `donor.comparable_for` would drop it anyway. Listing it here would suggest
+#: a lymph-node comparison that cannot be made.
 COMPARABLE_LINEAGES: dict[str, tuple[str, ...]] = {
     PANCREAS: ("Endocrine", "Exocrine", "Stromal", "Vascular",
                "T_NK", "B_Plasma", "Myeloid", "Neural"),
-    LYMPH_NODE: ("Stromal", "Vascular", "T_NK", "B_Plasma", "Myeloid", "Granulocyte"),
+    LYMPH_NODE: ("Stromal", "Vascular", "T_NK", "B_Plasma", "Myeloid"),
 }
 
 

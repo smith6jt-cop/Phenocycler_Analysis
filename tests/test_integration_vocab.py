@@ -76,12 +76,23 @@ def test_fibroblast_and_muscle_collapse_to_stromal():
     assert XENIUM_TO_COMMON["Stromal"] == "Stromal"
 
 
-def test_neutrophil_maps_to_granulocyte_which_xenium_only_has_as_fine():
-    assert pheno_to_common("Neutrophil") == "Granulocyte"
+def test_xenium_reaches_granulocyte_only_through_a_fine_label():
+    """Xenium folds `07_immune_granulocyte` into `Myeloid` at broad level, whatever the
+    protein side does — so a fine label is the only route."""
     assert RESOLVABLE["Granulocyte"]["xenium"] == "fine_only"
-    # The only route to Granulocyte on the Xenium side is a fine label.
     assert xenium_to_common("Myeloid", "Mast") == "Granulocyte"
     assert xenium_to_common("Myeloid", "Myeloid") == "Myeloid"
+
+
+def test_phenocycler_granulocyte_route_follows_the_core_lineages():
+    """With a `Neutrophil` class it maps to Granulocyte; folded into `Immune` it does not
+    exist, and MPO-only cells reach Myeloid via the empty immune subclass."""
+    from phenocycler.config import LINEAGES
+
+    if "Neutrophil" in LINEAGES:
+        assert pheno_to_common("Neutrophil") == "Granulocyte"
+    else:
+        assert pheno_to_common("Immune", "") == "Myeloid"
 
 
 def test_epithelial_is_a_default_sink_and_is_flagged():
@@ -208,3 +219,53 @@ def test_crosswalk_frame_and_report(tax):
     report = coverage_report(pairs, tax)
     assert "OFF-PANEL LINEAGE GATES" in report
     assert "default_sink" in report
+
+
+def test_granulocyte_resolvability_tracks_the_core_pipeline():
+    """The crosswalk must not advertise a capability the pipeline has stopped having.
+
+    While a dedicated `Neutrophil` lineage exists, PhenoCycler resolves granulocytes at broad
+    level. Fold MPO into `Immune` and it does not — `immune_subclass` gates CD3e/CD20/CD163
+    only, so an MPO-only cell lands in Myeloid. Deriving from `config.LINEAGES` makes the
+    crosswalk follow that instead of drifting behind it.
+    """
+    from phenocycler.config import LINEAGES
+    from phenocycler.integration.vocab import PHENO_TO_COMMON, RESOLVABLE
+
+    has_neutrophil = "Neutrophil" in LINEAGES
+    assert ("Neutrophil" in PHENO_TO_COMMON) == has_neutrophil
+    assert RESOLVABLE["Granulocyte"]["phenocycler"] == ("yes" if has_neutrophil else "fine_only")
+    # Xenium never calls it at broad level, whatever the protein side does.
+    assert RESOLVABLE["Granulocyte"]["xenium"] == "fine_only"
+
+
+def test_crosswalk_covers_exactly_the_core_lineages():
+    """The drift guard: a class added to or removed from `LINEAGES` must not leave the
+    crosswalk stale in either direction."""
+    from phenocycler.config import LINEAGES
+    from phenocycler.integration.vocab import PHENO_TO_COMMON
+
+    # `Immune` is deliberately absent — it resolves via immune_subclass, not the broad label.
+    expected = set(LINEAGES) - {"Immune"}
+    assert set(PHENO_TO_COMMON) == expected, (
+        f"crosswalk drifted from phenocycler.config.LINEAGES: "
+        f"missing={expected - set(PHENO_TO_COMMON)}, stale={set(PHENO_TO_COMMON) - expected}")
+
+
+def test_mpo_only_cells_reach_myeloid_when_neutrophil_is_folded_in():
+    """Broad types only: with MPO inside `Immune`, a neutrophil has no subclass and maps to
+    Myeloid — which is exactly where Xenium puts a granulocyte at broad level."""
+    from phenocycler.integration.vocab import pheno_to_common
+
+    assert pheno_to_common("Immune", "") == "Myeloid"
+    assert pheno_to_common("Immune", "Myeloid") == "Myeloid"
+
+
+def test_granulocyte_never_enters_a_comparable_set():
+    """Xenium cannot call it at broad level, so it is not evidence either way."""
+    from phenocycler.integration.donor import COMPARABLE, comparable_for
+    from phenocycler.integration.tissues import TISSUES
+
+    assert "Granulocyte" not in COMPARABLE
+    for tissue in TISSUES:
+        assert "Granulocyte" not in comparable_for(tissue), tissue
