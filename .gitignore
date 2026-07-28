@@ -242,3 +242,6 @@ data/integration/*
 !data/integration/manifest.csv
 !data/integration/vocab_crosswalk.csv
 .pytest_cache/
+
+# setuptools-scm generated (version comes from git tags, never committed)
+phenocycler/_version.py

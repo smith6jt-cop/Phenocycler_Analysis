@@ -1,10 +1,14 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "phenocycler-analysis"
-version = "0.3.0"
+# Version is derived from git tags by setuptools-scm — see [tool.setuptools_scm] below.
+# It is deliberately NOT a literal here: a hardcoded string and a git tag drift apart the
+# moment someone forgets one, and an analysis pipeline whose recorded version does not match
+# the commit that produced the results is worse than having no version at all.
+dynamic = ["version"]
 description = "Phenocycler / CODEX phenotyping pipeline: REDSEA -> RESTORE -> hormone floor -> 8-class broad lineage"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,3 +57,42 @@ phenocycler = "phenocycler.pipeline:main"
 
 [tool.setuptools]
 packages = ["phenocycler", "phenocycler.integration"]
+
+[tool.setuptools_scm]
+# Version comes from the nearest git tag. A tagged commit gives a clean release version
+# (`v0.4.0` -> `0.4.0`); anything after it gets a dev suffix carrying the distance and commit
+# (`0.4.1.dev3+g2fc0002`), so a result can always be traced back to the exact tree.
+version_file = "phenocycler/_version.py"
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+# Working from a tarball or a shallow clone with no tags (CI, HiPerGator scratch) must not
+# be a hard failure — fall back rather than refusing to build.
+fallback_version = "0.0.0+unknown"
+
+# --------------------------------------------------------------------------- #
+# Lint
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["notebooks", "data", "figures", "logs", "external"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = [
+    "E501",  # line length — scientific kwargs and long literals make this noisy
+    "B008",  # function call in default arg — Path() defaults are idiomatic here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests redefine fixtures, shadow builtins, and use bare asserts freely.
+"tests/*" = ["B011", "B018"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+markers = [
+    "slow: tests that need real imaging data (skipped in CI)",
+    "gpu: tests that need a GPU (HiPerGator only)",
+]
