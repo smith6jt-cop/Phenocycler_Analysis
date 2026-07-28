@@ -24,8 +24,8 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from ..config import LINEAGE_COLORS, STATUS_ORDER, PipelineConfig, load_config  # noqa: E402
-from .contract import CellTable, read_cell_table  # noqa: E402
-from .manifest import PAIRED, load_manifest  # noqa: E402
+from .contract import read_cell_table  # noqa: E402
+from .manifest import load_manifest, paired_rows  # noqa: E402
 from .rasterize import grid_for, tissue_mask  # noqa: E402
 from .register import registration_dir  # noqa: E402
 from .transform import Transform  # noqa: E402
@@ -294,17 +294,16 @@ def disease_trend_figure(cfg: PipelineConfig,
 
 
 def run_figures(cfg: PipelineConfig, donors: Optional[list[str]] = None,
-                *, roi: str = "panc") -> list[Path]:
+                *, roi: Optional[str] = None, tissue: Optional[str] = None) -> list[Path]:
     """Stage entry point: render everything that has data behind it."""
     cfg.integration_figures_dir.mkdir(parents=True, exist_ok=True)
     made: list[Path] = []
 
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
     if donors:
         man = man[man["donor_id"].isin({str(d) for d in donors})]
     for _, r in man.iterrows():
-        p = registration_overlay(cfg, r["donor_id"], roi)
+        p = registration_overlay(cfg, r["donor_id"], r["roi"])
         if p:
             made.append(p)
             print(f"[figures] {p}", flush=True)
@@ -324,11 +323,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Integration figures")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    run_figures(cfg, args.donors, roi=args.roi)
+    run_figures(cfg, args.donors, roi=args.roi, tissue=args.tissue)
     return 0
 
 

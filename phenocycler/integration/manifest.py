@@ -52,6 +52,7 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import normalize_donor_id
+from .tissues import for_roi as tissue_for_roi
 
 #: Columns of ``data/integration/manifest.csv``, in order.
 MANIFEST_COLUMNS = [
@@ -69,6 +70,7 @@ MANIFEST_COLUMNS = [
     "xenium_h5ad",
     "section_gap_um",
     "block_id",
+    "tissue",
 ]
 
 #: ``pair_status`` vocabulary.
@@ -77,8 +79,11 @@ PHENO_ONLY = "pheno_only"          # PhenoCycler has it, Xenium does not
 XENIUM_ONLY = "xenium_only"        # Xenium has it, PhenoCycler does not
 DONOR_UNKNOWN = "donor_unknown"    # a Xenium run whose donor is not recorded anywhere
 
-#: PhenoCycler is a pancreas-only pipeline; pLN Xenium regions are carried for provenance
-#: but never paired against it.
+#: Every ROI in the cohort is pairable: the design is 20 donors x {PhenoCycler, Xenium} x
+#: {pancreas, pancreatic lymph node}, so a lymph-node section has a counterpart on both
+#: platforms exactly as a pancreas section does. (An earlier revision treated PhenoCycler as
+#: pancreas-only, which was wrong.) `PAIRABLE_ROI` remains as the default single-ROI value
+#: for callers that want one.
 PAIRABLE_ROI = "panc"
 
 #: ``output-XETG00298__0059865__Panc__20250328__202338`` -> serial ``0059865``, label ``Panc``.
@@ -384,6 +389,7 @@ def build_manifest(
             "xenium_h5ad": "",
             "section_gap_um": str(ov.get("section_gap_um", "") or ""),
             "block_id": str(ov.get("block_id", "") or ""),
+            "tissue": tissue_for_roi(roi),
         })
         seen_keys.add(key)
 
@@ -410,6 +416,7 @@ def build_manifest(
             "xenium_h5ad": "",
             "section_gap_um": str(r.get("section_gap_um", "") or ""),
             "block_id": str(r.get("block_id", "") or ""),
+            "tissue": tissue_for_roi(r["roi"] or (key.split("__", 1)[1] if "__" in key else "")),
         })
         seen_keys.add(key)
 
@@ -439,7 +446,7 @@ def build_manifest(
                 images.append("")
                 geojsons.append("")
                 continue
-            if donor in pheno_set and roi == PAIRABLE_ROI:
+            if donor in pheno_set and tissue_for_roi(roi):
                 q, g = _pheno_paths(cfg, donor)
                 statuses.append(PAIRED)
                 images.append(q)
@@ -454,6 +461,8 @@ def build_manifest(
 
     # PhenoCycler donors with no Xenium run at all get their own rows, so the manifest is a
     # complete picture of the cohort rather than a Xenium-shaped view of it.
+    # PhenoCycler donors with no Xenium run at all. Recorded against the pancreas ROI as the
+    # cohort's primary tissue; a pheno-only lymph node would appear here too if one existed.
     for donor in sorted(pheno_set - xen_donors):
         q, g = _pheno_paths(cfg, donor)
         df = pd.concat([df, pd.DataFrame([{
@@ -471,6 +480,7 @@ def build_manifest(
             "xenium_h5ad": "",
             "section_gap_um": "",
             "block_id": "",
+            "tissue": tissue_for_roi(PAIRABLE_ROI),
         }])], ignore_index=True)
 
     if len(df):
@@ -529,12 +539,33 @@ def load_manifest(cfg: PipelineConfig) -> pd.DataFrame:
     return df
 
 
-def paired_rows(df: pd.DataFrame, roi: str = PAIRABLE_ROI) -> pd.DataFrame:
-    """The subset that can actually be integrated: both modalities, pairable ROI."""
-    sub = df[df["pair_status"] == PAIRED]
+def rows_for_scope(df: pd.DataFrame, roi: Optional[str] = None,
+                   tissue: Optional[str] = None) -> pd.DataFrame:
+    """Apply the ROI/tissue scope rule. The single definition of what a run covers.
+
+    Three shapes, matching the CLI: one ROI, one tissue's ROIs, or — with neither — every
+    ROI in the table. Every stage narrows through here rather than writing its own
+    ``df["roi"] == roi``; that hand-rolled form is what made the lymph node invisible to
+    half the pipeline, and it is the kind of thing a new stage copies without noticing.
+    """
+    sub = df
     if roi:
         sub = sub[sub["roi"] == roi]
+    elif tissue:
+        sub = sub[sub["tissue"] == tissue]
     return sub.reset_index(drop=True)
+
+
+def paired_rows(df: pd.DataFrame, roi: Optional[str] = None,
+                tissue: Optional[str] = None) -> pd.DataFrame:
+    """The subset that can actually be integrated, narrowed to the run's scope.
+
+    Defaults to **every** paired section, not to the pancreas. A tissue-shaped default in the
+    one function whose job is scoping is precisely how the lymph node went missing from half
+    the pipeline: every caller that forgot to pass an argument quietly analysed one tissue and
+    reported it as the cohort. Pass ``tissue=`` or ``roi=`` to narrow.
+    """
+    return rows_for_scope(df[df["pair_status"] == PAIRED], roi=roi, tissue=tissue)
 
 
 def run_manifest(cfg: PipelineConfig, *, write: bool = True,

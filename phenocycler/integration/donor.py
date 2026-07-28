@@ -29,7 +29,6 @@ evidence-positive figure on both sides.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -38,6 +37,8 @@ import pandas as pd
 from ..config import STATUS_ORDER, PipelineConfig, load_config
 from .contract import CellTable, discover_partitions, read_cell_table
 from .manifest import load_manifest
+from .tissues import TissueError
+from .tissues import comparable_lineages as tissue_comparable_lineages
 from .vocab import COMMON_LINEAGES, RESOLVABLE
 
 #: Lineages both modalities can resolve at the broad level without a caveat. Concordance is
@@ -49,6 +50,24 @@ COMPARABLE = tuple(
     and RESOLVABLE.get(lin, {}).get("phenocycler") in ("yes", "subclass")
     and RESOLVABLE.get(lin, {}).get("xenium") in ("yes", "surrogate")
 )
+
+
+def comparable_for(tissue: str) -> tuple[str, ...]:
+    """``COMPARABLE`` narrowed to the lineages that exist in this tissue.
+
+    Two independent filters, and both are needed. ``COMPARABLE`` asks whether the *instruments*
+    can resolve a lineage; the tissue registry asks whether the *tissue has one*. A lymph node
+    has no endocrine compartment, so a near-zero endocrine fraction on both sides is not
+    agreement about biology — it is two instruments both correctly finding nothing, and letting
+    it into the Spearman would inflate the concordance with a free correct answer.
+    """
+    if not tissue:
+        return COMPARABLE
+    try:
+        allowed = set(tissue_comparable_lineages(tissue))
+    except TissueError:
+        return COMPARABLE
+    return tuple(lin for lin in COMPARABLE if lin in allowed) or COMPARABLE
 
 
 def composition(table: CellTable,
@@ -74,6 +93,7 @@ def composition(table: CellTable,
             "modality": table.modality,
             "donor_id": table.donor_id,
             "roi": table.roi,
+            "tissue": table.tissue,
             "lineage_common": lineage,
             "n_cells": n,
             "n_evidence_positive": n_ev,
@@ -103,7 +123,7 @@ def marker_gene_concordance(
     p_feats = {c[len("feat__"):]: c for c in pheno.df.columns if c.startswith("feat__")}
     x_feats = {c[len("feat__"):]: c for c in xen.df.columns if c.startswith("feat__")}
 
-    for lineage in COMPARABLE:
+    for lineage in comparable_for(pheno.tissue or xen.tissue):
         p_sel = (pheno.df["lineage_common"] == lineage) & pheno.df["evidence_positive"]
         x_sel = (xen.df["lineage_common"] == lineage) & xen.df["evidence_positive"]
         if p_sel.sum() < 10 or x_sel.sum() < 10:
@@ -139,7 +159,8 @@ def _xenium_lineage_for(common: str) -> str:
 
 
 def compare_donor(pheno: CellTable, xen: CellTable) -> tuple[pd.DataFrame, dict]:
-    """Composition comparison for one donor. Returns ``(long table, summary stats)``."""
+    """Composition comparison for one donor+ROI. Returns ``(long table, summary stats)``."""
+    tissue = pheno.tissue or xen.tissue
     p = composition(pheno)
     x = composition(xen)
 
@@ -147,7 +168,8 @@ def compare_donor(pheno: CellTable, xen: CellTable) -> tuple[pd.DataFrame, dict]
     merged["delta_frac_all"] = merged["frac_all_pheno"] - merged["frac_all_xen"]
     merged["delta_frac_ev"] = (merged["frac_evidence_positive_pheno"]
                                - merged["frac_evidence_positive_xen"])
-    merged["comparable"] = merged["lineage_common"].isin(COMPARABLE)
+    merged["comparable"] = merged["lineage_common"].isin(comparable_for(tissue))
+    merged["tissue"] = tissue
 
     from scipy import stats as sps
 
@@ -155,6 +177,7 @@ def compare_donor(pheno: CellTable, xen: CellTable) -> tuple[pd.DataFrame, dict]
     stats = {
         "donor_id": pheno.donor_id,
         "roi": pheno.roi,
+        "tissue": tissue,
         "n_cells_pheno": len(pheno.df),
         "n_cells_xen": len(xen.df),
         "frac_fallback_pheno": float(1 - pheno.df["evidence_positive"].mean()),
@@ -186,7 +209,12 @@ def disease_trend(compositions: pd.DataFrame, status_by_donor: dict) -> pd.DataF
     """
     df = compositions.copy()
     df["status"] = df["donor_id"].map(status_by_donor).fillna("?")
-    grp = (df.groupby(["modality", "lineage_common", "status"], observed=True)
+    # Group by tissue as well as modality. Pooling a pancreas and a lymph node into one
+    # "mean endocrine fraction" would halve the pancreatic signal with structural zeros and
+    # turn the ND -> AAB -> T1D gradient — the whole point of this table — into noise.
+    if "tissue" not in df.columns:
+        df["tissue"] = ""
+    grp = (df.groupby(["tissue", "modality", "lineage_common", "status"], observed=True)
              .agg(mean_frac=("frac_evidence_positive", "mean"),
                   sd_frac=("frac_evidence_positive", "std"),
                   n_donors=("donor_id", "nunique"))
@@ -194,45 +222,61 @@ def disease_trend(compositions: pd.DataFrame, status_by_donor: dict) -> pd.DataF
 
     order = {s: i for i, s in enumerate(STATUS_ORDER)}
     grp["status_order"] = grp["status"].map(order).fillna(len(order))
-    return grp.sort_values(["modality", "lineage_common", "status_order"]).reset_index(drop=True)
+    return grp.sort_values(["tissue", "modality", "lineage_common", "status_order"]
+                           ).reset_index(drop=True)
 
 
 def run_donor(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Stage entry point. Runs on whatever is exported — pairing is a bonus, not a requirement."""
+    """Stage entry point. Runs on whatever is exported — pairing is a bonus, not a requirement.
+
+    Iterates ``(donor, roi)`` rather than donor. A donor contributes a pancreas section *and*
+    up to three lymph-node sections, and each is its own comparison: keying by donor alone
+    would keep whichever partition was discovered last and silently drop the other tissue.
+    """
     man = load_manifest(cfg)
     status_by_donor = dict(zip(man["donor_id"], man["disease_status"]))
 
-    pheno_parts = {d: r for d, r in discover_partitions(cfg.cells_pheno_dir)}
-    xen_parts = {d: r for d, r in discover_partitions(cfg.cells_xen_dir)}
-    want = set(donors) if donors else (set(pheno_parts) | set(xen_parts))
+    wanted_rois = set(cfg.resolve_rois(roi, [tissue] if tissue else None))
+    pheno_parts = set(discover_partitions(cfg.cells_pheno_dir))
+    xen_parts = set(discover_partitions(cfg.cells_xen_dir))
+    sections = sorted(p for p in (pheno_parts | xen_parts) if p[1] in wanted_rois)
+    if donors:
+        keep = {str(d) for d in donors}
+        sections = [s for s in sections if s[0] in keep]
 
     all_comp, all_cmp, stats_rows, all_markers = [], [], [], []
-    try:
-        from .vocab import load_panel_taxonomy, protein_gene_pairs
-        tax = load_panel_taxonomy(cfg)
-        panel = sorted({g for gs in tax.core_genes.values() for g in gs})
-        pairs = protein_gene_pairs(panel, tax=tax)
-    except Exception:  # noqa: BLE001 - marker comparison is optional
-        pairs = []
+    taxonomies: dict[str, list] = {}
 
-    for donor in sorted(want):
-        p = x = None
-        if donor in pheno_parts:
+    def _pairs_for(t: str) -> list:
+        """Marker pairs for a tissue's identity cores, resolved once per tissue."""
+        if t not in taxonomies:
             try:
-                p = read_cell_table(cfg.cells_pheno_dir, donor, pheno_parts[donor],
+                from .vocab import load_panel_taxonomy, protein_gene_pairs
+                tax = load_panel_taxonomy(cfg, t or None)
+                panel = sorted({g for gs in tax.core_genes.values() for g in gs})
+                taxonomies[t] = protein_gene_pairs(panel, tax=tax)
+            except Exception:  # noqa: BLE001 - marker comparison is optional
+                taxonomies[t] = []
+        return taxonomies[t]
+
+    for donor, section_roi in sections:
+        p = x = None
+        if (donor, section_roi) in pheno_parts:
+            try:
+                p = read_cell_table(cfg.cells_pheno_dir, donor, section_roi,
                                     modality="phenocycler")
                 all_comp.append(composition(p))
             except FileNotFoundError:
                 p = None
-        if donor in xen_parts:
+        if (donor, section_roi) in xen_parts:
             try:
-                x = read_cell_table(cfg.cells_xen_dir, donor, xen_parts[donor],
-                                    modality="xenium")
+                x = read_cell_table(cfg.cells_xen_dir, donor, section_roi, modality="xenium")
                 all_comp.append(composition(x))
             except FileNotFoundError:
                 x = None
@@ -244,19 +288,21 @@ def run_donor(
             all_cmp.append(merged)
             stats["status"] = status_by_donor.get(donor, "")
             stats_rows.append(stats)
-            print(f"[donor] {donor}: composition Spearman "
+            print(f"[donor] {donor}/{section_roi}: composition Spearman "
                   f"{stats.get('spearman_composition_ev', float('nan')):.3f} "
                   f"(evidence-positive), fallback {stats['frac_fallback_pheno']:.1%} pheno / "
                   f"{stats['frac_fallback_xen']:.1%} xenium", flush=True)
+            pairs = _pairs_for(p.tissue or x.tissue)
             if pairs:
                 mk = marker_gene_concordance(p, x, pairs)
                 if len(mk):
                     mk.insert(0, "donor_id", donor)
+                    mk.insert(1, "roi", section_roi)
                     all_markers.append(mk)
         elif p is not None or x is not None:
             which = "PhenoCycler" if p is not None else "Xenium"
-            print(f"[donor] {donor}: {which} only — composition recorded, no comparison",
-                  flush=True)
+            print(f"[donor] {donor}/{section_roi}: {which} only — composition recorded, "
+                  f"no comparison", flush=True)
 
     cfg.integration_qc_dir.mkdir(parents=True, exist_ok=True)
     if all_comp:
@@ -284,11 +330,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         description="Donor-level composition concordance (no registration needed)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    stats = run_donor(cfg, args.donors, roi=args.roi)
+    stats = run_donor(cfg, args.donors, roi=args.roi, tissue=args.tissue)
     if len(stats):
         print()
         print(stats.to_string(index=False))

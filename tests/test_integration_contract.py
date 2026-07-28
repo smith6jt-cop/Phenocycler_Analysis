@@ -26,6 +26,7 @@ def _minimal(n=10, modality="phenocycler"):
 
 def test_coerce_fills_schema_and_dtypes():
     df = coerce_cell_table(_minimal(), modality="phenocycler", donor_id="6539", roi="panc")
+    assert (df["tissue"] == "pancreas").all(), "tissue must be derived from the roi"
     for col, dtype in CELL_TABLE_COLUMNS.items():
         assert col in df.columns, col
         if dtype.startswith("float"):
@@ -52,17 +53,17 @@ def test_coerce_preserves_extra_columns_and_sorts_features():
 def test_missing_required_column_raises():
     bad = _minimal().drop(columns=["lineage_native"])
     with pytest.raises(ContractError, match="missing"):
-        coerce_cell_table(bad, modality="phenocycler", donor_id="1")
+        coerce_cell_table(bad, modality="phenocycler", donor_id="1", roi="panc")
 
 
 def test_unknown_modality_raises():
     with pytest.raises(ContractError, match="unknown modality"):
-        coerce_cell_table(_minimal(), modality="visium", donor_id="1")
+        coerce_cell_table(_minimal(), modality="visium", donor_id="1", roi="panc")
 
 
 def test_validate_rejects_mixed_modalities_and_duplicates():
-    a = coerce_cell_table(_minimal(), modality="phenocycler", donor_id="1")
-    b = coerce_cell_table(_minimal(), modality="xenium", donor_id="1")
+    a = coerce_cell_table(_minimal(), modality="phenocycler", donor_id="1", roi="panc")
+    b = coerce_cell_table(_minimal(), modality="xenium", donor_id="1", roi="panc")
     with pytest.raises(ContractError, match="mixes modalities"):
         validate_cell_table(pd.concat([a, b], ignore_index=True))
 
@@ -81,7 +82,7 @@ def test_validate_catches_pixels_masquerading_as_microns():
     """
     raw = _minimal(n=50)
     raw["x_um"] = np.linspace(0, 500_000, 50)
-    df = coerce_cell_table(raw, modality="xenium", donor_id="1")
+    df = coerce_cell_table(raw, modality="xenium", donor_id="1", roi="panc")
     with pytest.raises(ContractError, match="look like pixels"):
         validate_cell_table(df)
 
@@ -155,7 +156,7 @@ def test_empty_table_has_full_schema():
 
 
 def test_write_validates_before_persisting(tmp_path):
-    bad = coerce_cell_table(_minimal(), modality="phenocycler", donor_id="1")
+    bad = coerce_cell_table(_minimal(), modality="phenocycler", donor_id="1", roi="panc")
     bad.loc[0, "cell_id"] = bad.loc[1, "cell_id"]      # duplicate
     with pytest.raises(ContractError):
         write_cell_table(bad, tmp_path / "x.parquet")

@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -41,7 +40,7 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import CellTable, feature_name, read_cell_table
-from .manifest import PAIRED, load_manifest
+from .manifest import load_manifest, paired_rows
 from .vocab import MarkerPair, load_panel_taxonomy, protein_gene_pairs, usable_anchors
 
 
@@ -329,41 +328,48 @@ def run_crossmodal(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
     group_by: str = "niche_id_joint",
     require_qc_pass: bool = True,
 ) -> pd.DataFrame:
-    """Stage entry point. Skips donors whose registration did not pass QC."""
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+    """Stage entry point. Skips sections whose registration did not pass QC.
+
+    Spans the whole selection in one call and writes once — the output paths are stage-level,
+    so a per-ROI call would have each ROI overwrite the last.
+    """
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
     if donors:
         man = man[man["donor_id"].isin({str(d) for d in donors})]
     if man.empty:
         print("[crossmodal] no paired donors", flush=True)
         return pd.DataFrame()
 
-    passed: Optional[set[str]] = None
+    #: QC verdicts are per (donor, roi): a donor's pancreas can register cleanly while its
+    #: lymph node does not, so gating on donor alone would let a bad alignment through.
+    passed: Optional[set[tuple[str, str]]] = None
     qc_csv = cfg.integration_qc_dir / "registration_qc.csv"
     if require_qc_pass and qc_csv.exists():
         qc = pd.read_csv(qc_csv, dtype=str)
-        passed = set(qc.loc[qc["verdict"] != "FAIL", "donor_id"])
+        ok = qc.loc[qc["verdict"] != "FAIL"]
+        passed = set(zip(ok["donor_id"], ok.get("roi", pd.Series([""] * len(ok)))))
 
     rows, frames = [], []
     for _, r in man.iterrows():
-        donor = r["donor_id"]
-        if passed is not None and donor not in passed:
-            print(f"[crossmodal] {donor}: registration QC did not pass — skipped "
+        donor, roi_name = r["donor_id"], r["roi"]
+        if passed is not None and (donor, roi_name) not in passed:
+            print(f"[crossmodal] {donor}/{roi_name}: registration QC did not pass — skipped "
                   f"(links would inherit a bad alignment)", flush=True)
             continue
         try:
-            res = link_donor(cfg, donor, roi, group_by=group_by)
+            res = link_donor(cfg, donor, roi_name, group_by=group_by)
         except (AnchorError, FileNotFoundError) as exc:
-            print(f"[crossmodal] {donor}: {exc}", flush=True)
+            print(f"[crossmodal] {donor}/{roi_name}: {exc}", flush=True)
             continue
         rows.append(res.stats)
         if len(res.links):
             frames.append(res.links)
-        print(f"[crossmodal] {donor}: {res.stats['n_links']:,} links over "
+        print(f"[crossmodal] {donor}/{roi_name}: {res.stats['n_links']:,} links over "
               f"{res.stats['n_groups']} groups using {res.n_anchors} anchors | "
               f"lineage agreement {res.stats['agree_real']:.3f} vs null "
               f"{res.stats['agree_null']:.3f} (z={res.stats['z']:.1f})", flush=True)
@@ -389,14 +395,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Pseudo-cell linking across serial sections")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     ap.add_argument("--group-by", default="niche_id_joint")
     ap.add_argument("--ignore-qc", action="store_true",
                     help="link even for donors whose registration failed QC")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    stats = run_crossmodal(cfg, args.donors, roi=args.roi, group_by=args.group_by,
+    stats = run_crossmodal(cfg, args.donors, roi=args.roi, tissue=args.tissue,
+                           group_by=args.group_by,
                            require_qc_pass=not args.ignore_qc)
     if len(stats):
         print()

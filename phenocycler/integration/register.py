@@ -44,12 +44,12 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import CellTable, read_cell_table
-from .manifest import PAIRED, load_manifest
+from .manifest import load_manifest, paired_rows
 from .rasterize import (GridSpec, grid_for, lineage_density, normalize_image,
                         rasterize_structures, tissue_mask)
 from .structures import structures_path
 from .transform import (Transform, affine_from_pixels, affine_to_pixels, fit_affine_lstsq,
-                        fit_rigid_umeyama, from_rigid)
+                        fit_rigid_umeyama)
 
 #: Lineages used as density channels when registering without morphology images. Endocrine
 #: is effectively an islet map and Vascular a vessel map; both are structural and largely
@@ -817,14 +817,18 @@ def run_register(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
     use_images: bool = True,
 ) -> pd.DataFrame:
-    """Stage entry point: register every paired donor and persist the transforms."""
+    """Stage entry point: register every paired section and persist the transforms.
+
+    One call covers the whole selection. Registration is per (donor, roi) — a donor's
+    pancreas and each of its lymph nodes are separate sections with separate transforms.
+    """
     import json
 
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
     if donors:
         man = man[man["donor_id"].isin({str(d) for d in donors})]
     if man.empty:
@@ -833,7 +837,7 @@ def run_register(
 
     rows = []
     for _, r in man.iterrows():
-        donor = r["donor_id"]
+        donor, roi = r["donor_id"], r["roi"]
         res = register_donor(cfg, donor, roi, use_images=use_images)
         if res is None:
             continue
@@ -843,7 +847,8 @@ def run_register(
         (out / "qc.json").write_text(json.dumps(res.to_dict(), indent=2))
 
         rows.append({
-            "donor_id": donor, "roi": roi, "track": res.track,
+            "donor_id": donor, "roi": roi, "tissue": r.get("tissue", ""),
+            "track": res.track,
             "n_inliers": res.n_inliers, "n_candidates": res.n_candidates,
             "rmse_um": res.rmse_um, "tissue_dice": res.tissue_dice,
             "islet_dice": res.islet_dice, "mirrored": res.mirrored,
@@ -851,7 +856,7 @@ def run_register(
             "max_disp_um": res.transform.max_displacement_um,
             "score": res.score(), "stages": "|".join(res.stages),
         })
-        print(f"[register] {donor}: track={res.track} stages={'|'.join(res.stages)} "
+        print(f"[register] {donor}/{roi}: track={res.track} stages={'|'.join(res.stages)} "
               f"rot={res.transform.rotation_deg:+.1f}deg "
               f"tissue_dice={res.tissue_dice:.3f} islet_rmse={res.rmse_um:.1f}um",
               flush=True)
@@ -863,13 +868,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Register PhenoCycler <-> Xenium serial sections")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     ap.add_argument("--no-images", action="store_true",
                     help="point-set track only (skip all image reads)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    summary = run_register(cfg, args.donors, roi=args.roi, use_images=not args.no_images)
+    summary = run_register(cfg, args.donors, roi=args.roi, tissue=args.tissue,
+                           use_images=not args.no_images)
     if len(summary):
         print()
         print(summary.to_string(index=False))

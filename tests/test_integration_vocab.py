@@ -7,9 +7,8 @@ import pytest
 from phenocycler import load_config
 from phenocycler.config import LINEAGES
 from phenocycler.integration.vocab import (
-    COMMON_LINEAGES, GATE_MARKERS, PHENO_IMMUNE_TO_COMMON, PHENO_TO_COMMON,
-    PROTEIN_GENE_CANDIDATES, RESOLVABLE, SURROGATE_PANEL, XENIUM_FINE_TO_COMMON,
-    XENIUM_TO_COMMON, check_panel_roles_agreement, coverage_report, crosswalk_frame,
+    COMMON_LINEAGES, GATE_MARKERS, PHENO_TO_COMMON,
+    PROTEIN_GENE_CANDIDATES, RESOLVABLE, SURROGATE_PANEL, XENIUM_TO_COMMON, check_panel_roles_agreement, coverage_report, crosswalk_frame,
     load_panel_taxonomy, pheno_to_common, protein_gene_pairs, usable_anchors,
     xenium_to_common,
 )

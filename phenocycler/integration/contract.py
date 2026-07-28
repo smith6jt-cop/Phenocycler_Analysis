@@ -16,7 +16,10 @@ Schema::
                               Xenium: cell_id from cells.parquet / adata.obs_names.
     donor_id         str      the cross-modality join key. ALWAYS str (the donor metadata
                               workbook stores it numeric; PhenoCycler derives it by regex).
-    roi              str      'panc' | 'pln_1' | ... PhenoCycler is pancreas-only.
+    tissue           str      'pancreas' | 'pancreatic_lymph_node'. Set when the dataset is
+                              IMPORTED, not inferred later — see below.
+    roi              str      the section within the tissue: 'panc' | 'pln_1' .. 'pln_3'.
+                              One donor can have a pancreas and up to three lymph nodes.
     modality         str      'phenocycler' | 'xenium'
     x_um, y_um       float32  centroid in MICRONS in the modality's own frame.
     x_um_reg,        float32  centroid in microns in the FIXED frame, written by S5.
@@ -32,6 +35,17 @@ Schema::
     structure_id     str      islet id once structures.py has run, else ''.
     feat__<name>     float32  per-cell features. PhenoCycler: '<marker>_norm'.
                               Xenium: identity-core lineage scores.
+
+``tissue`` is a property of the dataset, fixed at import, not something derived downstream.
+The cohort is 20 donors × {PhenoCycler, Xenium} × {pancreas, pancreatic lymph node}, and the
+two tissues are analysed both separately and pooled. Carrying tissue as a column rather than
+as a global run mode is what makes that work: a stage filters to one tissue or runs across
+both, and a pooled table can never silently mix them because every row says which it is.
+
+It also decides what is *meaningful*. Islets exist in pancreas and not in lymph node, so
+structure extraction and islet matching are pancreas-only; the registration-free levels
+(donor, niche) and the grid comparison apply to both. Modules consult
+``phenocycler.integration.tissues`` rather than assuming pancreas.
 
 ``evidence_positive`` is not decoration. PhenoCycler's ``Epithelial`` is a *default sink* —
 ``lineage.py`` assigns it to every cell that fails all the positive gates (flagged there as
@@ -61,6 +75,7 @@ FEATURE_PREFIX = "feat__"
 CELL_TABLE_COLUMNS: dict[str, str] = {
     "cell_id": "object",
     "donor_id": "object",
+    "tissue": "object",
     "roi": "object",
     "modality": "object",
     "x_um": "float32",
@@ -97,6 +112,7 @@ class CellTable:
     modality: str
     donor_id: str
     roi: str = ""
+    tissue: str = ""
 
     @property
     def n_cells(self) -> int:
@@ -142,6 +158,20 @@ def as_feature(name: str) -> str:
     return name if name.startswith(FEATURE_PREFIX) else f"{FEATURE_PREFIX}{name}"
 
 
+def tissue_for_roi(roi: str) -> str:
+    """Map an ROI name to its tissue. Thin alias for :func:`tissues.for_roi`."""
+    from .tissues import for_roi
+
+    return for_roi(roi)
+
+
+def normalize_tissue(tissue: str) -> str:
+    """Canonicalise a tissue name. Thin alias for :func:`tissues.normalize`."""
+    from .tissues import normalize
+
+    return normalize(tissue)
+
+
 def normalize_donor_id(value) -> str:
     """Coerce a donor id to the canonical string form.
 
@@ -177,6 +207,7 @@ def coerce_cell_table(
     modality: str,
     donor_id: str,
     roi: str = "",
+    tissue: str = "",
 ) -> pd.DataFrame:
     """Fill missing optional columns, cast dtypes, and order columns canonically.
 
@@ -198,6 +229,16 @@ def coerce_cell_table(
     out["donor_id"] = normalize_donor_id(donor_id)
     if "roi" not in out.columns or roi:
         out["roi"] = roi
+    # Tissue is declared at import. When a producer does not pass one, derive it from the ROI
+    # rather than leaving it blank — a blank tissue would silently drop the row out of every
+    # tissue-filtered analysis, which is a far worse failure than a wrong-but-visible label.
+    if tissue:
+        # Lenient on input, strict on output: a producer may pass 'pLN' or 'lymph node', but
+        # what lands in the column is always the canonical identifier every consumer filters
+        # on. An unrecognised name is rejected here rather than becoming a third tissue.
+        out["tissue"] = normalize_tissue(tissue)
+    elif "tissue" not in out.columns or (out["tissue"].astype(str) == "").all():
+        out["tissue"] = tissue_for_roi(roi or (out["roi"].iloc[0] if len(out) else ""))
 
     for col, dtype in CELL_TABLE_COLUMNS.items():
         if col not in out.columns:
@@ -253,6 +294,11 @@ def validate_cell_table(df: pd.DataFrame, *, modality: Optional[str] = None) -> 
 
     if df["donor_id"].eq("").any():
         raise ContractError("cell table has empty donor_id values")
+
+    if df["tissue"].eq("").any():
+        raise ContractError(
+            "cell table has rows with no tissue — tissue is declared at import and every row "
+            "must carry one, or the row silently vanishes from tissue-filtered analyses")
 
     for col in ("x_um", "y_um"):
         if not np.isfinite(df[col].to_numpy()).any():
@@ -319,7 +365,10 @@ def read_cell_table(
     validate_cell_table(df, modality=modality)
     mod = str(df["modality"].iloc[0])
     got_roi = roi or (str(df["roi"].iloc[0]) if "roi" in df.columns and len(df) else "")
-    return CellTable(df=df, modality=mod, donor_id=normalize_donor_id(donor_id), roi=got_roi)
+    got_tissue = (str(df["tissue"].iloc[0])
+                  if "tissue" in df.columns and len(df) else tissue_for_roi(got_roi))
+    return CellTable(df=df, modality=mod, donor_id=normalize_donor_id(donor_id),
+                     roi=got_roi, tissue=got_tissue)
 
 
 def discover_partitions(root: Path) -> list[tuple[str, str]]:

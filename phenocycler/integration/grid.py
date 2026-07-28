@@ -28,7 +28,6 @@ are not biased by the grid's own anisotropy.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -36,7 +35,7 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import CellTable, partition_path, read_cell_table, write_cell_table
-from .manifest import PAIRED, load_manifest
+from .manifest import load_manifest, paired_rows
 from .register import registration_dir
 from .transform import Transform
 from .vocab import COMMON_LINEAGES
@@ -299,12 +298,18 @@ def run_grid(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
     use_registration: bool = True,
 ) -> pd.DataFrame:
-    """Stage entry point: niches for every donor, plus the grid comparison where registered."""
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+    """Stage entry point: niches for every donor, plus the grid comparison where registered.
+
+    Spans the whole selection in one call — one ROI, one tissue's ROIs, or the entire cohort
+    — and writes its outputs once at the end. Calling it once per ROI instead would have each
+    ROI's write overwrite the last, since the output paths are stage-level rather than
+    per-section.
+    """
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
     if donors:
         man = man[man["donor_id"].isin({str(d) for d in donors})]
     if man.empty:
@@ -315,12 +320,12 @@ def run_grid(
     rows, all_profiles, all_bins = [], [], []
 
     for _, r in man.iterrows():
-        donor = r["donor_id"]
+        donor, roi = r["donor_id"], r["roi"]
         try:
             pheno = read_cell_table(cfg.cells_pheno_dir, donor, roi, modality="phenocycler")
             xen = read_cell_table(cfg.cells_xen_dir, donor, roi, modality="xenium")
         except FileNotFoundError as exc:
-            print(f"[grid] {donor}: {exc}", flush=True)
+            print(f"[grid] {donor}/{roi}: {exc}", flush=True)
             continue
 
         # --- niche view: no registration needed ---
@@ -339,7 +344,7 @@ def run_grid(
         all_profiles.extend([p_prof, x_prof])
         agree = niche_agreement(p_prof, x_prof)
 
-        row = {"donor_id": donor, "roi": roi,
+        row = {"donor_id": donor, "roi": roi, "tissue": r.get("tissue", ""),
                "n_niches": int(max(p_lab.max(), x_lab.max()) + 1),
                "niche_median_cosine": float(agree["cosine"].median()) if len(agree) else np.nan}
 
@@ -356,6 +361,7 @@ def run_grid(
             x_bins = grid_composition(xen_r, cfg.grid_um, registered=True)
             merged, stats = compare_grids(p_bins, x_bins)
             merged.insert(0, "donor_id", donor)
+            merged.insert(1, "roi", roi)
             all_bins.append(merged)
             row.update({k: v for k, v in stats.items() if not k.startswith("p_")})
         else:
@@ -363,7 +369,7 @@ def run_grid(
             row["grid_note"] = "no registration — niche view only"
 
         rows.append(row)
-        print(f"[grid] {donor}: niche cosine median "
+        print(f"[grid] {donor}/{roi}: niche cosine median "
               f"{row.get('niche_median_cosine', float('nan')):.3f}, "
               f"{row.get('n_bins', 0)} comparable hex bins", flush=True)
 
@@ -386,14 +392,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Joint niches + registered-frame grid comparison")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     ap.add_argument("--no-registration", action="store_true",
                     help="niche view only (works without any registration)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
     cfg.integration_qc_dir.mkdir(parents=True, exist_ok=True)
-    out = run_grid(cfg, args.donors, roi=args.roi,
+    out = run_grid(cfg, args.donors, roi=args.roi, tissue=args.tissue,
                    use_registration=not args.no_registration)
     if len(out):
         print()

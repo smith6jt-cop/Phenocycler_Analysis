@@ -36,15 +36,14 @@ failure.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from ..config import PipelineConfig, load_config
-from .contract import CellTable, read_cell_table
-from .manifest import PAIRED, load_manifest
+from .contract import read_cell_table
+from .manifest import load_manifest, paired_rows
 from .register import registration_dir
 from .transform import Transform
 
@@ -260,14 +259,14 @@ def run_sameslide(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
     max_dist_um: float = DEFAULT_MAX_DIST_UM,
 ) -> pd.DataFrame:
-    """Stage entry point for same-slide mode."""
+    """Stage entry point for same-slide mode. One call covers the whole selection."""
     require_same_slide(cfg)
 
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
     if donors:
         man = man[man["donor_id"].isin({str(d) for d in donors})]
     if man.empty:
@@ -276,19 +275,19 @@ def run_sameslide(
 
     rows, frames = [], []
     for _, r in man.iterrows():
-        donor = r["donor_id"]
+        donor, roi_name = r["donor_id"], r["roi"]
         try:
-            pairs, stats = pair_donor(cfg, donor, roi, max_dist_um=max_dist_um)
+            pairs, stats = pair_donor(cfg, donor, roi_name, max_dist_um=max_dist_um)
         except FileNotFoundError as exc:
-            print(f"[sameslide] {donor}: {exc}", flush=True)
+            print(f"[sameslide] {donor}/{roi_name}: {exc}", flush=True)
             continue
         if "error" in stats:
             print(f"[sameslide] {stats['error']}", flush=True)
             continue
         rows.append(stats)
         if len(pairs):
-            frames.append(build_paired_matrix(cfg, donor, pairs, roi))
-        print(f"[sameslide] {donor}: {stats['n_pairs']:,} cell pairs "
+            frames.append(build_paired_matrix(cfg, donor, pairs, roi_name))
+        print(f"[sameslide] {donor}/{roi_name}: {stats['n_pairs']:,} cell pairs "
               f"({stats['pair_rate_pheno']:.1%} of PhenoCycler, "
               f"{stats['pair_rate_xen']:.1%} of Xenium), median {stats['median_distance_um']:.2f} um, "
               f"lineage agreement {stats['lineage_agreement']:.3f}", flush=True)
@@ -312,12 +311,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Same-slide cell-to-cell pairing")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     ap.add_argument("--max-dist-um", type=float, default=DEFAULT_MAX_DIST_UM)
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    stats = run_sameslide(cfg, args.donors, roi=args.roi, max_dist_um=args.max_dist_um)
+    stats = run_sameslide(cfg, args.donors, roi=args.roi, tissue=args.tissue,
+                          max_dist_um=args.max_dist_um)
     if len(stats):
         print()
         print(stats.to_string(index=False))

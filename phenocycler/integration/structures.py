@@ -45,6 +45,8 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import CellTable, discover_partitions, read_cell_table
+from .tissues import has_structures
+from .tissues import structure_kinds as tissue_structure_kinds
 
 #: Islet size classes, from `Xenium_Analysis/scripts/insulitis_analysis.py::SIZE_BINS`.
 #: Kept identical so an islet's size class means the same thing in both modalities.
@@ -345,12 +347,24 @@ def extract_donor(
     table: CellTable,
     cfg: PipelineConfig,
     *,
-    kinds: Iterable[str] = STRUCTURE_KINDS,
+    kinds: Optional[Iterable[str]] = None,
     registered: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], pd.Series]:
-    """All structure kinds for one section. Returns ``({kind: frame}, per_cell_islet_id)``."""
+    """All structure kinds for one section. Returns ``({kind: frame}, per_cell_islet_id)``.
+
+    Kinds default to what the section's TISSUE supports. Lymph node supports none — it has no
+    islets, so hormone-seeded DBSCAN has nothing to seed on and islet matching would have
+    nothing to match. The registration-free levels (donor, niche) and the registered grid
+    still apply there; see ``phenocycler.integration.tissues``.
+    """
     params = StructureParams.from_config(cfg)
+    tissue = table.tissue or "pancreas"
+    if kinds is None:
+        kinds = tissue_structure_kinds(tissue)
     kinds = list(kinds)
+    if not kinds:
+        empty = pd.Series([""] * len(table.df), index=table.df.index, dtype="object")
+        return {}, empty
     out: dict[str, pd.DataFrame] = {}
 
     islet_id = pd.Series([""] * len(table.df), index=table.df.index, dtype="object")
@@ -386,9 +400,10 @@ def run_structures(
     *,
     modalities: Iterable[str] = ("phenocycler", "xenium"),
     donors: Optional[list[str]] = None,
-    kinds: Iterable[str] = STRUCTURE_KINDS,
+    kinds: Optional[Iterable[str]] = None,
+    tissues: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
-    """Stage entry point: extract structures for every exported section."""
+    """Stage entry point: extract structures for every exported section that supports them."""
     roots = {"phenocycler": cfg.cells_pheno_dir, "xenium": cfg.cells_xen_dir}
     summary = []
 
@@ -398,6 +413,13 @@ def run_structures(
             if donors and donor not in set(donors):
                 continue
             table = read_cell_table(root, donor, roi, modality=modality)
+            if tissues and table.tissue not in set(tissues):
+                continue
+            if not has_structures(table.tissue or "pancreas"):
+                print(f"[structures] {modality}/{donor}/{roi or '-'}: "
+                      f"tissue '{table.tissue}' has no structural unit — skipped "
+                      f"(donor + niche levels still apply)", flush=True)
+                continue
             frames, islet_id = extract_donor(table, cfg, kinds=kinds)
 
             # Write the islet assignment back so the cell table knows its structure.
@@ -412,7 +434,7 @@ def run_structures(
                 frame.to_parquet(path, index=False)
 
             row = {"modality": modality, "donor_id": donor, "roi": roi,
-                   "n_cells": table.n_cells}
+                   "tissue": table.tissue, "n_cells": table.n_cells}
             row.update({f"n_{k}": len(v) for k, v in frames.items()})
             if "islet" in frames and len(frames["islet"]):
                 isl = frames["islet"]
@@ -434,11 +456,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--donor", action="append", dest="donors")
     ap.add_argument("--modality", action="append", dest="modalities",
                     choices=["phenocycler", "xenium"])
+    ap.add_argument("--tissue", action="append", dest="tissues",
+                    help="restrict to one tissue (repeatable); default is every tissue")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
     summary = run_structures(cfg, modalities=args.modalities or ("phenocycler", "xenium"),
-                             donors=args.donors)
+                             donors=args.donors, tissues=args.tissues)
     if len(summary):
         print(summary.to_string(index=False))
     return 0

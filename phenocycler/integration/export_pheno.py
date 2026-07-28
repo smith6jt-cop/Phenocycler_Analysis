@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -46,7 +47,8 @@ import pandas as pd
 
 from ..config import EXTRA_MARKERS, HORMONE_MARKERS, LINEAGES, PipelineConfig, load_config
 from ..parallel import map_donors
-from .contract import as_feature, coerce_cell_table, partition_path, write_cell_table
+from .contract import (as_feature, coerce_cell_table, normalize_tissue, partition_path,
+                       write_cell_table)
 from .vocab import map_pheno_series
 
 #: Marker -> immune subclass. Mirrors `LINEAGES['Immune']`; a cell positive for more than one
@@ -133,9 +135,18 @@ def export_donor(
     cfg: PipelineConfig,
     *,
     roi: str = "panc",
+    tissue: str = "",
     markers: Optional[list[str]] = None,
 ) -> pd.DataFrame:
-    """Build the contract table for one PhenoCycler donor."""
+    """Build the contract table for one PhenoCycler donor.
+
+    ``tissue`` is declared by the caller because it is a property of the dataset being
+    imported, not something recoverable from the cell table. It defaults to the tissue
+    implied by ``roi``.
+    """
+    from .tissues import for_roi, normalize
+
+    tissue = normalize(tissue) if tissue else (for_roi(roi) or "pancreas")
     broad = _read_first_parquet(cfg.broad_dir, donor)
     if broad is None:
         raise ExportError(
@@ -242,38 +253,85 @@ def export_donor(
               f"(absent from data/cells) — dropped", flush=True)
         out = out[out["x_um"].notna()].reset_index(drop=True)
 
-    return coerce_cell_table(out, modality="phenocycler", donor_id=str(donor), roi=roi)
+    return coerce_cell_table(out, modality="phenocycler", donor_id=str(donor), roi=roi,
+                             tissue=tissue)
 
 
-def _export_and_write(donor: str, cfg: PipelineConfig, roi: str) -> dict:
-    df = export_donor(donor, cfg, roi=roi)
+def _export_and_write(donor: str, cfg: PipelineConfig, roi: str, tissue: str = "",
+                      source_cfg: Optional[PipelineConfig] = None) -> dict:
+    """Read from ``source_cfg`` (the tissue's core-pipeline dir), write into ``cfg``."""
+    df = export_donor(donor, source_cfg or cfg, roi=roi, tissue=tissue)
     path = partition_path(cfg.cells_pheno_dir, donor, roi)
     write_cell_table(df, path)
     counts = df["lineage_common"].value_counts().to_dict()
-    print(f"[export_pheno] {donor}: {len(df):,} cells -> {path.parent}", flush=True)
-    return {"donor_id": donor, "n_cells": len(df), **counts}
+    print(f"[export_pheno] {donor} ({df['tissue'].iloc[0] if len(df) else '?'}): "
+          f"{len(df):,} cells -> {path.parent}", flush=True)
+    return {"donor_id": donor, "roi": roi,
+            "tissue": df["tissue"].iloc[0] if len(df) else "", "n_cells": len(df), **counts}
 
 
 def run_export_pheno(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: str = "",
+    tissues: Optional[list[str]] = None,
     n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Stage entry point: export every donor with a broad-lineage output."""
-    donors = donors or cfg.discover_donors(cfg.broad_dir)
-    if not donors:
-        raise ExportError(
-            f"no donors found under {cfg.broad_dir}. Run the core pipeline "
-            f"(`python -m phenocycler.pipeline`) through the 'lineage' stage first."
-        )
+    """Stage entry point: export every donor with a broad-lineage output, per tissue.
+
+    The PhenoCycler side has no ROI dimension upstream. The core pipeline derives
+    ``donor_id`` as the first digit-run of the qptiff name, so donor 6539's pancreas image and
+    its lymph-node image both land in ``data/cells/donor_id=6539`` and are indistinguishable
+    once there. Each tissue therefore needs its own core-pipeline data dir, mapped by
+    ``[integration] pheno_tissue_dirs``.
+
+    When two selected tissues resolve to the *same* directory this stage exports the first and
+    refuses the rest, loudly. Exporting one source under two ROIs would write a pancreas
+    section into the lymph-node partition — cells that are real, labelled correctly, and
+    attributed to the wrong organ, which every downstream comparison would take at face value.
+    """
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
-    rows = map_donors(partial(_export_and_write, cfg=cfg, roi=roi), donors,
-                      n_jobs=n_jobs, ordered=True)
-    out = pd.DataFrame([r for r in rows if r]).fillna(0)
+    names = list(tissues) if tissues else ([normalize_tissue(tissue)] if tissue
+                                           else cfg.tissue_list)
+    if roi:
+        names = [t for t in names if roi in cfg.rois_for_tissue(t)] or names[:1]
+
+    seen_sources: dict[str, str] = {}
+    frames = []
+    for name in names:
+        source = str(cfg.pheno_dir_for_tissue(name))
+        if source in seen_sources:
+            print(f"[export_pheno] SKIPPING {name}: its PhenoCycler source resolves to the "
+                  f"same directory as {seen_sources[source]!r} ({source}).\n"
+                  f"    Exporting it anyway would copy {seen_sources[source]} cells into the "
+                  f"{name} partition and label them {name}.\n"
+                  f"    Fix: run the core pipeline once per tissue and map them with\n"
+                  f"      [integration] pheno_tissue_dirs = "
+                  f"{seen_sources[source]}=/path/to/{seen_sources[source]}/data,"
+                  f"{name}=/path/to/{name}/data", flush=True)
+            continue
+        seen_sources[source] = name
+
+        local = replace(cfg, data_dir=Path(source))
+        found = donors or local.discover_donors(local.broad_dir)
+        if not found:
+            raise ExportError(
+                f"no donors found under {local.broad_dir} (tissue {name}). Run the core "
+                f"pipeline (`python -m phenocycler.pipeline`) through the 'lineage' stage "
+                f"first, or point [integration] pheno_tissue_dirs at the right data dir."
+            )
+        target_roi = roi or (cfg.rois_for_tissue(name) or [""])[0]
+        rows = map_donors(partial(_export_and_write, cfg=cfg, source_cfg=local,
+                                  roi=target_roi, tissue=name),
+                          found, n_jobs=n_jobs, ordered=True)
+        frames.extend(r for r in rows if r)
+
+    out = pd.DataFrame(frames).fillna(0)
     if len(out):
-        print(f"\n[export_pheno] {len(out)} donor(s), "
+        print(f"\n[export_pheno] {len(out)} section(s) across "
+              f"{out['tissue'].nunique()} tissue(s), "
               f"{int(out['n_cells'].sum()):,} cells total", flush=True)
     return out
 
@@ -282,12 +340,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="PhenoCycler -> integration cell-table contract")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="write into this ROI partition (default: the tissue's first ROI)")
+    ap.add_argument("--tissue", action="append", dest="tissues",
+                    help="tissue this dataset is (repeatable); default is every configured "
+                         "tissue, each read from its [integration] pheno_tissue_dirs entry")
     ap.add_argument("--jobs", type=int, default=None)
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    summary = run_export_pheno(cfg, args.donors, roi=args.roi, n_jobs=args.jobs)
+    summary = run_export_pheno(cfg, args.donors, roi=args.roi, tissues=args.tissues,
+                               n_jobs=args.jobs)
     if len(summary):
         print(summary.to_string(index=False))
     return 0

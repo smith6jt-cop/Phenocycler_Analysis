@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 
 from phenocycler import load_config
-from phenocycler.config import (PipelineConfig, LINEAGES, STRUCT_LINEAGES,
+from phenocycler.config import (LINEAGES, STRUCT_LINEAGES,
                                 DEFAULT_MARKER_PAIRS, EXTRA_MARKER_PAIRS, EXTRA_MARKERS)
 
 

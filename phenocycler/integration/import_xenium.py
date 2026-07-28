@@ -41,7 +41,7 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import as_feature, coerce_cell_table, partition_path, write_cell_table
-from .manifest import PAIRED, load_manifest
+from .manifest import load_manifest, paired_rows, rows_for_scope
 from .vocab import (COMMON_LINEAGES, PanelTaxonomy, load_panel_taxonomy, map_xenium_series)
 
 #: obs columns worth carrying when present. Everything else stays in the h5ad.
@@ -238,9 +238,16 @@ def import_sample(
     donor_id: str,
     roi: str,
     sample_key: str = "",
+    tissue: str = "",
     tax: Optional[PanelTaxonomy] = None,
 ) -> pd.DataFrame:
-    """Build the contract table for one Xenium section."""
+    """Build the contract table for one Xenium section.
+
+    ``tissue`` is declared at import; it defaults to the tissue implied by ``roi``.
+    """
+    from .tissues import for_roi, normalize
+
+    tissue = normalize(tissue) if tissue else (for_roi(roi) or "pancreas")
     obs, feats = read_xenium(source, tax)
 
     broad = _obs_str(obs, "celltype_broad")
@@ -299,7 +306,8 @@ def import_sample(
                   f"vocabulary (known: {[c for c in COMMON_LINEAGES if c != 'Unassigned']})",
                   flush=True)
 
-    return coerce_cell_table(out, modality="xenium", donor_id=str(donor_id), roi=roi)
+    return coerce_cell_table(out, modality="xenium", donor_id=str(donor_id), roi=roi,
+                             tissue=tissue)
 
 
 def _resolve_source(row: pd.Series) -> Optional[Path]:
@@ -315,15 +323,20 @@ def run_import_xenium(
     cfg: PipelineConfig,
     *,
     donors: Optional[list[str]] = None,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
     only_paired: bool = True,
 ) -> pd.DataFrame:
-    """Stage entry point: import every manifest row whose source is on disk."""
+    """Stage entry point: import every manifest row whose source is on disk.
+
+    Identity-core scores are tissue-specific — a lymph node must not be scored on the
+    pancreatic endocrine axis — so the taxonomy is resolved per row's tissue, not once.
+    """
     man = load_manifest(cfg)
-    if only_paired:
-        man = man[man["pair_status"] == PAIRED]
-    if roi:
-        man = man[man["roi"] == roi]
+    # `--all` keeps the unpaired rows (donor_unknown / xenium_only) but scopes them the same
+    # way, so the ROI/tissue rule has exactly one implementation.
+    man = (paired_rows(man, roi=roi, tissue=tissue) if only_paired
+           else rows_for_scope(man, roi=roi, tissue=tissue))
     if donors:
         want = {str(d) for d in donors}
         man = man[man["donor_id"].isin(want)]
@@ -331,14 +344,19 @@ def run_import_xenium(
     if man.empty:
         print("[import_xenium] no manifest rows to import "
               "(check `python -m phenocycler.integration.manifest --report`)", flush=True)
-        return pd.DataFrame(columns=["donor_id", "roi", "n_cells", "source"])
+        return pd.DataFrame(columns=["donor_id", "roi", "tissue", "n_cells", "source"])
 
-    try:
-        tax = load_panel_taxonomy(cfg)
-    except Exception as exc:  # noqa: BLE001 - scores are optional
-        print(f"[import_xenium] panel taxonomy unavailable ({exc}); "
-              f"importing without identity-core scores", flush=True)
-        tax = None
+    taxonomies: dict[str, object] = {}
+
+    def _tax_for(t: str):
+        if t not in taxonomies:
+            try:
+                taxonomies[t] = load_panel_taxonomy(cfg, t or None)
+            except Exception as exc:  # noqa: BLE001 - scores are optional
+                print(f"[import_xenium] panel taxonomy unavailable for {t or 'default'} "
+                      f"({exc}); importing without identity-core scores", flush=True)
+                taxonomies[t] = None
+        return taxonomies[t]
 
     rows = []
     for _, r in man.iterrows():
@@ -347,13 +365,14 @@ def run_import_xenium(
             print(f"[import_xenium] donor {r['donor_id']} ({r['roi']}): no Xenium source on "
                   f"disk — skipped", flush=True)
             continue
-        df = import_sample(src, donor_id=r["donor_id"], roi=r["roi"],
-                           sample_key=r.get("xenium_sample_key", ""), tax=tax)
+        row_tissue = r.get("tissue", "") or cfg.tissue_for_roi(r["roi"])
+        df = import_sample(src, donor_id=r["donor_id"], roi=r["roi"], tissue=row_tissue,
+                           sample_key=r.get("xenium_sample_key", ""), tax=_tax_for(row_tissue))
         path = partition_path(cfg.cells_xen_dir, r["donor_id"], r["roi"])
         write_cell_table(df, path)
-        print(f"[import_xenium] {r['donor_id']}/{r['roi']}: {len(df):,} cells -> {path.parent}",
-              flush=True)
-        rows.append({"donor_id": r["donor_id"], "roi": r["roi"],
+        print(f"[import_xenium] {r['donor_id']}/{r['roi']} ({row_tissue}): {len(df):,} "
+              f"cells -> {path.parent}", flush=True)
+        rows.append({"donor_id": r["donor_id"], "roi": r["roi"], "tissue": row_tissue,
                      "n_cells": len(df), "source": str(src)})
 
     out = pd.DataFrame(rows)
@@ -367,13 +386,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Xenium -> integration cell-table contract")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     ap.add_argument("--all", action="store_true",
                     help="import unpaired rows too (donor_unknown / xenium_only)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    summary = run_import_xenium(cfg, donors=args.donors, roi=args.roi,
+    summary = run_import_xenium(cfg, donors=args.donors, roi=args.roi, tissue=args.tissue,
                                 only_paired=not args.all)
     if len(summary):
         print(summary.to_string(index=False))

@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from phenocycler.integration.rasterize import (GridSpec, grid_for, normalize_image,
-                                               rasterize_points, tissue_mask)
+                                               rasterize_points)
 from phenocycler.integration.register import (dice, icp, nearest_neighbour_rmse,
                                               ransac_affine, refine_bspline, refine_ecc,
                                               register_image, register_point_set)

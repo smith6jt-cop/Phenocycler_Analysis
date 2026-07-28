@@ -318,10 +318,21 @@ def _read_csv_rows(path: Path) -> list[dict]:
 def load_panel_taxonomy(cfg: PipelineConfig, tissue: Optional[str] = None) -> PanelTaxonomy:
     """Load ``panel_roles.csv`` + the ``identity_core`` CSVs from the pinned submodule.
 
+    ``tissue`` selects which cores apply. XeniumPanelExplorer ships ``pancreas`` and
+    ``thymus``; a tissue with no directory of its own (pancreatic lymph node) resolves to the
+    **shared** cores — T cell, B/plasma, NK/ILC, myeloid, granulocyte, endothelial, pericyte,
+    neural, epithelial — and drops the three pancreas-specific ones. That is the correct
+    answer for a lymph node rather than a degraded fallback: scoring lymph-node cells against
+    ``01_pancreas_endocrine`` would put weight on an endocrine axis that cannot exist there,
+    and the broad call is an argmax over those axes.
+
     Raises with an actionable message when the submodule is not checked out — this is the
     single most likely first-run failure, and 'FileNotFoundError: panel_roles.csv' would not
     tell anyone to run ``git submodule update``.
     """
+    from .tissues import applies as tissue_applies
+    from .tissues import panel_tissue_dir
+
     tissue = tissue or cfg.tissue
     root = Path(cfg.panel_explorer)
     roles_csv = root / "data" / "panel_roles.csv"
@@ -333,13 +344,19 @@ def load_panel_taxonomy(cfg: PipelineConfig, tissue: Optional[str] = None) -> Pa
         )
 
     tax = PanelTaxonomy(tissue=tissue, root=root)
+    # Which row set in panel_roles.csv describes this tissue's cores. A tissue with no
+    # directory borrows the pancreas rows and then filters out the pancreas-specific stems,
+    # which is how the shared pool is reached without duplicating the role table upstream.
+    panel_dir = panel_tissue_dir(tissue)
+    roles_tissue = panel_dir or "pancreas"
+
     for row in _read_csv_rows(roles_csv):
-        if row.get("tissue") != tissue:
+        if row.get("tissue") != roles_tissue:
             continue
         stem = (row.get("subpanel") or "").strip()
         use = (row.get("phenotyping_use") or "").strip()
         lineage = (row.get("lineage_or_group") or "").strip()
-        if not stem:
+        if not stem or not tissue_applies(tissue, stem):
             continue
         if use == "broad_mask":
             tax.panel_to_lineage[stem] = lineage
@@ -350,7 +367,7 @@ def load_panel_taxonomy(cfg: PipelineConfig, tissue: Optional[str] = None) -> Pa
     # rest; panel_roles.phenotyping_source records which, but checking both is simpler and
     # equivalent (the tissue copy wins).
     search_dirs = [
-        root / "data" / "tissues" / tissue / "identity_core",
+        *( [root / "data" / "tissues" / panel_dir / "identity_core"] if panel_dir else [] ),
         root / "data" / "identity_core",
     ]
     for stem in list(tax.panel_to_lineage) + tax.embedding_extra:
@@ -599,28 +616,50 @@ def coverage_report(pairs: Iterable[MarkerPair], tax: Optional[PanelTaxonomy] = 
 
 
 def run_vocab(cfg: PipelineConfig, panel_genes: Optional[Iterable[str]] = None,
-              *, write: bool = True) -> pd.DataFrame:
+              *, tissue: Optional[str] = None, write: bool = True) -> pd.DataFrame:
     """Stage entry point: build the crosswalk, print coverage, write the CSV.
 
     ``panel_genes`` defaults to the union of the tissue's identity cores, which is enough to
     build the lineage half of the crosswalk without any Xenium run mounted. Pass the run's
     real ``var_names`` for an accurate marker-level report.
+
+    The crosswalk is tissue-specific because the identity cores are: a lymph node is scored
+    against the shared immune/vascular/stromal cores only, so its lineage rows carry
+    different core-gene counts than the pancreas rows. Each tissue therefore gets its own
+    ``vocab_crosswalk_{tissue}.csv``, and the canonical ``vocab_crosswalk.csv`` is the
+    concatenation of them, tagged by tissue.
     """
-    tax = load_panel_taxonomy(cfg)
+    tissue = tissue or cfg.tissue
+    tax = load_panel_taxonomy(cfg, tissue)
     if panel_genes is None:
         panel_genes = sorted({g for genes in tax.core_genes.values() for g in genes})
-        print("[vocab] no run panel supplied — marker coverage is computed against the "
-              "identity-core union only and will understate on-panel markers", flush=True)
+        print(f"[vocab] {tissue}: no run panel supplied — marker coverage is computed against "
+              "the identity-core union only and will understate on-panel markers", flush=True)
 
     pairs = protein_gene_pairs(panel_genes, tax=tax)
     print(coverage_report(pairs, tax), flush=True)
 
     df = crosswalk_frame(pairs, tax=tax)
+    df.insert(0, "tissue", tissue)
     if write:
         out = cfg.vocab_crosswalk_csv
         out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out, index=False)
-        print(f"\n[vocab] wrote {out} ({len(df)} rows)", flush=True)
+        per_tissue = out.with_name(f"{out.stem}_{tissue}{out.suffix}")
+        df.to_csv(per_tissue, index=False)
+        # Merge into the canonical file rather than overwrite it, so a per-tissue re-run does
+        # not silently delete the other tissue's rows.
+        combined = df
+        if out.exists():
+            try:
+                prev = pd.read_csv(out)
+                if "tissue" in prev.columns:
+                    prev = prev[prev["tissue"] != tissue]
+                    combined = pd.concat([prev, df], ignore_index=True)
+            except Exception:  # noqa: BLE001 - a corrupt/legacy file is replaced, not fatal
+                combined = df
+        combined.to_csv(out, index=False)
+        print(f"\n[vocab] wrote {per_tissue} ({len(df)} rows) and {out} "
+              f"({len(combined)} rows)", flush=True)
     return df
 
 
@@ -633,6 +672,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--config", default=None)
     ap.add_argument("--panel", default=None,
                     help="text file of gene symbols (one per line) from the actual run")
+    ap.add_argument("--tissue", action="append", dest="tissues",
+                    help="build for this tissue (repeatable); default is every configured one")
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args(argv)
 
@@ -640,7 +681,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     genes = None
     if args.panel:
         genes = [ln.strip() for ln in Path(args.panel).read_text().splitlines() if ln.strip()]
-    run_vocab(cfg, genes, write=not args.no_write)
+    for tissue in (args.tissues or cfg.tissue_list):
+        run_vocab(cfg, genes, tissue=tissue, write=not args.no_write)
     return 0
 
 

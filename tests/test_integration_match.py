@@ -6,14 +6,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from phenocycler import load_config
 from phenocycler.integration.contract import CellTable, coerce_cell_table
 from phenocycler.integration.donor import COMPARABLE, compare_donor, composition
 from phenocycler.integration.grid import (NICHE_LINEAGES, call_niches, composition_vectors,
                                           compare_grids, grid_composition, hex_bin,
                                           majority_smooth, niche_agreement, niche_profiles)
 from phenocycler.integration.match import (concordance, match_structures, permuted_null)
-from phenocycler.integration.transform import from_rigid
 
 
 def _structures(n, seed, jitter=0.0, drop=0.0, transform=None):

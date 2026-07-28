@@ -30,16 +30,16 @@ suspicious rather than reassuring — it would suggest the gates are too loose.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from ..config import PipelineConfig, load_config
-from .manifest import PAIRED, load_manifest
+from .manifest import load_manifest, paired_rows
 from .register import registration_dir
 from .structures import structures_path
+from .tissues import structure_kinds as tissue_structure_kinds
 from .transform import Transform
 
 #: Cost weights. Distance dominates; the shape terms break ties and reject implausible pairs
@@ -212,10 +212,25 @@ def match_donor(
     donor: str,
     roi: str = "panc",
     *,
-    kind: str = "islet",
+    kind: Optional[str] = None,
     with_null: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
-    """Match one donor's structures after applying the stored registration."""
+    """Match one donor's structures after applying the stored registration.
+
+    ``kind`` defaults to the ROI's tissue's primary structural unit — islet in pancreas. A
+    tissue with no structural unit returns an explicit skip rather than an error: there is
+    nothing wrong with a lymph node, matching simply does not apply to it.
+    """
+    tissue = cfg.tissue_for_roi(roi)
+    kinds = tissue_structure_kinds(tissue) if tissue else ()
+    if kind is None:
+        if not kinds:
+            return pd.DataFrame(), {
+                "donor_id": donor, "roi": roi, "tissue": tissue, "skipped": True,
+                "reason": f"tissue '{tissue}' has no structural unit — islet matching does "
+                          f"not apply; donor-level, niche and grid comparisons still run"}
+        kind = kinds[0]
+
     fixed_is_pheno = cfg.fixed_modality == "phenocycler"
     fixed_mod = "phenocycler" if fixed_is_pheno else "xenium"
     moving_mod = "xenium" if fixed_is_pheno else "phenocycler"
@@ -251,6 +266,8 @@ def match_donor(
     stats = {
         "donor_id": donor,
         "roi": roi,
+        "tissue": tissue,
+        "kind": kind,
         "n_moving": len(moving),
         "n_fixed": len(fixed),
         "n_matched": len(pairs),
@@ -310,15 +327,33 @@ def run_match(
     cfg: PipelineConfig,
     donors: Optional[list[str]] = None,
     *,
-    roi: str = "panc",
+    roi: Optional[str] = None,
+    tissue: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Stage entry point: match every registered donor and write the paired islet table."""
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+    """Stage entry point: match every registered donor and write the paired islet table.
+
+    Scoped by ``roi`` (one section), ``tissue`` (that tissue's ROIs) or neither (the whole
+    cohort). ROIs whose tissue has no structural unit are announced and skipped — a combined
+    pancreas + lymph-node run therefore does the right thing without the caller filtering.
+    """
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
     if donors:
         man = man[man["donor_id"].isin({str(d) for d in donors})]
     if man.empty:
         print("[match] no paired donors", flush=True)
+        return pd.DataFrame()
+
+    # Announce the skip once per tissue rather than once per donor, so a 20-donor lymph-node
+    # run does not bury the pancreas results under 20 identical lines.
+    skipped = sorted({r["roi"] for _, r in man.iterrows()
+                      if not tissue_structure_kinds(cfg.tissue_for_roi(r["roi"]))})
+    if skipped:
+        for t in sorted({cfg.tissue_for_roi(x) for x in skipped}):
+            print(f"[match] skipping roi(s) {', '.join(x for x in skipped if cfg.tissue_for_roi(x) == t)}: "
+                  f"tissue '{t}' has no structural unit to match on", flush=True)
+        man = man[~man["roi"].isin(set(skipped))]
+    if man.empty:
+        print("[match] nothing to match — no selected tissue has a structural unit", flush=True)
         return pd.DataFrame()
 
     fixed_mod = cfg.fixed_modality
@@ -326,15 +361,18 @@ def run_match(
 
     all_pairs, stats_rows = [], []
     for _, r in man.iterrows():
-        donor = r["donor_id"]
-        pairs, stats = match_donor(cfg, donor, roi)
+        donor, roi_name = r["donor_id"], r["roi"]
+        pairs, stats = match_donor(cfg, donor, roi_name)
+        if stats.get("skipped"):
+            continue
         if "error" in stats:
-            print(f"[match] {donor}: {stats['error']}", flush=True)
+            print(f"[match] {donor}/{roi_name}: {stats['error']}", flush=True)
             continue
         stats.update(concordance(pairs, moving_mod, fixed_mod))
         all_pairs.append(pairs)
         stats_rows.append(stats)
-        print(f"[match] {donor}: {stats['n_matched']}/{min(stats['n_moving'], stats['n_fixed'])} "
+        print(f"[match] {donor}/{roi_name}: "
+              f"{stats['n_matched']}/{min(stats['n_moving'], stats['n_fixed'])} "
               f"islets matched (median {stats['median_distance_um']:.0f} um), "
               f"null mean {stats.get('null_mean', float('nan')):.1f} "
               f"z={stats.get('z', float('nan')):.1f}", flush=True)
@@ -360,11 +398,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Match islets across registered serial sections")
     ap.add_argument("--config", default=None)
     ap.add_argument("--donor", action="append", dest="donors")
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None, help="restrict to one tissue's ROIs")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    stats = run_match(cfg, args.donors, roi=args.roi)
+    stats = run_match(cfg, args.donors, roi=args.roi, tissue=args.tissue)
     if len(stats):
         print()
         print(stats.to_string(index=False))

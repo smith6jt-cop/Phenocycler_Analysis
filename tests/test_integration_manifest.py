@@ -104,14 +104,68 @@ def test_pair_status_classification(tmp_path):
         return sub["pair_status"].iloc[0]
 
     assert status("6539", "panc") == PAIRED
-    # PhenoCycler is pancreas-only, so a lymph-node region is never pairable against it.
-    assert status("6539", "pln_1") == XENIUM_ONLY
+    # The cohort is 20 donors x {PhenoCycler, Xenium} x {pancreas, pLN}, so a lymph-node
+    # section pairs exactly as a pancreas section does. An earlier revision hard-coded
+    # PhenoCycler as pancreas-only and would have dropped every pLN pairing on the floor.
+    assert status("6539", "pln_1") == PAIRED
     assert status("9999", "panc") == XENIUM_ONLY
     assert status("6414", "panc") == PHENO_ONLY
 
     assert summary.paired_donors == ["6539"]
     assert summary.pheno_only_donors == ["6414"]
-    assert paired_rows(df)["donor_id"].tolist() == ["6539"]
+    # Unscoped means the whole cohort — both of 6539's sections, not just the pancreas.
+    assert paired_rows(df)["donor_id"].tolist() == ["6539", "6539"]
+    assert sorted(paired_rows(df)["roi"]) == ["panc", "pln_1"]
+
+
+def test_pairing_is_tissue_gated_not_roi_gated(tmp_path):
+    """An ROI that maps to no known tissue is not pairable, however the donor pairs.
+
+    `pair_status` asks "is this ROI's tissue one we run?", not "is this ROI literally
+    `panc`?" — otherwise adding the lymph node means editing pairing logic. A stray
+    `Region_1` label still has no PhenoCycler counterpart and must stay `xenium_only`.
+    """
+    rows = [
+        {"donor_id": "6539", "roi": "panc", "batch": "b",
+         "source_path": BUNDLE.format(label="Panc")},
+        {"donor_id": "6539", "roi": "pln_2", "batch": "b",
+         "source_path": BUNDLE.format(label="pLN2").replace("0059865", "0011111")},
+        {"donor_id": "6539", "roi": "region_1", "batch": "b",
+         "source_path": BUNDLE.format(label="Region_1").replace("0059865", "0022222")},
+    ]
+    cfg = _cfg(tmp_path, rows)
+    df, _ = build_manifest(cfg, pheno_donors=["6539"])
+    by_roi = dict(zip(df["roi"], df["pair_status"]))
+    assert by_roi["panc"] == PAIRED
+    assert by_roi["pln_2"] == PAIRED
+    assert by_roi["region_1"] == XENIUM_ONLY
+
+    tissues = dict(zip(df["roi"], df["tissue"]))
+    assert tissues["panc"] == "pancreas"
+    assert tissues["pln_2"] == "pancreatic_lymph_node"
+    assert tissues["region_1"] == ""
+
+
+def test_paired_rows_selects_by_tissue_or_roi(tmp_path):
+    """A per-tissue run filters by tissue; a combined run passes `roi=None` for everything."""
+    rows = [
+        {"donor_id": "6539", "roi": "panc", "batch": "b",
+         "source_path": BUNDLE.format(label="Panc")},
+        {"donor_id": "6539", "roi": "pln_1", "batch": "b",
+         "source_path": BUNDLE.format(label="pLN")},
+        {"donor_id": "6539", "roi": "pln_2", "batch": "b",
+         "source_path": BUNDLE.format(label="pLN2").replace("0059865", "0011111")},
+    ]
+    cfg = _cfg(tmp_path, rows)
+    df, _ = build_manifest(cfg, pheno_donors=["6539"])
+
+    # Unscoped is the whole cohort; a tissue narrows to its ROIs; an roi narrows to one.
+    assert sorted(paired_rows(df)["roi"]) == ["panc", "pln_1", "pln_2"]
+    assert paired_rows(df, tissue="pancreas")["roi"].tolist() == ["panc"]
+    assert paired_rows(df, tissue="pancreatic_lymph_node")["roi"].tolist() == ["pln_1", "pln_2"]
+    assert paired_rows(df, roi="pln_2")["roi"].tolist() == ["pln_2"]
+    # roi beats tissue, matching `resolve_rois` and the CLI.
+    assert paired_rows(df, roi="panc", tissue="pancreatic_lymph_node")["roi"].tolist() == ["panc"]
 
 
 def test_unmapped_xenium_sample_is_surfaced_not_dropped(tmp_path):

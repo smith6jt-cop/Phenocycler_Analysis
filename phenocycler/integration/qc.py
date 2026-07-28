@@ -21,21 +21,29 @@ sections would not align would be throwing away good data for a bad reason.
            -> structure and grid results are produced but flagged
     FAIL   neither gate met
            -> registration-dependent steps skipped; donor-level and niche results stand
+
+The islet-RMSE gate applies only to tissues that *have* a structural unit. A pancreatic
+lymph node has no islets, so there is no landmark residual to compute and the metric is
+undefined rather than missing. Grading on "one of two gates met" there would cap every
+lymph-node donor at WARN forever and permanently withhold ``crossmodal`` from half the
+cohort — for a reason that is an artefact of the gate design, not of the registration. So
+for those tissues the verdict rests on tissue Dice alone, which is the metric that actually
+exists. See ``phenocycler.integration.tissues``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from ..config import PipelineConfig, load_config
-from .manifest import PAIRED, load_manifest
+from .manifest import load_manifest, paired_rows
 from .register import registration_dir
+from .tissues import DISPLAY_NAME, has_structures
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
@@ -48,8 +56,14 @@ ALLOWED_BY_VERDICT = {
 
 
 def verdict_for(tissue_dice: float, islet_rmse_um: float, *,
-                dice_min: float, rmse_max: float) -> tuple[str, list[str]]:
-    """Grade one registration. Returns ``(verdict, reasons)``."""
+                dice_min: float, rmse_max: float,
+                require_structures: bool = True) -> tuple[str, list[str]]:
+    """Grade one registration. Returns ``(verdict, reasons)``.
+
+    ``require_structures=False`` for a tissue with no structural unit (lymph node): the
+    landmark residual is undefined there, so it is dropped from the decision entirely rather
+    than counted as a failed gate.
+    """
     reasons = []
     dice_ok = np.isfinite(tissue_dice) and tissue_dice >= dice_min
     rmse_ok = np.isfinite(islet_rmse_um) and islet_rmse_um <= rmse_max
@@ -58,6 +72,12 @@ def verdict_for(tissue_dice: float, islet_rmse_um: float, *,
         reasons.append("tissue Dice not computed")
     elif not dice_ok:
         reasons.append(f"tissue Dice {tissue_dice:.3f} < {dice_min:.2f}")
+
+    if not require_structures:
+        # One gate, honestly labelled. Do not report the missing RMSE as a shortcoming of
+        # this registration — no landmark exists in this tissue to measure it against.
+        reasons.append("islet RMSE n/a — tissue has no structural unit; graded on Dice alone")
+        return (PASS if dice_ok else FAIL), reasons
 
     if not np.isfinite(islet_rmse_um):
         reasons.append("islet RMSE not computed (too few structures to check)")
@@ -71,27 +91,34 @@ def verdict_for(tissue_dice: float, islet_rmse_um: float, *,
     return FAIL, reasons
 
 
-def collect_registration_qc(cfg: PipelineConfig, roi: str = "panc") -> pd.DataFrame:
-    """Read every stored ``qc.json`` and grade it."""
-    man = load_manifest(cfg)
-    man = man[(man["pair_status"] == PAIRED) & (man["roi"] == roi)]
+def collect_registration_qc(cfg: PipelineConfig, roi: Optional[str] = None,
+                            tissue: Optional[str] = None) -> pd.DataFrame:
+    """Read every stored ``qc.json`` and grade it.
+
+    Scope follows ``paired_rows``: one ROI, one tissue's ROIs, or — with ``roi=None`` and no
+    tissue — every paired section in the cohort, which is what a combined run grades.
+    """
+    man = paired_rows(load_manifest(cfg), roi=roi, tissue=tissue)
 
     rows = []
     for _, r in man.iterrows():
-        donor = r["donor_id"]
-        path = registration_dir(cfg, donor, roi) / "qc.json"
+        donor, roi_name = r["donor_id"], r["roi"]
+        roi_tissue = r.get("tissue", "") or cfg.tissue_for_roi(roi_name)
+        graded_on_dice = not has_structures(roi_tissue) if roi_tissue else False
+        path = registration_dir(cfg, donor, roi_name) / "qc.json"
         if not path.exists():
-            rows.append({"donor_id": donor, "roi": roi, "verdict": FAIL,
-                         "reasons": "no registration produced", "track": "",
+            rows.append({"donor_id": donor, "roi": roi_name, "tissue": roi_tissue,
+                         "verdict": FAIL, "reasons": "no registration produced", "track": "",
                          "tissue_dice": np.nan, "islet_rmse_um": np.nan})
             continue
         d = json.loads(path.read_text())
         v, reasons = verdict_for(
             float(d.get("tissue_dice", np.nan)), float(d.get("rmse_um", np.nan)),
-            dice_min=cfg.qc_tissue_dice_min, rmse_max=cfg.qc_islet_rmse_max_um)
+            dice_min=cfg.qc_tissue_dice_min, rmse_max=cfg.qc_islet_rmse_max_um,
+            require_structures=not graded_on_dice)
         tf = d.get("transform", {})
         rows.append({
-            "donor_id": donor, "roi": roi, "verdict": v,
+            "donor_id": donor, "roi": roi_name, "tissue": roi_tissue, "verdict": v,
             "reasons": "; ".join(reasons),
             "track": d.get("track", ""),
             "tissue_dice": d.get("tissue_dice", np.nan),
@@ -106,6 +133,15 @@ def collect_registration_qc(cfg: PipelineConfig, roi: str = "panc") -> pd.DataFr
             "allows": ",".join(ALLOWED_BY_VERDICT[v]),
         })
     return pd.DataFrame(rows)
+
+
+def _scope_label(cfg: PipelineConfig, roi: Optional[str], tissue: Optional[str]) -> str:
+    """What this report covers, so a per-tissue run is never mistaken for the whole cohort."""
+    if tissue:
+        return f"{DISPLAY_NAME.get(tissue, tissue)} ({'/'.join(cfg.rois_for_tissue(tissue))})"
+    if roi:
+        return f"roi {roi} ({DISPLAY_NAME.get(cfg.tissue_for_roi(roi), '?')})"
+    return "all tissues — " + ", ".join(DISPLAY_NAME.get(t, t) for t in cfg.tissue_list)
 
 
 def sanity_flags(qc: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
@@ -136,17 +172,20 @@ def sanity_flags(qc: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
     return out
 
 
-def summarize(cfg: PipelineConfig, roi: str = "panc") -> tuple[pd.DataFrame, str]:
+def summarize(cfg: PipelineConfig, roi: Optional[str] = None,
+              tissue: Optional[str] = None) -> tuple[pd.DataFrame, str]:
     """Grade every donor and render the report."""
-    qc = sanity_flags(collect_registration_qc(cfg, roi), cfg)
+    qc = sanity_flags(collect_registration_qc(cfg, roi, tissue), cfg)
 
     lines = [
         "PhenoCycler <-> Xenium integration QC",
         "=" * 68,
         f"mode           : {cfg.integration_mode}",
         f"fixed frame    : {cfg.fixed_modality}",
+        f"scope          : {_scope_label(cfg, roi, tissue)}",
         f"gates          : tissue Dice >= {cfg.qc_tissue_dice_min:.2f}, "
-        f"islet RMSE <= {cfg.qc_islet_rmse_max_um:.0f} um",
+        f"islet RMSE <= {cfg.qc_islet_rmse_max_um:.0f} um "
+        f"(RMSE gate applies only where a structural unit exists)",
         "",
     ]
     if qc.empty:
@@ -156,12 +195,20 @@ def summarize(cfg: PipelineConfig, roi: str = "panc") -> tuple[pd.DataFrame, str
     counts = qc["verdict"].value_counts().to_dict()
     lines.append("verdicts: " + ", ".join(f"{k}={counts.get(k, 0)}"
                                           for k in (PASS, WARN, FAIL)))
+    if qc["tissue"].nunique() > 1:
+        by_tissue = qc.groupby("tissue")["verdict"].value_counts().unstack(fill_value=0)
+        lines.append("")
+        for t, row in by_tissue.iterrows():
+            lines.append(f"  {DISPLAY_NAME.get(t, t):<22} " + ", ".join(
+                f"{k}={int(row.get(k, 0))}" for k in (PASS, WARN, FAIL)))
     lines.append("")
-    lines.append(f"  {'donor':<8} {'verdict':<7} {'track':<10} {'dice':>6} {'rmse_um':>8}  notes")
-    for _, r in qc.sort_values(["verdict", "donor_id"]).iterrows():
+    lines.append(f"  {'donor':<8} {'roi':<7} {'verdict':<7} {'track':<10} "
+                 f"{'dice':>6} {'rmse_um':>8}  notes")
+    for _, r in qc.sort_values(["verdict", "donor_id", "roi"]).iterrows():
         note = "; ".join(x for x in (r.get("reasons", ""), r.get("sanity_flags", "")) if x)
-        lines.append(f"  {r['donor_id']:<8} {r['verdict']:<7} {str(r['track']):<10} "
-                     f"{float(r['tissue_dice']):>6.3f} {float(r['islet_rmse_um']):>8.1f}  {note}")
+        lines.append(f"  {r['donor_id']:<8} {str(r['roi']):<7} {r['verdict']:<7} "
+                     f"{str(r['track']):<10} {float(r['tissue_dice']):>6.3f} "
+                     f"{float(r['islet_rmse_um']):>8.1f}  {note}")
 
     n_fail = counts.get(FAIL, 0)
     if n_fail:
@@ -251,9 +298,10 @@ def concordance_summary(results: dict[str, pd.DataFrame]) -> str:
     return "\n".join(lines)
 
 
-def run_qc(cfg: PipelineConfig, *, roi: str = "panc", write: bool = True) -> pd.DataFrame:
+def run_qc(cfg: PipelineConfig, *, roi: Optional[str] = None,
+           tissue: Optional[str] = None, write: bool = True) -> pd.DataFrame:
     """Stage entry point: grade registrations, write the gate table and the report."""
-    qc, report = summarize(cfg, roi)
+    qc, report = summarize(cfg, roi, tissue)
     results = gather_results(cfg)
     full = report + "\n" + concordance_summary(results)
     print(full, flush=True)
@@ -267,24 +315,28 @@ def run_qc(cfg: PipelineConfig, *, roi: str = "panc", write: bool = True) -> pd.
     return qc
 
 
-def passing_donors(cfg: PipelineConfig, level: str, roi: str = "panc") -> list[str]:
+def passing_donors(cfg: PipelineConfig, level: str, roi: Optional[str] = None,
+                   tissue: Optional[str] = None) -> list[str]:
     """Donors whose verdict permits ``level`` ('structure', 'grid', 'crossmodal', ...)."""
-    qc = collect_registration_qc(cfg, roi)
+    qc = collect_registration_qc(cfg, roi, tissue)
     if qc.empty:
         return []
     ok = qc["verdict"].map(lambda v: level in ALLOWED_BY_VERDICT.get(v, ()))
-    return sorted(qc.loc[ok, "donor_id"].tolist())
+    return sorted(set(qc.loc[ok, "donor_id"].tolist()))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Integration QC gates and report")
     ap.add_argument("--config", default=None)
-    ap.add_argument("--roi", default="panc")
+    ap.add_argument("--roi", default=None,
+                    help="grade one ROI (default: every ROI of --tissue, or all tissues)")
+    ap.add_argument("--tissue", default=None,
+                    help="grade one tissue's ROIs, e.g. pancreatic_lymph_node")
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    run_qc(cfg, roi=args.roi, write=not args.no_write)
+    run_qc(cfg, roi=args.roi, tissue=args.tissue, write=not args.no_write)
     return 0
 
 

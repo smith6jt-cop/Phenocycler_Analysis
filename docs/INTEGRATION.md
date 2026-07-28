@@ -13,8 +13,87 @@ pip install -e .
 
 python -m phenocycler.integration.manifest --report      # what pairs with what
 python -m phenocycler.integration.pipeline --status      # stage table
-python -m phenocycler.integration.pipeline               # run everything
+python -m phenocycler.integration.pipeline               # run everything, both tissues
+python -m phenocycler.integration.pipeline --tissue pancreas    # one tissue
 ```
+
+---
+
+## Tissue
+
+The cohort is **20 donors × {PhenoCycler, Xenium} × {pancreas, pancreatic lymph node}**.
+
+Tissue is a property of the *dataset*, fixed when it is imported, not a mode of the analysis.
+It is derived from the ROI (`panc` → pancreas, `pln_1..3` → pancreatic lymph node), written
+into the cell table as a column at creation, and validated: a section whose ROI maps to no
+known tissue is refused rather than defaulting to pancreas. Every stage therefore runs on one
+tissue or on both, and a bare run covers both:
+
+```bash
+python -m phenocycler.integration.pipeline                                # both tissues
+python -m phenocycler.integration.pipeline --tissue pancreatic_lymph_node # one tissue
+python -m phenocycler.integration.pipeline --roi pln_2                    # one section
+```
+
+`--roi` beats `--tissue`; with neither, the scope is every ROI of every tissue in
+`[integration] tissues`. Stage runners take that scope and iterate the manifest themselves —
+they are *not* called once per ROI, because their output paths are stage-level
+(`niche_profiles.csv`, `islets.parquet`) and a per-ROI call would have each ROI overwrite the
+last.
+
+The two tissues diverge in exactly two places, both biological. Everything else — export,
+import, vocab, registration, niches, the grid, donor composition, pseudo-cell linking — is
+identical.
+
+**1. Structures.** Islets exist in pancreas. A lymph node has none, so hormone-seeded DBSCAN
+has nothing to seed on and islet matching (S6) has nothing to match. The structure level is
+simply not run there; `--status` marks it `n/a`, and a combined run still matches islets in
+the pancreas half. B-cell follicles are the obvious substitute landmark and the code would
+support them (`call_landmarks` is generic over a seed lineage), but a follicle called from a
+5K RNA panel on one side and a 55-plex protein panel on the other is a far weaker
+correspondence than an islet, and shipping it would invite structure-level claims the data
+cannot support. `tissues.STRUCTURE_SEEDS` is where it would go.
+
+This propagates into QC. The islet-RMSE gate is *undefined* without islets, not missing, so
+for those tissues the verdict rests on tissue Dice alone. Counting the absent metric as a
+failed gate would cap every lymph-node donor at `WARN` forever and permanently withhold
+`crossmodal` from half the cohort — an artefact of the gate design, not a property of the
+registration.
+
+**2. Identity panels.** XeniumPanelExplorer ships `pancreas` and `thymus`, no lymph node. But
+the cores a lymph node needs are exactly the *shared* ones — T cell, B/plasma, NK/ILC,
+myeloid, granulocyte, endothelial, pericyte, neural, epithelial — and the three
+pancreas-specific cores (endocrine, exocrine, fibroblast/stellate) do not apply. So pLN
+resolves to the shared pool: 8 cores against the pancreas's 11. That is the correct answer,
+not a degraded fallback. Scoring a lymph-node cell against `01_pancreas_endocrine` would not
+be harmlessly uninformative — the broad call is an argmax over those axes, so an axis that
+cannot exist in the tissue is a competitor that can win.
+
+The same logic narrows donor-level concordance: `Endocrine` and `Exocrine` are dropped from
+the comparable-lineage set for pLN, because a near-zero fraction on both sides is two
+instruments correctly finding nothing, and letting it into the Spearman would inflate the
+concordance with a free correct answer.
+
+`phenocycler/integration/tissues.py` is the single place that knows any of this.
+
+### One caveat on the PhenoCycler side
+
+The core pipeline derives `donor_id` as the first digit-run of the qptiff name
+(`cells_parquet.py`), so donor 6539's pancreas image and its lymph-node image both land in
+`data/cells/donor_id=6539` and cannot be told apart afterwards. Each tissue therefore needs
+its own core-pipeline data dir:
+
+```ini
+[integration]
+pheno_tissue_dirs = pancreas=/path/panc/data,pancreatic_lymph_node=/path/pln/data
+```
+
+Left unset, both tissues resolve to the same directory and `export_pheno` exports the first
+and **refuses** the rest with an actionable message. That refusal is the point: exporting one
+source under two ROIs would write a pancreas section into the lymph-node partition — real
+cells, correctly labelled, attributed to the wrong organ, which every downstream comparison
+would take at face value. The Xenium side has no such problem; its sections are keyed
+`{serial}__{roi}` and one slide serial legitimately carries both.
 
 ---
 
@@ -59,10 +138,10 @@ manifest      S0   donor ↔ Xenium-run pairing; stamps donor_id/roi into the da
 export_pheno  S1a  phenotype/broad + cells + restore_gated  →  cells_pheno/
 import_xenium S1b  h5ad | SpatialData zarr | raw bundle     →  cells_xen/
 vocab         S2   harmonised lineage vocabulary + protein↔gene crosswalk
-structures    S3   tissue / islets / ducts / vessels, same algorithm both sides
+structures    S3   tissue / islets / ducts / vessels, same algorithm both sides [pancreas]
 register      S4   coarse rigid → affine → non-rigid; image + point-set tracks
 transform     S5   warp coordinates and masks into the fixed frame
-match         S6   islet ↔ islet assignment                    [sequential]
+match         S6   islet ↔ islet assignment          [sequential, pancreas]
 grid          S7   joint niches (no registration) + registered hex grid
 donor         S8   donor-level concordance                     [no registration]
 crossmodal    S9   pseudo-cell linking                         [sequential, INFERENCE]
@@ -187,6 +266,14 @@ the original bundle, at a pyramid level near the target resolution.
 | WARN | one gate met | all but pseudo-cell linking |
 | FAIL | neither | donor-level and niche only |
 
+In a tissue with no structural unit the islet-RMSE gate does not exist, so the verdict is
+PASS on Dice alone and FAIL otherwise — there is no WARN band, because there is no second
+gate to half-meet. The dropped gate is stated in the `reasons` column rather than being
+silently absent.
+
+Verdicts are per **(donor, ROI)**, not per donor: a donor's pancreas can register cleanly
+while its lymph node does not, and `crossmodal` gates on the section it is about to link.
+
 A FAIL donor is **not** dropped from the study — only from the spatial analyses. Losing good
 donor-level data because two sections would not align would be the wrong trade.
 
@@ -196,8 +283,9 @@ donor-level data because two sections would not align would be the wrong trade.
 
 ```
 data/integration/
-├── manifest.csv                     pairing table + pair_status        [tracked]
-├── vocab_crosswalk.csv              lineage + marker crosswalk         [tracked]
+├── manifest.csv                     pairing table + pair_status + tissue [tracked]
+├── vocab_crosswalk.csv              lineage + marker crosswalk, all tissues [tracked]
+├── vocab_crosswalk_<tissue>.csv     per-tissue crosswalk (cores differ)  [tracked]
 ├── xenium_paths.csv                 vendored donor → run map           [tracked]
 ├── donor_overrides.csv              donor ids not recorded upstream    [tracked]
 ├── cells_pheno/donor_id=*/roi=*/    contract cell tables
@@ -223,8 +311,9 @@ longer align with `cells.parquet`.
 ## Verifying it works
 
 ```bash
-pytest tests/                                        # 89 integration tests, no data needed
+pytest tests/                                        # no data needed
 python -m phenocycler.integration.pipeline --status
+python -m phenocycler.integration.pipeline --status --tissue pancreatic_lymph_node
 python -m phenocycler.integration.manifest --report
 python -m phenocycler.integration.pipeline --donor 6539 --mode sequential
 ```
