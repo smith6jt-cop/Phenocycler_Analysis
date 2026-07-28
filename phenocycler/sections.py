@@ -71,8 +71,16 @@ def key_from_image(image: str) -> str:
 
 #: Region token -> the ROI vocabulary the integration layer pairs on. The Xenium manifest
 #: names lymph-node regions ``pln_1..pln_3``; PhenoCycler images carry a bare ``pLN``, so a
-#: token with no index resolves to ``pln_1`` — the only lymph-node region every donor in the
-#: manifest has (26/26; only three donors have a second, one a third).
+#: token with no index resolves to ``pln_1``.
+#:
+#: ``pln_1`` because it is the region every row in ``xenium_paths.csv`` has — 26 of 26 donors
+#: listed there, with three carrying a second and one a third. Note that CSV is the *vendored
+#: upstream manifest*, not the run cohort: the analysis cohort is 20 donors, and which 20 has
+#: not been pinned anywhere in this repo. So this mapping is an inference from a superset, and
+#: it is wrong for any donor whose single PhenoCycler lymph-node section corresponds to that
+#: donor's ``pln_2`` or ``pln_3`` rather than its ``pln_1``. Pairing failures would show up as
+#: a registration that cannot align; if that happens, add a per-donor override here rather than
+#: loosening the mapping.
 REGION_TO_ROI: dict[str, str] = {"pln": "pln_1", "ln": "pln_1"}
 
 #: The ROI of a section whose filename carries no region token at all.
