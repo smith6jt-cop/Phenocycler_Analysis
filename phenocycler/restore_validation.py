@@ -1930,19 +1930,14 @@ def load_validation_sample(
     for marker in whole_cell_only:
         merged[compartment_column("Cell", marker)] = merged[f"raw__{marker}"]
 
-    # A cell whose nucleus fills it has NO cytoplasmic ring, so QuPath emits no Cytoplasm mean. The
-    # value is UNDEFINED, not missing: 9.02% of cells on donor 6591, of which 100% have a nucleus
-    # (cell_qc already drops no-nucleus objects, `require_nucleus`) and 100% have nc_area_ratio >= 0.99
-    # with nucleus_area == cell_area to the pixel in 99.8%. Left as NaN they fail the finite check in
-    # `evaluate_locked_pair` and 101,113 cells are discarded from the pair -- which both loses a tenth
-    # of the tissue and confounds any Cytoplasm-vs-no-Cytoplasm comparison with a change in the cell
-    # set. The whole-cell mean is the correct estimate of such a cell's cytoplasmic signal, because for
-    # these cells the cytoplasmic region IS the cell.
-    for marker in sampled_markers:
-        cyto = compartment_column("Cytoplasm", marker)
-        cell = compartment_column("Cell", marker)
-        if cyto in merged.columns and cell in merged.columns:
-            merged[cyto] = merged[cyto].fillna(merged[cell])
+    # A cell whose nucleus fills it has NO cytoplasmic ring, so QuPath emits no Cytoplasm mean.
+    # Such a cell is DROPPED from any pair that uses the Cytoplasm feature -- it is left NaN here and
+    # the finite check in `evaluate_locked_pair` excludes it. Do NOT fill it from the whole-cell mean:
+    # `Cell` is a SUPERSET that contains the membrane band, so filling would push membrane signal into
+    # the cytoplasm feature and destroy the independence the feature exists to provide. 9.02% of cells
+    # on donor 6591 (all of which have a nucleus -- cell_qc already removed no-nucleus objects). A cell
+    # needs BOTH a nucleus and a cell body to have a cytoplasm; without one it cannot supply the
+    # measurement and is not a candidate for a Cytoplasm-based fit.
 
     max_delta = 0.0
     for marker in sampled_markers:
@@ -2345,16 +2340,24 @@ def evaluate_locked_pair(
     # setting applied their limitation to everything. Nothing about that donor is unusual; the arms,
     # anchor recovery and separator are mid-cohort.
     #
-    # "Cell" is always required: it is the whole-cell mean, present for every marker by construction.
+    # `Cell` is NOT required, and is not a free extra feature when it is present: it is a SUPERSET of
+    # Nucleus, Cytoplasm and Membrane, so it is collinear with each of them by construction. Measured
+    # on donor 6591 over 8 markers: r(Cell, Nucleus) 0.948-0.985, r(Cell, Membrane) 0.837-0.957,
+    # r(Cell, Cytoplasm) 0.810-0.934. Declaring "Membrane,Cell" therefore buys almost no independent
+    # information -- which is why going from 2 features to 4 moved 12 of 14 tested donor-pairs by
+    # <=0.2%. Cytoplasm and Membrane are DISJOINT regions and are the informative pairing.
+    #
+    # A marker with no compartment measurements has only `Cell` (synthesised in load_validation_sample
+    # from the canonical parquet), so requiring at least one available compartment -- rather than
+    # requiring `Cell` specifically -- is what lets a Cytoplasm+Membrane fit run at all.
     effective_compartments = tuple(
         c for c in config.feature_compartments
         if all(compartment_column(c, m) in donor_df.columns for m in (target, reference))
     )
-    if "Cell" not in effective_compartments:
+    if not effective_compartments:
         raise ValueError(
             f"{target} <- {reference}: no usable feature compartment. Declared "
-            f"{list(config.feature_compartments)}; 'Cell' must be among them and present for both "
-            "markers (load_validation_sample synthesises it from the canonical parquet)."
+            f"{list(config.feature_compartments)}; none is present for both markers."
         )
     feature_columns = [
         compartment_column(compartment, marker)

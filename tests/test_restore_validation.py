@@ -1802,20 +1802,22 @@ def test_effective_compartments_fall_back_when_a_marker_lacks_membrane():
     assert eff == ("Cell",)
 
 
-def test_cell_is_always_required():
-    """'Cell' is the whole-cell mean and exists for every marker; a declaration without it is an error,
-    not a silent empty feature set."""
+def test_any_available_compartment_is_usable_and_cell_is_not_required():
+    """`Cell` is a SUPERSET of the other compartments, so it is collinear with each by construction
+    (donor 6591, 8 markers: r(Cell,Nucleus) 0.948-0.985, r(Cell,Membrane) 0.837-0.957). Requiring it
+    made Cytoplasm+Membrane -- the only DISJOINT pairing, and the one carrying independent information
+    -- unusable. Replaces `test_cell_is_always_required`. An empty feature set is still an error."""
+    df = _pair_frame(("CD68", "E_cadherin"), ("Cytoplasm", "Membrane"))
+    cfg = rv.PairValidationConfig(feature_compartments=("Cytoplasm", "Membrane"))
+    ev = rv.evaluate_locked_pair(df, "TEST", "CD68", "E_cadherin", config=cfg)
+    assert ev["feature_compartments"] == "Cytoplasm+Membrane"
+
     df = _pair_frame(("CD68", "E_cadherin"), ("Membrane",))
-    cfg = rv.PairValidationConfig(feature_compartments=("Membrane",))
+    cfg = rv.PairValidationConfig(feature_compartments=("Nucleus",))
     with pytest.raises(ValueError, match="no usable feature compartment"):
-        rv.evaluate_locked_pair(df, "TEST", "CD68", "E_cadherin", config=cfg,
-                                pair_review=rv.PairReview.ACCEPTED)
+        rv.evaluate_locked_pair(df, "TEST", "CD68", "E_cadherin", config=cfg)
 
 
-# --------------------------------------------------------------------------- #
-# Review-display invariants. Both of these shipped broken and were caught only by a reviewer looking
-# at the finished PDFs, so they are asserted here rather than trusted.
-# --------------------------------------------------------------------------- #
 def test_step2_line_and_axis_use_the_active_divisor_not_the_manuscript_maximum():
     """The drawn Step-2 threshold must be the divisor production uses.
 
