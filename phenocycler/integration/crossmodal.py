@@ -16,9 +16,12 @@ CD68, CD99, TUBB3, MPO. That is a usable but narrow basis, and a basis narrow en
 degenerate is worse than none — so this module **refuses to run** below
 ``crossmodal_min_anchors`` rather than quietly producing links from three genes.
 
-**Serial sections have no ground-truth cell correspondence.** A link is a statement about
-similarity in a shared feature space, not a claim that two measurements came from one cell —
-that claim is only available in ``same_slide`` mode. So every output column is prefixed
+**These links carry no ground-truth cell correspondence.** A link is a statement about
+similarity in a shared feature space, not a claim that two measurements came from one cell.
+Some serial-section cells genuinely are the same cell — see ``cellmatch.py``, which recovers
+endocrine cells inside matched islets under a verified local residual — but *this* module
+links every cell in a group, including the ~72% that have no counterpart in the other
+section and the cell types that can never have one. Nothing here is a measurement. So every output column is prefixed
 ``inferred_``, every link carries a confidence, and validation is against structure-level
 aggregates plus a permuted-link null. If the inferred pairing cannot reproduce the islet-level
 concordance that S6 measured directly, it has not earned belief.

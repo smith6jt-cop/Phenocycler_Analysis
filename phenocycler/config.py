@@ -164,6 +164,19 @@ class PipelineConfig:
     match_max_dist_um: float = 200.0
     match_area_ratio: float = 2.5
     crossmodal_min_anchors: int = 8               # refuse pseudo-cell linking below this
+    # S6b cell matching inside matched islets. The thresholds are not style choices: a
+    # simulation of adjacent 5 um sections puts endocrine precision at 0.95 with a <=2 um
+    # local residual and 0.40 at 5 um, so the residual gate is what separates a measurement
+    # from a coin flip. See phenocycler/integration/cellmatch.py.
+    # Post-Xenium IF staining for INS/GCG on the Xenium section. When true, Xenium endocrine
+    # identity is a protein measurement on the same cells as the RNA rather than a surrogate
+    # inference, which is what makes protein<->protein endocrine anchors possible across the
+    # serial pair. (CD3e is excluded deliberately: post-Xenium chemistry degrades epitopes and
+    # lower-abundance surface markers do not survive it reliably.)
+    xenium_hormone_if: bool = False
+    cellmatch_max_dist_um: float = 3.0            # centroid cap for a candidate pair
+    cellmatch_max_residual_um: float = 2.0        # skip an islet above this local residual
+    cellmatch_min_signal_over_null: float = 3.0   # skip if not clearly above the permuted null
     qc_tissue_dice_min: float = 0.80
     qc_islet_rmse_max_um: float = 150.0
 
@@ -466,6 +479,10 @@ _INI_SCHEMA = {
         "match_max_dist_um": ("match_max_dist_um", float),
         "match_area_ratio": ("match_area_ratio", float),
         "crossmodal_min_anchors": ("crossmodal_min_anchors", int),
+        "xenium_hormone_if": ("xenium_hormone_if", _as_bool),
+        "cellmatch_max_dist_um": ("cellmatch_max_dist_um", float),
+        "cellmatch_max_residual_um": ("cellmatch_max_residual_um", float),
+        "cellmatch_min_signal_over_null": ("cellmatch_min_signal_over_null", float),
         "qc_tissue_dice_min": ("qc_tissue_dice_min", float),
         "qc_islet_rmse_max_um": ("qc_islet_rmse_max_um", float),
     },

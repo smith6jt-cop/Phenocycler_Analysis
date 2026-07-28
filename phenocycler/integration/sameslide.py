@@ -6,10 +6,17 @@ cells, and a genuine paired protein+RNA matrix is recoverable. Everything the se
 has to approximate — islet matching, niche comparison, feature-space linking — becomes
 unnecessary, because the correspondence is a measurement rather than an inference.
 
-The mode guard is a hard error in both directions, and that is deliberate. Every claim
-downstream rests on which of these two situations holds: "these two measurements come from
-one cell" is true in same-slide mode and false in sequential mode, and no amount of
-registration quality changes that. A warning would be too easy to ignore.
+The mode guard is a hard error in both directions, and that is deliberate: same-slide mode
+claims *whole-cell* correspondence for *every* cell, which serial sections cannot support.
+
+That is narrower than what an earlier version of this docstring said. It claimed serial
+sections never measure the same cell at all, which is simply false — pancreatic cells are
+10-15 um and sections are 5 um, so most cells straddle the cut. What serial sections cannot
+give is correspondence for every cell: only ~28% are detectable in both, the recoverable
+population is heavily biased toward large cells (0% of 8 um lymphocytes), and each side sees
+a different *part* of the cell. ``cellmatch.py`` (S6b) recovers the fraction that is real —
+endocrine cells inside matched islets, under a verified local registration residual — and
+refuses the rest. This module remains for the case where one section was imaged twice.
 
 **What ``pair_donor`` currently does:** mutual-nearest-centroid assignment within
 ``max_dist_um``. Mutual rather than one-way, because one-way nearest-neighbour assignment

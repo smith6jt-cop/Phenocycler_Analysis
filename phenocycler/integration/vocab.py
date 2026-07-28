@@ -97,9 +97,6 @@ COMMON_LINEAGES: tuple[str, ...] = (
     "Unassigned",
 )
 
-#: PhenoCycler broad_lineage -> common. `Immune` is intentionally absent: it is resolved
-#: through `immune_subclass` by :func:`pheno_to_common`, because mapping it to a single
-#: common class would throw away information both modalities have.
 #: Every PhenoCycler broad class this repo has ever emitted. `PHENO_TO_COMMON` below is this
 #: filtered to the classes the *current* `config.LINEAGES` actually produces, so the crosswalk
 #: tracks the core pipeline instead of drifting from it. `Neutrophil` is the live example:
@@ -115,6 +112,9 @@ _PHENO_BROAD_TO_COMMON: dict[str, str] = {
     "Neutrophil": "Granulocyte",
 }
 
+#: PhenoCycler broad_lineage -> common. `Immune` is intentionally absent: it is resolved
+#: through `immune_subclass` by :func:`pheno_to_common`, because mapping it to a single
+#: common class would throw away information both modalities have.
 PHENO_TO_COMMON: dict[str, str] = {
     k: v for k, v in _PHENO_BROAD_TO_COMMON.items() if k in _CORE_LINEAGES
 }
@@ -155,6 +155,10 @@ XENIUM_FINE_TO_COMMON: dict[str, str] = {
 #: check this before reporting a lineage — a class only one side can see is not evidence of
 #: a difference between modalities.
 RESOLVABLE: dict[str, dict[str, str]] = {
+    # Panel-only default: INS/GCG/SST are absent from the 5K panel, so Xenium infers
+    # endocrine identity from surrogate cores (PDX1, ISL1, NEUROD1, ABCC8...). Post-Xenium IF
+    # staining for INS/GCG makes it a direct protein measurement on the same cells — see
+    # `resolvable_for`, which upgrades this when [integration] xenium_hormone_if is set.
     "Endocrine":   {"phenocycler": "yes", "xenium": "surrogate"},
     "Exocrine":    {"phenocycler": "default_sink", "xenium": "yes"},
     "Stromal":     {"phenocycler": "yes", "xenium": "yes"},
@@ -536,6 +540,21 @@ def usable_anchors(pairs: Iterable[MarkerPair], *, type_only: bool = False) -> l
     out = [p for p in pairs if p.usable_anchor]
     if type_only:
         out = [p for p in out if p.role == "TYPE"]
+    return out
+
+
+def resolvable_for(cfg: Optional[PipelineConfig] = None) -> dict[str, dict[str, str]]:
+    """`RESOLVABLE`, adjusted for what this run's Xenium sections actually carry.
+
+    Post-Xenium immunofluorescence for INS/GCG turns Xenium's endocrine call from a surrogate
+    inference into a direct protein measurement *on the same cells as the RNA* — the single
+    biggest gap in the panel crosswalk, since the hormones are the markers that define the
+    compartment a T1D study is about. Reported rather than assumed: with the flag off, the
+    crosswalk keeps saying `surrogate`, which is the truthful answer for panel-only data.
+    """
+    out = {k: dict(v) for k, v in RESOLVABLE.items()}
+    if cfg is not None and getattr(cfg, "xenium_hormone_if", False):
+        out["Endocrine"]["xenium"] = "yes"
     return out
 
 
