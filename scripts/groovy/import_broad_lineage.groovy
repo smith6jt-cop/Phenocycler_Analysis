@@ -15,11 +15,15 @@ def folder = new File(System.getProperty("user.home"),
                       "Phenocycler_Analysis/data/phenotype/qupath_class")
 // ----------------------------------------------------------------------------
 
-// distinct colours for the six broad lineages (match the analysis figures)
+// Distinct colours for the EIGHT broad lineages, matching phenocycler.config.LINEAGE_COLORS
+// so QuPath and the analysis figures agree. Neural and Neutrophil were added when the
+// lineage call moved from six classes to eight; without them those two import with QuPath's
+// default colour and are indistinguishable on screen.
 def COLORS = [
     "Epithelial" : [68, 119, 170],   "Fibroblast" : [238, 102, 119],
     "Immune"     : [34, 136, 51],    "Endocrine"  : [204, 187, 68],
     "Endothelial": [102, 204, 238],  "Muscle"     : [170, 51, 119],
+    "Neural"     : [181, 131, 141],  "Neutrophil" : [230, 159, 0],
 ]
 COLORS.each { name, c -> getPathClass(name).setColor(c[0], c[1], c[2]) }
 

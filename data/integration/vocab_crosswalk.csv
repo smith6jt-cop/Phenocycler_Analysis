@@ -1,0 +1,66 @@
+kind,common,phenocycler,xenium,pheno_resolution,xenium_resolution,pheno_note,xenium_note,collapsed,identity_core_genes
+lineage,Endocrine,Endocrine,Endocrine,yes,surrogate,resolved by a positive broad-level call,no 1:1 marker; resolved via curated surrogate identity panel,,18
+lineage,Exocrine,Epithelial,Exocrine,default_sink,yes,assigned by fallback when all positive gates fail (epi_default),resolved by a positive broad-level call,,8
+lineage,Stromal,Fibroblast|Muscle,Stromal,yes,yes,resolved by a positive broad-level call,resolved by a positive broad-level call,Fibroblast (Vimentin)|Muscle (SMA),48
+lineage,Vascular,Endothelial,Vascular,yes,yes,resolved by a positive broad-level call,resolved by a positive broad-level call,,87
+lineage,T_NK,Immune/T,Immune_T,subclass,yes,"recovered from per-marker gates, not the broad label",resolved by a positive broad-level call,,129
+lineage,B_Plasma,Immune/B,Immune_B,subclass,yes,"recovered from per-marker gates, not the broad label",resolved by a positive broad-level call,,58
+lineage,Myeloid,Immune/Myeloid|Immune/Mixed,Myeloid,subclass,yes,"recovered from per-marker gates, not the broad label",resolved by a positive broad-level call,,111
+lineage,Granulocyte,Neutrophil,,yes,fine_only,resolved by a positive broad-level call,no broad class; only reachable as a fine subtype,,0
+lineage,Neural,Neural,Neural,yes,yes,resolved by a positive broad-level call,resolved by a positive broad-level call,,17
+lineage,Unassigned,,,never,no,this modality has no Unassigned bucket by construction,not resolvable,,0
+marker,,Pan_Cytokeratin,KRT19,TYPE,on_panel,lineage gate,,,
+marker,,EpCAM,EPCAM,TYPE,on_panel,,,,
+marker,,E_cadherin,CDH1,TYPE,on_panel,,,,
+marker,,TP63,TP63,TYPE,on_panel,,,,
+marker,,CD66,CEACAM1,TYPE,on_panel,,,,
+marker,,Vimentin,,TYPE,off_panel,lineage gate,surrogate: 13_fibroblast_stellate (39 genes),,39
+marker,,Collagen_IV,COL4A1|COL4A2,TYPE,on_panel,,,,
+marker,,SMA,ACTA2,TYPE,on_panel,lineage gate,,,
+marker,,B3TUBB,TUBB3,TYPE,on_panel,lineage gate,,,
+marker,,CD56,NCAM1,TYPE,on_panel,,,,
+marker,,CD31,PECAM1,TYPE,on_panel,lineage gate,,,
+marker,,CD34,CD34,TYPE,on_panel,,,,
+marker,,Podoplanin,PDPN,TYPE,on_panel,,,,
+marker,,Caveolin,,TYPE,off_panel,,surrogate: 11_endothelial_vascular (87 genes),,87
+marker,,INS,,TYPE,off_panel,lineage gate,surrogate: 01_pancreas_endocrine (18 genes),,18
+marker,,GCG,,TYPE,off_panel,lineage gate,surrogate: 01_pancreas_endocrine (18 genes),,18
+marker,,SST,,TYPE,off_panel,lineage gate,surrogate: 01_pancreas_endocrine (18 genes),,18
+marker,,CD99,CD99,TYPE,on_panel,lineage gate,,,
+marker,,CD3e,CD3E|CD3G,TYPE,on_panel,lineage gate,,,
+marker,,CD8,CD8A|CD8B,TYPE,on_panel,,,,
+marker,,CD4,CD4,TYPE,on_panel,,,,
+marker,,FOXP3,FOXP3,TYPE,on_panel,,,,
+marker,,CD20,MS4A1,TYPE,on_panel,lineage gate,,,
+marker,,CD79a,CD79A,TYPE,on_panel,,,,
+marker,,CD68,CD68,TYPE,on_panel,,,,
+marker,,CD163,CD163,TYPE,on_panel,lineage gate,,,
+marker,,Iba1,,TYPE,off_panel,,surrogate: 06_immune_myeloid (90 genes),,90
+marker,,CD206,MRC1,TYPE,on_panel,,,,
+marker,,M2Gal3,,TYPE,off_panel,,surrogate: 06_immune_myeloid (90 genes),,90
+marker,,CD11c,ITGAX,TYPE,on_panel,,,,
+marker,,CD209,CD209,TYPE,on_panel,,,,
+marker,,CD11b,ITGAM,TYPE,on_panel,,,,
+marker,,MPO,MPO,TYPE,on_panel,lineage gate,,,
+marker,,b_Catenin1,CTNNB1,TYPE,on_panel,,,,
+marker,,Ki67,MKI67,PROCESS,on_panel,,,,
+marker,,PCNA,PCNA,PROCESS,on_panel,,,,
+marker,,Granzyme_B,GZMB,PROCESS,on_panel,,,,
+marker,,CD107a,LAMP1,PROCESS,on_panel,,,,
+marker,,PD_1,PDCD1,PROCESS,on_panel,,,,
+marker,,PD_L1,CD274,PROCESS,on_panel,,,,
+marker,,LAG3,LAG3,PROCESS,on_panel,,,,
+marker,,TOX,TOX,PROCESS,on_panel,,,,
+marker,,VISTA,VSIR,PROCESS,on_panel,,,,
+marker,,ICOS,ICOS,PROCESS,on_panel,,,,
+marker,,TCF_1,TCF7,PROCESS,on_panel,,,,
+marker,,CD39,ENTPD1,PROCESS,on_panel,,,,
+marker,,HLA_DR,,PROCESS,off_panel,,surrogate: 06_immune_myeloid (90 genes),,90
+marker,,HLA_A,,PROCESS,off_panel,,,,
+marker,,iNOS,NOS2,PROCESS,on_panel,,,,
+marker,,IDO1,IDO1,PROCESS,on_panel,,,,
+marker,,SOX2,SOX2,PROCESS,on_panel,,,,
+marker,,Bcl_2,BCL2,PROCESS,on_panel,,,,
+marker,,CD44,CD44,PROCESS,on_panel,,,,
+marker,,CD57,B3GAT1,PROCESS,on_panel,,,,
+marker,,CD38,CD38,PROCESS,on_panel,,,,

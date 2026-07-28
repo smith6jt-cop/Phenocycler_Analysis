@@ -31,9 +31,25 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
 test = ["pytest"]
+# PhenoCycler <-> Xenium integration (phenocycler/integration/). The core pipeline never
+# imports these; every integration module degrades to a clear ImportError naming the extra.
+# `maxfuse` is deliberately absent — its only release is 0.0.2 (2023) with unpinned deps, so
+# phenocycler.integration.crossmodal implements the algorithm directly instead.
+integration = [
+    "anndata",
+    "scanpy",
+    "spatialdata",
+    "spatialdata-io",
+    "zarr",
+    "geopandas",
+    "shapely",
+    "opencv-python-headless",
+    "SimpleITK",
+    "h5py",
+]
 
 [project.scripts]
 phenocycler = "phenocycler.pipeline:main"
 
 [tool.setuptools]
-packages = ["phenocycler"]
+packages = ["phenocycler", "phenocycler.integration"]

@@ -48,6 +48,23 @@ data/
 │   ├── celltype_marker_dotplot.png / _heatmap.png# Step 7: identity QC figures
 │   └── qupath_class/pheno_class_<id>.csv         # Step 6: object_id, broad_lineage, image (for QuPath)
 ├── redsea_reassess/                              # read-only acceptance-yardstick CSVs + figures
+├── integration/                                  # PhenoCycler <-> Xenium (optional; see docs/INTEGRATION.md)
+│   ├── manifest.csv                              # donor <-> Xenium-run pairing + pair_status   [tracked]
+│   ├── vocab_crosswalk.csv                       # harmonised lineages + protein<->gene pairs   [tracked]
+│   ├── xenium_paths.csv                          # vendored donor -> Xenium bundle map          [tracked]
+│   ├── donor_overrides.csv                       # donor ids not recorded upstream              [tracked]
+│   ├── cells_pheno/donor_id=*/roi=*/data_0.parquet   # contract cell table (protein side)
+│   ├── cells_xen/donor_id=*/roi=*/data_0.parquet     # contract cell table (RNA side)
+│   ├── structures/{phenocycler,xenium}/donor_id=*/roi=*/{islets,ducts,vessels}.parquet
+│   ├── registration/donor_id=*/roi=*/            # transform.json, *_displacement.npz, qc.json
+│   ├── paired/islets.parquet                     # matched islet pairs      [sequential]
+│   ├── paired/cells.parquet                      # paired protein+RNA cells [same_slide]
+│   ├── niches/                                   # niche_profiles.csv, grid_bins.parquet
+│   ├── crossmodal/pseudocell_links.parquet       # INFERRED links, not measurements
+│   ├── qc/                                       # registration_qc.csv, composition.csv,
+│   │                                             # disease_trend.csv, integration_report.txt
+│   ├── figures/                                  # registration overlays, concordance, trends
+│   └── export/                                   # QuPath + Xenium Explorer round-trips
 └── redsea_scratch/
     ├── geojson/cells__<image>.geojson            # QuPath boundaries (input to REDSEA)
     ├── masks/<id>.tif                            # int32 instance masks (--keep-mask)
@@ -69,6 +86,20 @@ panel is larger (~59-plex); only these gate the broad lineage.
 `build_cells_parquet` derives `cell_region` from the QuPath `Parent` annotation:
 `Islet_N` → `core`, `Islet_N_exp20um` → `peri`, `Annotation (Tissue)` / `Root object`
 → `tissue`, else `other`; and `islet_num` from `Islet_<N>`.
+
+## Integration inputs (optional)
+
+| Input | config.ini key | What it is |
+|-------|----------------|------------|
+| Xenium run map | `[integration] xenium_paths_csv` | `donor_id, roi, batch, source_path` — vendored from Xenium_Analysis, where nothing reads it. Made load-bearing here. |
+| Donor overrides | `[integration] donor_overrides_csv` | `xenium_sample_key, donor_id, roi[, section_gap_um, block_id]`. For Xenium runs whose donor is recorded nowhere upstream (e.g. `0041323`, `0041326`). |
+| Panel taxonomy | `[integration] panel_explorer` | XeniumPanelExplorer submodule — `panel_roles.csv` + `identity_core/*.csv`, shipped upstream as a machine-readable contract for Python consumers. |
+| Xenium outputs | resolved from the manifest | `{sample}_phenotyped.h5ad`, or the SpatialData zarr, or the raw `output-XETG...` bundle. Morphology images are read from the **bundle** — the Xenium ingest excludes them from the zarr. |
+
+The cross-modality join key is `donor_id`, normalised to a string on both sides (the donor
+workbook stores it numerically, PhenoCycler derives it by regex). The Xenium *section* key is
+`{serial}__{roi}`, never the bare serial: one slide serial can carry both a pancreas and a
+lymph-node region.
 
 ## Storage & reproducibility
 
