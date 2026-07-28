@@ -1930,6 +1930,20 @@ def load_validation_sample(
     for marker in whole_cell_only:
         merged[compartment_column("Cell", marker)] = merged[f"raw__{marker}"]
 
+    # A cell whose nucleus fills it has NO cytoplasmic ring, so QuPath emits no Cytoplasm mean. The
+    # value is UNDEFINED, not missing: 9.02% of cells on donor 6591, of which 100% have a nucleus
+    # (cell_qc already drops no-nucleus objects, `require_nucleus`) and 100% have nc_area_ratio >= 0.99
+    # with nucleus_area == cell_area to the pixel in 99.8%. Left as NaN they fail the finite check in
+    # `evaluate_locked_pair` and 101,113 cells are discarded from the pair -- which both loses a tenth
+    # of the tissue and confounds any Cytoplasm-vs-no-Cytoplasm comparison with a change in the cell
+    # set. The whole-cell mean is the correct estimate of such a cell's cytoplasmic signal, because for
+    # these cells the cytoplasmic region IS the cell.
+    for marker in sampled_markers:
+        cyto = compartment_column("Cytoplasm", marker)
+        cell = compartment_column("Cell", marker)
+        if cyto in merged.columns and cell in merged.columns:
+            merged[cyto] = merged[cyto].fillna(merged[cell])
+
     max_delta = 0.0
     for marker in sampled_markers:
         qupath = merged[compartment_column("Cell", marker)].to_numpy(float)
