@@ -76,24 +76,53 @@ concordance with a free correct answer.
 
 `phenocycler/integration/tissues.py` is the single place that knows any of this.
 
-### One caveat on the PhenoCycler side
+### Section keys on the PhenoCycler side
 
-The core pipeline derives `donor_id` as the first digit-run of the qptiff name
-(`cells_parquet.py`), so donor 6539's pancreas image and its lymph-node image both land in
-`data/cells/donor_id=6539` and cannot be told apart afterwards. Each tissue therefore needs
-its own core-pipeline data dir:
+Both of a donor's images are named for the same donor:
 
-```ini
-[integration]
-pheno_tissue_dirs = pancreas=/path/panc/data,pancreatic_lymph_node=/path/pln/data
+```
+6539_Scan1.er.qptiff        pancreas
+6539pLN_Scan1.er.qptiff     pancreatic lymph node
 ```
 
-Left unset, both tissues resolve to the same directory and `export_pheno` exports the first
-and **refuses** the rest with an actionable message. That refusal is the point: exporting one
-source under two ROIs would write a pancreas section into the lymph-node partition — real
-cells, correctly labelled, attributed to the wrong organ, which every downstream comparison
-would take at face value. The Xenium side has no such problem; its sections are keyed
-`{serial}__{roi}` and one slide serial legitimately carries both.
+The core pipeline used to key partitions on `regexp_extract("Image", '[0-9]+')` — the first
+digit-run — so both landed in `data/cells/donor_id=6539`. Two sections in one partition is
+not a labelling nuisance. Every core stage treats a partition as one image: `redsea.py` reads
+`image.iloc[0]` and masks *every* cell in the partition with that one section's GeoJSON,
+`restore.py` fits one threshold set per partition, and each section's micron coordinates are
+measured from its own slide origin. A shared partition would mask one section with the
+other's polygons, normalise two images as one, and interleave two coordinate frames into a
+single overlapping point cloud — with nothing raised anywhere.
+
+So the partition key is the **section key**: the donor's digits plus whatever region token
+the filename carries, lowercased.
+
+| image | partition | donor | roi |
+|---|---|---|---|
+| `6539_Scan1.er.qptiff` | `6539` | 6539 | `panc` |
+| `6539pLN_Scan1.er.qptiff` | `6539pln` | 6539 | `pln_1` |
+| `6539pLN2_Scan1.er.qptiff` | `6539pln2` | 6539 | `pln_2` |
+
+`phenocycler/sections.py` is the single definition, shared by the DuckDB expression that
+*builds* the partitions and the Python parser that *takes them apart* — two languages, one
+rule, checked against each other in the test suite. A bare `pLN` resolves to `pln_1`, the
+only lymph-node region every donor in the manifest has (26/26; three donors have a second,
+one a third). An unrecognised token like `6539spleen` is refused rather than folded into the
+pancreas, and `redsea.donor_image` asserts its partition holds exactly one image as a
+backstop.
+
+This also makes pairing exact rather than assumed. The manifest now knows *which* PhenoCycler
+sections exist, so a donor whose lymph node was never scanned is `xenium_only` for that ROI
+instead of being reported as a pairing that does not exist.
+
+Two consequences worth knowing:
+
+- The core pipeline's `donor_id=*` partitions are **sections**, so a 20-donor two-tissue
+  cohort has ~40 of them. `cfg.discover_sections()` is the work-unit iterator every core
+  stage uses; `cfg.discover_donors()` returns the 20 unique donors, which is what the manifest
+  and the donor workbook join want. Conflating the two makes `6539pln` a phantom donor.
+- `[integration] pheno_tissue_dirs` survives only as an override for a tissue processed
+  through a *separate* core-pipeline run. The normal case needs one run and no config.
 
 ---
 

@@ -47,6 +47,9 @@ import pandas as pd
 
 from ..config import EXTRA_MARKERS, HORMONE_MARKERS, LINEAGES, PipelineConfig, load_config
 from ..parallel import map_donors
+from ..sections import SectionError
+from ..sections import describe as describe_sections
+from ..sections import parse as parse_section
 from .contract import (as_feature, coerce_cell_table, normalize_tissue, partition_path,
                        write_cell_table)
 from .vocab import map_pheno_series
@@ -137,8 +140,14 @@ def export_donor(
     roi: str = "panc",
     tissue: str = "",
     markers: Optional[list[str]] = None,
+    section_key: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Build the contract table for one PhenoCycler donor.
+    """Build the contract table for one PhenoCycler section.
+
+    ``donor`` is the donor id the output is keyed by; ``section_key`` is the partition it is
+    *read* from, which for a lymph node is ``6539pln`` rather than ``6539``. They differ
+    because the core pipeline partitions by section and the contract partitions by
+    ``(donor, roi)`` — the same physical section, addressed two ways.
 
     ``tissue`` is declared by the caller because it is a property of the dataset being
     imported, not something recoverable from the cell table. It defaults to the tissue
@@ -147,18 +156,20 @@ def export_donor(
     from .tissues import for_roi, normalize
 
     tissue = normalize(tissue) if tissue else (for_roi(roi) or "pancreas")
-    broad = _read_first_parquet(cfg.broad_dir, donor)
+    donor = str(donor)
+    key = str(section_key) if section_key else donor
+    broad = _read_first_parquet(cfg.broad_dir, key)
     if broad is None:
         raise ExportError(
-            f"donor {donor}: no broad-lineage output under {cfg.broad_dir}/donor_id={donor}. "
+            f"section {key}: no broad-lineage output under {cfg.broad_dir}/donor_id={key}. "
             f"Run `python -m phenocycler.pipeline` (the 'lineage' stage) first."
         )
     broad["object_id"] = broad["object_id"].astype(str)
 
-    cells = _read_first_parquet(cfg.cells_dir, donor)
+    cells = _read_first_parquet(cfg.cells_dir, key)
     if cells is None:
         raise ExportError(
-            f"donor {donor}: no cell table under {cfg.cells_dir}/donor_id={donor}; "
+            f"section {key}: no cell table under {cfg.cells_dir}/donor_id={key}; "
             f"the 'cells' stage must run before integration (it carries the coordinates)"
         )
     cells["object_id"] = cells["object_id"].astype(str)
@@ -167,7 +178,7 @@ def export_donor(
     missing_coords = {"X_centroid", "Y_centroid"} - set(coord_cols)
     if missing_coords:
         raise ExportError(
-            f"donor {donor}: data/cells is missing {sorted(missing_coords)} — integration "
+            f"section {key}: data/cells is missing {sorted(missing_coords)} — integration "
             f"needs micron centroids, which build_cells_parquet writes from QuPath's "
             f"'Centroid X/Y um' columns"
         )
@@ -182,7 +193,7 @@ def export_donor(
 
     # RESTORE gates: main pass + the extra pass, merged the same way lineage.py does it.
     markers = markers or ALL_GATED_MARKERS
-    gated = _read_first_parquet(cfg.restore_gated_dir, donor)
+    gated = _read_first_parquet(cfg.restore_gated_dir, key)
     if gated is not None:
         gated["object_id"] = gated["object_id"].astype(str)
         keep = ["object_id"] + [f"{m}_{s}" for m in MAIN_MARKERS for s in ("pos", "norm")
@@ -190,7 +201,7 @@ def export_donor(
         df = df.merge(gated.loc[:, [c for c in keep if c in gated.columns]],
                       on="object_id", how="left")
 
-    extra = _read_first_parquet(cfg.restore_gated_extra_dir, donor)
+    extra = _read_first_parquet(cfg.restore_gated_extra_dir, key)
     if extra is not None:
         extra["object_id"] = extra["object_id"].astype(str)
         keep = ["object_id"] + [f"{m}_{s}" for m in EXTRA_MARKERS for s in ("pos", "norm")
@@ -249,7 +260,7 @@ def export_donor(
 
     n_missing = int(out["x_um"].isna().sum())
     if n_missing:
-        print(f"[export_pheno] donor {donor}: {n_missing:,} cells have no centroid "
+        print(f"[export_pheno] section {key}: {n_missing:,} cells have no centroid "
               f"(absent from data/cells) — dropped", flush=True)
         out = out[out["x_um"].notna()].reset_index(drop=True)
 
@@ -257,16 +268,20 @@ def export_donor(
                              tissue=tissue)
 
 
-def _export_and_write(donor: str, cfg: PipelineConfig, roi: str, tissue: str = "",
+def _export_and_write(section_key: str, cfg: PipelineConfig, tissue_by_roi: dict,
                       source_cfg: Optional[PipelineConfig] = None) -> dict:
-    """Read from ``source_cfg`` (the tissue's core-pipeline dir), write into ``cfg``."""
-    df = export_donor(donor, source_cfg or cfg, roi=roi, tissue=tissue)
-    path = partition_path(cfg.cells_pheno_dir, donor, roi)
+    """Export one section: read the ``section_key`` partition, write ``(donor, roi)``."""
+    sec = parse_section(section_key)
+    tissue = tissue_by_roi.get(sec.roi, "")
+    df = export_donor(sec.donor_id, source_cfg or cfg, roi=sec.roi, tissue=tissue,
+                      section_key=sec.key)
+    path = partition_path(cfg.cells_pheno_dir, sec.donor_id, sec.roi)
     write_cell_table(df, path)
     counts = df["lineage_common"].value_counts().to_dict()
-    print(f"[export_pheno] {donor} ({df['tissue'].iloc[0] if len(df) else '?'}): "
+    print(f"[export_pheno] {sec.key} -> {sec.donor_id}/{sec.roi} "
+          f"({df['tissue'].iloc[0] if len(df) else '?'}): "
           f"{len(df):,} cells -> {path.parent}", flush=True)
-    return {"donor_id": donor, "roi": roi,
+    return {"section_key": sec.key, "donor_id": sec.donor_id, "roi": sec.roi,
             "tissue": df["tissue"].iloc[0] if len(df) else "", "n_cells": len(df), **counts}
 
 
@@ -279,60 +294,83 @@ def run_export_pheno(
     tissues: Optional[list[str]] = None,
     n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Stage entry point: export every donor with a broad-lineage output, per tissue.
+    """Stage entry point: export every PhenoCycler **section** with a broad-lineage output.
 
-    The PhenoCycler side has no ROI dimension upstream. The core pipeline derives
-    ``donor_id`` as the first digit-run of the qptiff name, so donor 6539's pancreas image and
-    its lymph-node image both land in ``data/cells/donor_id=6539`` and are indistinguishable
-    once there. Each tissue therefore needs its own core-pipeline data dir, mapped by
-    ``[integration] pheno_tissue_dirs``.
+    Sections are discovered from the core pipeline's partitions, whose keys carry the region
+    the qptiff named — ``6539`` is donor 6539's pancreas, ``6539pln`` its lymph node. Each
+    becomes its own ``(donor, roi)`` partition in the contract. Nothing is inferred: a donor
+    contributes exactly the sections whose images exist, so a donor with no lymph-node scan
+    simply has no lymph-node row rather than an empty or duplicated one.
 
-    When two selected tissues resolve to the *same* directory this stage exports the first and
-    refuses the rest, loudly. Exporting one source under two ROIs would write a pancreas
-    section into the lymph-node partition — cells that are real, labelled correctly, and
-    attributed to the wrong organ, which every downstream comparison would take at face value.
+    ``[integration] pheno_tissue_dirs`` remains available for the case where a tissue was
+    processed through a *separate* core-pipeline run (a different QuPath export, hence a
+    different ``data_dir``). It is an override, not the normal path — with one run covering
+    both tissues, the section keys already separate them.
     """
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
     names = list(tissues) if tissues else ([normalize_tissue(tissue)] if tissue
                                            else cfg.tissue_list)
+    wanted_rois = {r for t in names for r in cfg.rois_for_tissue(t)}
     if roi:
-        names = [t for t in names if roi in cfg.rois_for_tissue(t)] or names[:1]
+        wanted_rois = {roi}
+    tissue_by_roi = {r: t for t in names for r in cfg.rois_for_tissue(t)}
+    keep_donors = {str(d) for d in donors} if donors else None
 
+    frames: list[dict] = []
     seen_sources: dict[str, str] = {}
-    frames = []
     for name in names:
         source = str(cfg.pheno_dir_for_tissue(name))
         if source in seen_sources:
-            print(f"[export_pheno] SKIPPING {name}: its PhenoCycler source resolves to the "
-                  f"same directory as {seen_sources[source]!r} ({source}).\n"
-                  f"    Exporting it anyway would copy {seen_sources[source]} cells into the "
-                  f"{name} partition and label them {name}.\n"
-                  f"    Fix: run the core pipeline once per tissue and map them with\n"
-                  f"      [integration] pheno_tissue_dirs = "
-                  f"{seen_sources[source]}=/path/to/{seen_sources[source]}/data,"
-                  f"{name}=/path/to/{name}/data", flush=True)
+            # Not an error any more: one core-pipeline run legitimately holds both tissues,
+            # and the section keys tell them apart. Skip so the shared directory is scanned
+            # once rather than once per tissue.
             continue
         seen_sources[source] = name
 
         local = replace(cfg, data_dir=Path(source))
-        found = donors or local.discover_donors(local.broad_dir)
-        if not found:
+        found = _sections_in(local, wanted_rois, keep_donors)
+        if not found and not frames:
             raise ExportError(
-                f"no donors found under {local.broad_dir} (tissue {name}). Run the core "
-                f"pipeline (`python -m phenocycler.pipeline`) through the 'lineage' stage "
-                f"first, or point [integration] pheno_tissue_dirs at the right data dir."
+                f"no PhenoCycler sections found under {local.broad_dir} for roi(s) "
+                f"{sorted(wanted_rois)}. Run the core pipeline "
+                f"(`python -m phenocycler.pipeline`) through the 'lineage' stage first. If "
+                f"it has run, check that the qptiff names carry the region "
+                f"(e.g. '6539pLN_Scan1.er.qptiff') — see phenocycler/sections.py."
             )
-        target_roi = roi or (cfg.rois_for_tissue(name) or [""])[0]
+        if found:
+            print(f"[export_pheno] {describe_sections(found)}", flush=True)
         rows = map_donors(partial(_export_and_write, cfg=cfg, source_cfg=local,
-                                  roi=target_roi, tissue=name),
+                                  tissue_by_roi=tissue_by_roi),
                           found, n_jobs=n_jobs, ordered=True)
         frames.extend(r for r in rows if r)
 
     out = pd.DataFrame(frames).fillna(0)
     if len(out):
         print(f"\n[export_pheno] {len(out)} section(s) across "
-              f"{out['tissue'].nunique()} tissue(s), "
-              f"{int(out['n_cells'].sum()):,} cells total", flush=True)
+              f"{out['donor_id'].nunique()} donor(s) and {out['tissue'].nunique()} "
+              f"tissue(s), {int(out['n_cells'].sum()):,} cells total", flush=True)
+    return out
+
+
+def _sections_in(cfg: PipelineConfig, wanted_rois: set, keep_donors: Optional[set]) -> list[str]:
+    """Section keys under ``cfg.broad_dir`` that match the ROI/donor selection.
+
+    An unparseable key is reported and skipped rather than exported under a guessed ROI —
+    the point of the section key is that an unrecognised region must not silently become a
+    pancreas.
+    """
+    out = []
+    for key in cfg.discover_sections(cfg.broad_dir):
+        try:
+            sec = parse_section(key)
+        except SectionError as exc:
+            print(f"[export_pheno] SKIPPING partition {key!r}: {exc}", flush=True)
+            continue
+        if wanted_rois and sec.roi not in wanted_rois:
+            continue
+        if keep_donors and sec.donor_id not in keep_donors:
+            continue
+        out.append(sec.key)
     return out
 
 

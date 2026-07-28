@@ -110,3 +110,34 @@ def test_redsea_params_from_config_preserves_defaults():
     assert p.alpha == 1.0
     assert p.edge_radius == 0          # 1-px band
     assert p.gap_bridge == 1
+
+
+def test_donor_image_rejects_a_partition_holding_two_sections(tmp_path):
+    """One partition must be one section, and this is where that gets enforced.
+
+    `donor_image` picks the GeoJSON used to mask every cell in a partition. If two images
+    ever share a partition — the exact failure the section key exists to prevent — taking
+    `.iloc[0]` would mask one section's cells with the other section's polygons: most would
+    fall outside every polygon and be silently zeroed, and any that landed inside would get a
+    neighbouring section's spillover correction. No stage downstream would report anything,
+    so the guard belongs at the read.
+    """
+    import pandas as pd
+    import pytest
+
+    from phenocycler import load_config
+
+    cfg = load_config()
+    cfg.data_dir = tmp_path
+    part = cfg.cells_dir / "donor_id=6539"
+    part.mkdir(parents=True)
+
+    one = pd.DataFrame({"image": ["6539_Scan1.er.qptiff - resolution #1"] * 3})
+    one.to_parquet(part / "data_0.parquet", index=False)
+    assert redsea.donor_image(cfg, "6539").startswith("6539_Scan1")
+
+    mixed = pd.DataFrame({"image": ["6539_Scan1.er.qptiff - resolution #1",
+                                    "6539pLN_Scan1.er.qptiff - resolution #1"]})
+    mixed.to_parquet(part / "data_0.parquet", index=False)
+    with pytest.raises(SystemExit, match="contains 2 images"):
+        redsea.donor_image(cfg, "6539")

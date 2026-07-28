@@ -51,6 +51,10 @@ from typing import Optional
 import pandas as pd
 
 from ..config import PipelineConfig, load_config
+from ..sections import SectionError
+from ..sections import key_for as section_key_for
+from ..sections import key_from_image
+from ..sections import parse as parse_section
 from .contract import normalize_donor_id
 from .tissues import for_roi as tissue_for_roi
 
@@ -280,28 +284,56 @@ def read_donor_metadata(cfg: PipelineConfig) -> pd.DataFrame:
     return out.drop_duplicates(subset="donor_id").reset_index(drop=True)
 
 
-def _pheno_paths(cfg: PipelineConfig, donor_id: str) -> tuple[str, str]:
-    """Best-effort ``(qptiff, geojson)`` for a PhenoCycler donor.
+def _pheno_paths(cfg: PipelineConfig, donor_id: str, roi: str = PAIRABLE_ROI) -> tuple[str, str]:
+    """Best-effort ``(qptiff, geojson)`` for one PhenoCycler **section**.
 
     Both are looked up rather than constructed: REDSEA rebuilds the GeoJSON tag from the
-    donor's ``image`` column and the upstream data README warns not to rename those files,
+    section's ``image`` column and the upstream data README warns not to rename those files,
     so a glob is safer than a guess. Empty strings when the raw inputs are not mounted —
     the tabular stages do not need them and must not fail without them.
-    """
-    qptiff = ""
-    images_dir = Path(cfg.images_dir)
-    if images_dir.exists():
-        hits = sorted(images_dir.glob(f"{donor_id}*.qptiff"))
-        if hits:
-            qptiff = str(hits[0])
 
-    geojson = ""
+    Matching is on the *section key* rather than a `{donor}*` prefix. A prefix glob returns
+    both of a donor's images — ``6539_Scan1`` and ``6539pLN_Scan1`` — and taking the first
+    would hand the lymph-node row a pancreas qptiff, which REDSEA would then mask with the
+    wrong polygons.
+    """
+    want = section_key_for(donor_id, roi)
+
+    def _match(paths, strip) -> str:
+        for p in sorted(paths):
+            name = p.name[len(strip):] if strip and p.name.startswith(strip) else p.name
+            if key_from_image(name) == want:
+                return str(p)
+        return ""
+
+    images_dir = Path(cfg.images_dir)
+    qptiff = _match(images_dir.glob(f"{donor_id}*.qptiff"), "") if images_dir.exists() else ""
+
     gdir = Path(cfg.geojson_dir)
-    if gdir.exists():
-        hits = sorted(gdir.glob(f"cells__{donor_id}*.geojson"))
-        if hits:
-            geojson = str(hits[0])
+    geojson = (_match(gdir.glob(f"cells__{donor_id}*.geojson"), "cells__")
+               if gdir.exists() else "")
     return qptiff, geojson
+
+
+def _discover_pheno_sections(cfg: PipelineConfig,
+                             summary: "ManifestSummary") -> Optional[set[tuple[str, str]]]:
+    """``{(donor_id, roi)}`` from the core pipeline's partitions, or ``None`` if absent.
+
+    ``None`` means "nothing exported yet" and is distinct from an empty set: the manifest
+    still builds a Xenium-shaped picture rather than claiming every donor is unpaired.
+    """
+    keys = cfg.discover_sections()
+    if not keys:
+        return None
+    out: set[tuple[str, str]] = set()
+    for key in keys:
+        try:
+            sec = parse_section(key)
+        except SectionError as exc:
+            summary.warnings.append(f"PhenoCycler partition {key!r} skipped: {exc}")
+            continue
+        out.add((sec.donor_id, sec.roi))
+    return out
 
 
 def _rewrite_root(path: str, xenium_root: str) -> str:
@@ -324,6 +356,7 @@ def build_manifest(
     cfg: PipelineConfig,
     *,
     pheno_donors: Optional[list[str]] = None,
+    pheno_sections: Optional[list[tuple[str, str]]] = None,
     xenium_processed_root: Optional[Path] = None,
 ) -> tuple[pd.DataFrame, ManifestSummary]:
     """Build the pairing manifest.
@@ -334,8 +367,15 @@ def build_manifest(
         Resolved pipeline config (supplies both CSV paths, the donor workbook and
         ``xenium_root``).
     pheno_donors
-        Override the PhenoCycler donor list; defaults to ``cfg.discover_donors()``, i.e.
-        whatever ``data/cells/donor_id=*`` contains.
+        Override the PhenoCycler donor list. Pairing then falls back to "this donor has
+        PhenoCycler data, so every ROI of a known tissue is pairable" — the best that can be
+        said without knowing which sections exist.
+    pheno_sections
+        Override the PhenoCycler ``(donor_id, roi)`` list. This is the precise form and the
+        default: sections are discovered from ``data/cells/donor_id=*``, whose keys carry the
+        region (``6539`` pancreas, ``6539pln`` lymph node). With it, a donor whose lymph node
+        was never scanned is ``xenium_only`` for that ROI instead of being reported as a
+        pairing that does not exist.
     xenium_processed_root
         Where ``{sample}/{sample}_phenotyped.h5ad`` and ``{sample}.zarr`` live, if mounted.
         Used only to fill the ``xenium_h5ad`` / ``xenium_zarr`` columns.
@@ -346,9 +386,22 @@ def build_manifest(
     """
     summary = ManifestSummary()
 
-    donors = (list(pheno_donors) if pheno_donors is not None
-              else cfg.discover_donors())
-    pheno_set = {normalize_donor_id(d) for d in donors if normalize_donor_id(d)}
+    # `pheno_pairs` is the precise statement (which sections exist); `pheno_set` is the
+    # fallback (which donors exist). `pheno_pairs is None` means "sections unknown — pair on
+    # the donor and the ROI's tissue", which is what an explicit `pheno_donors` list implies.
+    pheno_pairs: Optional[set[tuple[str, str]]] = None
+    if pheno_sections is not None:
+        pheno_pairs = {(normalize_donor_id(d), str(r)) for d, r in pheno_sections}
+        pheno_set = {d for d, _ in pheno_pairs if d}
+    elif pheno_donors is not None:
+        pheno_set = {normalize_donor_id(d) for d in pheno_donors if normalize_donor_id(d)}
+    else:
+        discovered = _discover_pheno_sections(cfg, summary)
+        if discovered is None:
+            pheno_set = set()
+        else:
+            pheno_pairs = discovered
+            pheno_set = {d for d, _ in pheno_pairs if d}
 
     xen = read_xenium_paths(cfg.xenium_paths_csv)
     overrides = read_donor_overrides(cfg.donor_overrides_csv)
@@ -446,8 +499,10 @@ def build_manifest(
                 images.append("")
                 geojsons.append("")
                 continue
-            if donor in pheno_set and tissue_for_roi(roi):
-                q, g = _pheno_paths(cfg, donor)
+            paired = ((donor, roi) in pheno_pairs if pheno_pairs is not None
+                      else (donor in pheno_set and bool(tissue_for_roi(roi))))
+            if paired:
+                q, g = _pheno_paths(cfg, donor, roi)
                 statuses.append(PAIRED)
                 images.append(q)
                 geojsons.append(g)
@@ -459,15 +514,22 @@ def build_manifest(
         df["pheno_image"] = images
         df["pheno_geojson"] = geojsons
 
-    # PhenoCycler donors with no Xenium run at all get their own rows, so the manifest is a
-    # complete picture of the cohort rather than a Xenium-shaped view of it.
-    # PhenoCycler donors with no Xenium run at all. Recorded against the pancreas ROI as the
-    # cohort's primary tissue; a pheno-only lymph node would appear here too if one existed.
-    for donor in sorted(pheno_set - xen_donors):
-        q, g = _pheno_paths(cfg, donor)
+    # PhenoCycler sections with no Xenium counterpart get their own rows, so the manifest is a
+    # complete picture of the cohort rather than a Xenium-shaped view of it. With sections
+    # known, this is exact: a donor whose pancreas paired but whose lymph node has no Xenium
+    # run gets one `pheno_only` lymph-node row, rather than the whole donor being counted
+    # either way on the strength of its pancreas.
+    have = {(str(r["donor_id"]), str(r["roi"])) for _, r in df.iterrows()} if len(df) else set()
+    if pheno_pairs is not None:
+        orphans = sorted(p for p in pheno_pairs if p not in have and p[0])
+    else:
+        orphans = [(d, PAIRABLE_ROI) for d in sorted(pheno_set - xen_donors)]
+
+    for donor, roi in orphans:
+        q, g = _pheno_paths(cfg, donor, roi)
         df = pd.concat([df, pd.DataFrame([{
             "donor_id": donor,
-            "roi": PAIRABLE_ROI,
+            "roi": roi,
             "disease_status": status_by_donor.get(donor, ""),
             "pair_status": PHENO_ONLY,
             "pheno_image": q,
@@ -480,7 +542,7 @@ def build_manifest(
             "xenium_h5ad": "",
             "section_gap_um": "",
             "block_id": "",
-            "tissue": tissue_for_roi(PAIRABLE_ROI),
+            "tissue": tissue_for_roi(roi),
         }])], ignore_index=True)
 
     if len(df):

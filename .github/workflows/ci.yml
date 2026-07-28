@@ -96,7 +96,10 @@ jobs:
           "
       - name: Core tests
         # Deselect the integration suite: it needs the extra, which the next job covers.
-        run: pytest tests/ -q --ignore-glob='tests/test_integration_*.py'
+        # -rs reports skips. Some core tests guard on an optional import (the section-key
+        # SQL/Python equivalence check needs duckdb), and a silently skipped test reads
+        # exactly like a passing one in the summary line.
+        run: pytest tests/ -q -rs --ignore-glob='tests/test_integration_*.py'
 
   test-integration:
     name: Integration tests

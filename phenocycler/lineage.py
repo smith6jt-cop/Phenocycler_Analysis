@@ -177,7 +177,7 @@ def run_lineage(cfg: PipelineConfig, *, donors=None, n_jobs=None) -> pd.DataFram
     """Assign broad lineage for all donors (parallel), write partitions + composition figure."""
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
     cfg.broad_dir.mkdir(parents=True, exist_ok=True)
-    donor_ids = donors or cfg.discover_donors(cfg.restore_gated_dir)
+    donor_ids = donors or cfg.discover_sections(cfg.restore_gated_dir)
     if not donor_ids:
         raise SystemExit(f"[err] no gated donors under {cfg.restore_gated_dir}")
 

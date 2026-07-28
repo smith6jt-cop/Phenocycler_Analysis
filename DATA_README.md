@@ -31,11 +31,23 @@ The `<image>` tag in the GeoJSON filename is the QuPath image name with
 `cells__6539_Scan1.er.qptiff_-_resolution__1.geojson`). `phenocycler.redsea`
 reconstructs exactly this tag from each donor's `image` column, so do not rename.
 
-## Outputs (hive-partitioned by donor)
+## Outputs (hive-partitioned by section)
+
+`donor_id=<key>` is a **section** key, not a bare donor id: the donor's digits plus the
+region token its qptiff carries, lowercased. A donor with two images gets two partitions.
+
+| image | partition |
+|---|---|
+| `6539_Scan1.er.qptiff` | `donor_id=6539` (pancreas) |
+| `6539pLN_Scan1.er.qptiff` | `donor_id=6539pln` (pancreatic lymph node) |
+
+One partition is one image throughout: one GeoJSON, one RESTORE threshold set, one coordinate
+frame. `phenocycler/sections.py` defines the key and `cfg.discover_sections()` iterates them;
+`cfg.discover_donors()` returns the unique donors behind them.
 
 ```
 data/
-├── cells/donor_id=<id>/*.parquet                 # Step 1: raw MFI + morphology + region
+├── cells/donor_id=<key>/*.parquet                # Step 1: raw MFI + morphology + region
 ├── cells_redsea/donor_id=<id>/data_0.parquet     # Step 2: REDSEA spillover-corrected means
 ├── restore_redsea/                               # Step 3: threshs.pkl, positive_fractions.csv, qc/
 ├── restore_thresholds_redsea.csv                 # Step 3: per-image KMeans/GMM/SSC thresholds (chosen flag)

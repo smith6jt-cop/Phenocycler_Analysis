@@ -72,7 +72,7 @@ def run_hormone_floor(cfg: PipelineConfig, *, gated_dir=None, out_dir=None, mark
     markers = list(markers) if markers else list(HORMONE_MARKERS)
     min_norm = cfg.hormone_min_norm if min_norm is None else float(min_norm)
     n_jobs = cfg.n_jobs if n_jobs is None else n_jobs
-    donor_ids = donors or cfg.discover_donors(gated_dir)
+    donor_ids = donors or cfg.discover_sections(gated_dir)
     if not donor_ids:
         raise SystemExit(f"[err] no gated donors under {gated_dir}")
 

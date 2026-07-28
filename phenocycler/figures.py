@@ -72,7 +72,7 @@ def run_figures(cfg: PipelineConfig, *, donors=None) -> dict:
     per-lineage sums. Returns the two output PNG paths. ``donors`` restricts the run to a subset
     (defaults to every donor discovered under ``cfg.broad_dir``).
     """
-    donors = list(donors) if donors else cfg.discover_donors(cfg.broad_dir)
+    donors = list(donors) if donors else cfg.discover_sections(cfg.broad_dir)
     if not donors:
         raise SystemExit(f"no Step-1 output found under {cfg.broad_dir} — run "
                          f"assign_broad_lineage (phenocycler.lineage) first")

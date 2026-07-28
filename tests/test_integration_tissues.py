@@ -312,35 +312,61 @@ def test_run_donor_keeps_both_sections_of_a_donor(cfg, tmp_path):
 # PhenoCycler source resolution
 # --------------------------------------------------------------------------- #
 
-def test_pheno_source_is_resolved_per_tissue(cfg, tmp_path):
-    """The core pipeline derives donor_id as the first digit-run of the qptiff name, so a
-    donor's pancreas and lymph-node images land in the same partition. Each tissue needs its
-    own core-pipeline data dir."""
+def test_pheno_source_override_is_still_available(cfg, tmp_path):
+    """`pheno_tissue_dirs` survives as an override for a tissue processed through a separate
+    core-pipeline run (a different QuPath export). It is no longer the normal path: section
+    keys separate the tissues within one run."""
     local = load_config()
     local.pheno_tissue_dirs = (f"pancreas={tmp_path/'panc'},"
                                f"pancreatic_lymph_node={tmp_path/'pln'}")
     assert local.pheno_dir_for_tissue(T.PANCREAS) == tmp_path / "panc"
     assert local.pheno_dir_for_tissue(T.LYMPH_NODE) == tmp_path / "pln"
-    # Unmapped tissues fall back to the shared data dir.
+    # Unmapped tissues fall back to the shared data dir, which is the default and is correct.
     local.pheno_tissue_dirs = f"pancreas={tmp_path/'panc'}"
     assert local.pheno_dir_for_tissue(T.LYMPH_NODE) == local.data_dir
 
 
-def test_export_refuses_to_duplicate_one_source_across_two_tissues(cfg, tmp_path, capsys):
-    """The failure this prevents is the worst kind: real cells, correctly labelled, attributed
-    to the wrong organ — which every downstream comparison would take at face value.
+def test_one_source_dir_yields_both_tissues(cfg, tmp_path):
+    """The whole point of the section key: one core-pipeline run covers both tissues.
 
-    With no per-tissue mapping both tissues resolve to one directory, so the second must be
-    skipped with an actionable message rather than exported as a copy of the first.
+    Previously `6539` and `6539pLN` collided in `donor_id=6539`, and the workaround was a
+    separate data dir per tissue. Now the partitions are distinct, so a single directory
+    exports a pancreas section *and* a lymph-node section for the same donor — each read
+    from its own partition and written to its own `(donor, roi)`.
     """
-    from phenocycler.integration.export_pheno import ExportError, run_export_pheno
+    from phenocycler.integration.export_pheno import _sections_in
 
     local = load_config()
-    local.data_dir = tmp_path                  # empty: the first tissue raises, which is fine
-    assert (local.pheno_dir_for_tissue(T.PANCREAS)
-            == local.pheno_dir_for_tissue(T.LYMPH_NODE)), "precondition: one shared source"
-    with pytest.raises(ExportError, match="no donors found"):
-        run_export_pheno(local, tissues=[T.PANCREAS, T.LYMPH_NODE])
+    local.data_dir = tmp_path
+    for key in ("6539", "6539pln", "6414"):
+        (local.broad_dir / f"donor_id={key}").mkdir(parents=True, exist_ok=True)
+
+    both = _sections_in(local, wanted_rois={"panc", "pln_1"}, keep_donors=None)
+    assert sorted(both) == ["6414", "6539", "6539pln"]
+
+    # And each tissue can still be selected on its own, from the same directory.
+    assert sorted(_sections_in(local, {"panc"}, None)) == ["6414", "6539"]
+    assert sorted(_sections_in(local, {"pln_1"}, None)) == ["6539pln"]
+    assert sorted(_sections_in(local, {"panc", "pln_1"}, {"6539"})) == ["6539", "6539pln"]
+
+
+def test_unparseable_partition_is_skipped_not_guessed(cfg, tmp_path, capsys):
+    """An unknown region token must not be exported as a pancreas.
+
+    Folding `6539spleen` into the pancreas would put a third tissue's cells into pancreatic
+    composition and islet statistics with no error — the failure the section key exists to
+    prevent, reintroduced one level up.
+    """
+    from phenocycler.integration.export_pheno import _sections_in
+
+    local = load_config()
+    local.data_dir = tmp_path
+    for key in ("6539", "6539spleen"):
+        (local.broad_dir / f"donor_id={key}").mkdir(parents=True, exist_ok=True)
+
+    found = _sections_in(local, wanted_rois={"panc"}, keep_donors=None)
+    assert found == ["6539"], "the unknown region must not be exported at all"
+    assert "6539spleen" in capsys.readouterr().out, "and the skip must be announced"
 
 
 # --------------------------------------------------------------------------- #

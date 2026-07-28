@@ -89,7 +89,7 @@ def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
 
     def _redsea():
         params = redsea.RedseaParams.from_config(cfg)
-        redsea.run_redsea(cfg, cfg.discover_donors(), params, n_jobs=cfg.n_jobs)
+        redsea.run_redsea(cfg, cfg.discover_sections(), params, n_jobs=cfg.n_jobs)
 
     def _restore():
         restore.run_restore(cfg)
