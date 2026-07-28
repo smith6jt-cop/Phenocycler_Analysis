@@ -102,11 +102,32 @@ class RedseaParams:
 
 # --------------------------------------------------------------------------- discovery
 def donor_image(cfg: PipelineConfig, donor: str) -> str:
-    """The QuPath image string for this donor (from the cells parquet)."""
-    f = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
-    if not f:
+    """The QuPath image string for this section (from the cells parquet).
+
+    Asserts the partition holds exactly one image. Every partition is one section — one
+    qptiff, one GeoJSON, one coordinate frame — and this function's result picks the mask
+    that gets applied to every cell in it. If two images ever share a partition, taking
+    ``.iloc[0]`` would mask one section's cells with the other's polygons: most cells would
+    fall outside every polygon and be silently zeroed, and the ones that did land inside
+    would get a neighbouring section's spillover correction. Nothing downstream would
+    report an error, so the check belongs here.
+    """
+    files = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
+    if not files:
         raise SystemExit(f"[err] no {cfg.cells_dir}/donor_id={donor}")
-    return str(pd.read_parquet(f[0], columns=["image"]).image.iloc[0])
+
+    images: set[str] = set()
+    for f in files:
+        images.update(pd.read_parquet(f, columns=["image"]).image.astype(str).unique())
+    if len(images) > 1:
+        raise SystemExit(
+            f"[err] partition donor_id={donor} contains {len(images)} images: "
+            f"{sorted(images)}\n"
+            f"      One partition must be one section. This usually means the section key "
+            f"did not separate two images of the same donor (e.g. a pancreas and a lymph "
+            f"node) — check phenocycler/sections.py against your qptiff names and rebuild "
+            f"the cells parquet.")
+    return str(next(iter(images)))
 
 
 def resolve_paths(cfg: PipelineConfig, donor: str):
@@ -637,7 +658,7 @@ def main(argv=None):
                                       gate_kappa=a.gate_kappa, **over)
 
     if a.all:
-        donors = cfg.discover_donors()
+        donors = cfg.discover_sections()
     elif a.donor:
         donors = [a.donor]
     else:

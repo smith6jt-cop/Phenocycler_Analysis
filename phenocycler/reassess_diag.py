@@ -398,7 +398,7 @@ def run_reassess_diag(cfg: PipelineConfig, *, donors=None, figure=True, out_dir=
     (when `figure`) the two diagnostic PNGs under `out_dir` (default ``cfg.redsea_reassess_dir``). Modifies no
     pipeline data. Returns the four computed frames ``(obj, gr, rvf, fb)``.
     """
-    donor_ids = donors or cfg.discover_donors(cfg.restore_gated_dir)
+    donor_ids = donors or cfg.discover_sections(cfg.restore_gated_dir)
     out = Path(out_dir) if out_dir is not None else cfg.redsea_reassess_dir
     out.mkdir(parents=True, exist_ok=True)
     obj, gr, rvf, fb = compute_all(donor_ids, cfg)

@@ -10,8 +10,16 @@ instead of hardcoded ``~/IO60panc2nd`` paths.
 
 Input  : <cells_csv>                     (the full QuPath ``Cellmeasurements.csv``,
                                            ~23.3M cells, ~1,228 cols, ~138 GB)
-Output : <data_dir>/cells/donor_id=<id>/*.parquet   (~65 cols: identity, spatial,
+Output : <data_dir>/cells/donor_id=<key>/*.parquet   (~65 cols: identity, spatial,
          morphology, region, and the whole-cell marker means)
+
+``<key>`` is a **section** key, not a bare donor id — ``6539`` for a donor's pancreas and
+``6539pln`` for its lymph node, derived from the qptiff name by
+:data:`phenocycler.sections.SECTION_KEY_SQL`. One partition is one image throughout this
+pipeline: REDSEA masks a partition with a single GeoJSON, RESTORE fits one threshold set per
+partition, and micron coordinates are measured from one slide origin. Keying on the donor
+alone put a donor's two images in one partition, which is not a labelling nuisance but a
+silent correctness failure — see ``phenocycler/sections.py`` for the full argument.
 
 Region scheme: Parent ``Islet_N`` = core, ``Islet_N_exp20um`` = peri,
 ``Annotation (Tissue)`` / ``Root object`` = tissue, else other.
@@ -33,6 +41,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import PipelineConfig, load_config
+from .sections import SECTION_KEY_SQL
 
 
 def header_cols(csv_path: Path) -> list[str]:
@@ -61,7 +70,10 @@ def build_sql(csv_path: Path, out_dir: Path, limit: Optional[int],
     if not mm:
         raise SystemExit("No 'Cell: <marker>: Mean' columns found — check the CSV header.")
     selects = [
-        "regexp_extract(\"Image\", '[0-9]+') AS donor_id",  # first digit-run: '6374...'->6374
+        # Section key, not donor id: '6539_Scan1...' -> 6539, '6539pLN_Scan1...' -> 6539pln.
+        # The column keeps the name `donor_id` because it is the hive partition key every
+        # downstream stage already globs; `phenocycler.sections.parse` takes it apart.
+        f"{SECTION_KEY_SQL} AS donor_id",
         '"Image" AS image',
         '"Object ID" AS object_id',
         "TRY_CAST(\"Centroid X µm\" AS DOUBLE) AS X_centroid",

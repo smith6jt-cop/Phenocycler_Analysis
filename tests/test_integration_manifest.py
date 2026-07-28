@@ -168,6 +168,59 @@ def test_paired_rows_selects_by_tissue_or_roi(tmp_path):
     assert paired_rows(df, roi="panc", tissue="pancreatic_lymph_node")["roi"].tolist() == ["panc"]
 
 
+def test_pairing_is_exact_when_pheno_sections_are_known(tmp_path):
+    """Knowing which PhenoCycler sections exist turns pairing from an assumption into a fact.
+
+    Donor 6539 has both scans; 6414 has only a pancreas. Pairing on the donor alone would
+    report 6414's lymph node as paired on the strength of its pancreas — a pairing that does
+    not exist, which registration would then fail on for no discoverable reason.
+    """
+    rows = [
+        {"donor_id": "6539", "roi": "panc", "batch": "b",
+         "source_path": BUNDLE.format(label="Panc")},
+        {"donor_id": "6539", "roi": "pln_1", "batch": "b",
+         "source_path": BUNDLE.format(label="pLN").replace("0059865", "0011111")},
+        {"donor_id": "6414", "roi": "panc", "batch": "b",
+         "source_path": BUNDLE.format(label="Panc").replace("0059865", "0022222")},
+        {"donor_id": "6414", "roi": "pln_1", "batch": "b",
+         "source_path": BUNDLE.format(label="pLN").replace("0059865", "0033333")},
+    ]
+    cfg = _cfg(tmp_path, rows)
+    df, _ = build_manifest(cfg, pheno_sections=[("6539", "panc"), ("6539", "pln_1"),
+                                                ("6414", "panc")])
+    status = {(r["donor_id"], r["roi"]): r["pair_status"] for _, r in df.iterrows()}
+    assert status[("6539", "panc")] == PAIRED
+    assert status[("6539", "pln_1")] == PAIRED
+    assert status[("6414", "panc")] == PAIRED
+    assert status[("6414", "pln_1")] == XENIUM_ONLY, "6414's lymph node was never scanned"
+
+
+def test_pheno_section_without_a_xenium_run_is_pheno_only_per_section(tmp_path):
+    """A donor can pair on one tissue and be pheno-only on the other. Recording that per
+    donor would lose the distinction entirely."""
+    rows = [{"donor_id": "6539", "roi": "panc", "batch": "b",
+             "source_path": BUNDLE.format(label="Panc")}]
+    cfg = _cfg(tmp_path, rows)
+    df, summary = build_manifest(cfg, pheno_sections=[("6539", "panc"), ("6539", "pln_1")])
+    status = {(r["donor_id"], r["roi"]): r["pair_status"] for _, r in df.iterrows()}
+    assert status[("6539", "panc")] == PAIRED
+    assert status[("6539", "pln_1")] == PHENO_ONLY
+    assert summary.paired_donors == ["6539"]
+
+
+def test_donor_list_without_sections_still_pairs_on_tissue(tmp_path):
+    """The fallback path: given only a donor list, every ROI of a known tissue is pairable.
+
+    That is the most that can be said without section information, and it stays available so
+    a caller with no exported partitions (or a test) is not forced to invent them.
+    """
+    rows = [{"donor_id": "6539", "roi": "pln_1", "batch": "b",
+             "source_path": BUNDLE.format(label="pLN")}]
+    cfg = _cfg(tmp_path, rows)
+    df, _ = build_manifest(cfg, pheno_donors=["6539"])
+    assert df.iloc[0]["pair_status"] == PAIRED
+
+
 def test_unmapped_xenium_sample_is_surfaced_not_dropped(tmp_path):
     """0041323 / 0041326 have processed h5ads but appear in no manifest and carry no donor.
 

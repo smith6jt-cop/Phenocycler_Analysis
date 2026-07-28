@@ -359,10 +359,39 @@ class PipelineConfig:
         return out
 
     # ---- helpers -----------------------------------------------------------
-    def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
-        """Donor ids by globbing ``<dir>/donor_id=*`` (defaults to cells_dir)."""
+    def discover_sections(self, from_dir: Optional[Path] = None) -> list[str]:
+        """Section keys by globbing ``<dir>/donor_id=*`` (defaults to cells_dir).
+
+        This is the pipeline's **work unit**: one key is one image, one GeoJSON, one
+        RESTORE threshold set, one coordinate frame. A donor with a pancreas and a lymph
+        node contributes two — ``6539`` and ``6539pln``.
+        """
         base = Path(from_dir) if from_dir is not None else self.cells_dir
         return sorted(p.name.split("=", 1)[1] for p in base.glob("donor_id=*"))
+
+    def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
+        """Unique **donor ids** behind the discovered sections.
+
+        Distinct from :meth:`discover_sections` on purpose. Stages that process images want
+        sections; the pairing manifest and the donor workbook join want donors. Conflating
+        them is how ``6539pln`` becomes a phantom donor with no metadata and no Xenium
+        counterpart, which then shows up in the manifest as a real pairing gap.
+        """
+        from .sections import parse
+
+        out = set()
+        for key in self.discover_sections(from_dir):
+            try:
+                out.add(parse(key).donor_id)
+            except Exception:  # noqa: BLE001 - an unparseable key is surfaced by the stage
+                out.add(key)
+        return sorted(out)
+
+    def discover_section_objects(self, from_dir: Optional[Path] = None) -> list:
+        """:class:`phenocycler.sections.Section` for every discovered partition."""
+        from .sections import parse
+
+        return [parse(k) for k in self.discover_sections(from_dir)]
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.geojson_dir, self.mask_dir, self.inter_dir):
