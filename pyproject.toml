@@ -30,6 +30,11 @@ dependencies = [
     "imagecodecs",
     "duckdb",
     "openpyxl",
+    # phenocycler/restore.py imports tqdm at module load to build the headless stubs the
+    # vendored RESTORE needs. It was only ever declared in environment.yml, so the conda env
+    # masked the omission and `pip install -e .` produced an installation that could not run
+    # the RESTORE stage. CI caught this on its first run.
+    "tqdm",
 ]
 
 [project.optional-dependencies]

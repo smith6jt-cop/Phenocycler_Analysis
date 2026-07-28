@@ -62,6 +62,22 @@ def cfg():
     return load_config()
 
 
+def _require_taxonomy(cfg) -> None:
+    """Skip when the XeniumPanelExplorer submodule is not checked out.
+
+    That submodule is a **private** repository, so CI running with the default
+    repo-scoped GITHUB_TOKEN cannot clone it. Anything that resolves protein<->gene anchors
+    goes through it, so those tests skip rather than fail — a missing private submodule is an
+    environment limitation, not a defect in the code under test.
+    """
+    from phenocycler.integration.vocab import VocabError, load_panel_taxonomy
+
+    try:
+        load_panel_taxonomy(cfg)
+    except (VocabError, FileNotFoundError) as exc:
+        pytest.skip(f"XeniumPanelExplorer submodule unavailable: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # Anchors
 # --------------------------------------------------------------------------- #
@@ -102,6 +118,7 @@ def test_anchor_requires_presence_in_both_tables(cfg):
 
 def test_linking_refuses_below_the_minimum_anchor_count(tmp_path, cfg):
     """Three genes cannot support a shared embedding, and the failure must be loud."""
+    _require_taxonomy(cfg)
     p, x = _paired_tables(n_markers=3)
     thin = load_config(data_dir=tmp_path, crossmodal_min_anchors=8)
 

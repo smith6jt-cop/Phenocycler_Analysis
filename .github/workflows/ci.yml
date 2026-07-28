@@ -105,9 +105,30 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # The vocabulary crosswalk is derived from the pinned XeniumPanelExplorer
-          # submodule, so the tests that assert crosswalk totality need it checked out.
-          submodules: recursive
+          # NOT `submodules: recursive`. external/XeniumPanelExplorer is a PRIVATE repo, and
+          # the default GITHUB_TOKEN is scoped to this repository only — so a recursive
+          # checkout aborts the whole job on "Repository not found" before anything runs.
+          # Submodules are initialised in the next step, tolerantly.
+          submodules: false
+
+      - name: Initialise submodules (XeniumPanelExplorer is private; tolerate failure)
+        run: |
+          # RESTORE is public and must succeed.
+          git submodule update --init --depth 1 external/RESTORE
+
+          # XeniumPanelExplorer is private. With SUBMODULE_TOKEN set (a PAT with read access
+          # to it) the crosswalk tests run for real; without it they skip, and the rest of
+          # the suite still provides signal. Skipping is the honest outcome — pretending to
+          # test a taxonomy we could not fetch would be worse than reporting the gap.
+          if [ -n "${{ secrets.SUBMODULE_TOKEN }}" ]; then
+            git config --global url."https://x-access-token:${{ secrets.SUBMODULE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+            git submodule update --init --depth 1 external/XeniumPanelExplorer \
+              || echo "::warning::XeniumPanelExplorer checkout failed even with SUBMODULE_TOKEN"
+          else
+            git submodule update --init --depth 1 external/XeniumPanelExplorer \
+              || echo "::notice::XeniumPanelExplorer is private and no SUBMODULE_TOKEN secret is set — vocabulary-crosswalk tests will skip"
+          fi
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -116,8 +137,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e '.[integration,test]'
+
       - name: Full suite
-        run: pytest tests/ -q
+        # -rs lists skip reasons, so a job that quietly stopped exercising the crosswalk is
+        # visible in the log rather than looking identical to a full pass.
+        run: pytest tests/ -q -rs
+
+      - name: Report crosswalk coverage
+        if: always()
+        run: |
+          if [ -f external/XeniumPanelExplorer/data/panel_roles.csv ]; then
+            echo "::notice::vocabulary crosswalk tests ran against the pinned panel taxonomy"
+          else
+            echo "::warning::vocabulary crosswalk tests SKIPPED — external/XeniumPanelExplorer (private) was not available. Set a SUBMODULE_TOKEN secret to cover them."
+          fi
+
       - name: Stage tables render without any data
         run: |
           python -m phenocycler.pipeline --status
