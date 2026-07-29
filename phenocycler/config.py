@@ -277,6 +277,16 @@ class PipelineConfig:
         return self.integration_dir / "cells_pheno"
 
     @property
+    def cells_pheno_xif_dir(self) -> Path:
+        """Contract tables for PhenoCycler images OF THE XENIUM SECTION (post-Xenium re-stain).
+
+        Kept apart from `cells_pheno_dir` because they share a (donor, roi) but are a
+        different piece of tissue: writing them into the same partition would silently mix
+        two sections. Their counterpart is `cells_xen_dir` — same cells, same slide.
+        """
+        return self.integration_dir / "cells_pheno_xif"
+
+    @property
     def cells_xen_dir(self) -> Path:
         return self.integration_dir / "cells_xen"
 
