@@ -130,21 +130,36 @@ def test_broad_lowsignal_becomes_evidence_negative(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_sameslide_docstring_matches_what_pair_donor_does():
-    """The docstring claimed IoU was preferred while `pair_donor` only used centroids.
+    """The docstring must describe the matchers that are actually reachable.
 
-    Asserted rather than eyeballed because the two drift apart silently — the reader has no
-    way to tell which criterion actually ran.
+    It once claimed IoU was preferred while `pair_donor` only ever called centroids; it now
+    claims both are available with `auto` selecting between them. Either way the risk is the
+    same — the two drift apart silently, and a reader has no way to tell which criterion ran.
     """
     import inspect
 
     from phenocycler.integration import sameslide
 
     doc = inspect.getdoc(sameslide) or ""
-    src = inspect.getsource(sameslide.pair_donor)
+    src = "".join(inspect.getsource(f) for f in (sameslide.pair_donor, sameslide._match,
+                                                 sameslide.match_tables_by_iou))
 
-    uses_iou = "match_by_iou(" in src
-    uses_centroid = "match_by_centroid(" in src
-    assert uses_centroid and not uses_iou, (
-        "pair_donor's implementation changed — update the module docstring to match")
-    assert "not wired in" in doc or "not yet wired in" in doc, (
-        "the docstring must say IoU is available but unused while that remains true")
+    assert "match_by_centroid(" in src, "centroid matching must remain reachable"
+    assert "match_by_iou(" in src, "IoU matching must be reachable from pair_donor"
+    # And the docstring must not still describe IoU as unavailable.
+    for stale in ("not yet wired in", "does not use it", "no same-slide data"):
+        assert stale not in doc, f"module docstring still says {stale!r} about IoU"
+    assert "auto" in doc and "iou" in doc.lower(), (
+        "the docstring must say how the matcher is selected")
+
+
+def test_pair_donor_records_which_matcher_ran():
+    """`auto` falling back silently would make a polygon-loading failure look like a
+    successful centroid run, and the two have different error characteristics."""
+    import inspect
+
+    from phenocycler.integration import sameslide
+
+    src = inspect.getsource(sameslide.pair_donor)
+    assert '"method": used' in src or '"method"' in src, (
+        "stats must record which matcher produced the pairs")

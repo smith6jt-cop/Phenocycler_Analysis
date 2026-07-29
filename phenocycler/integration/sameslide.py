@@ -18,21 +18,25 @@ a different *part* of the cell. ``cellmatch.py`` (S6b) recovers the fraction tha
 endocrine cells inside matched islets, under a verified local registration residual — and
 refuses the rest. This module remains for the case where one section was imaged twice.
 
-**What ``pair_donor`` currently does:** mutual-nearest-centroid assignment within
-``max_dist_um``. Mutual rather than one-way, because one-way nearest-neighbour assignment
-produces many-to-one collisions exactly where segmentation disagrees most.
+**How ``pair_donor`` matches.** Two criteria, selected by ``method``:
 
-**What is available but not yet wired in:** :func:`match_by_iou` does polygon-overlap
-assignment, which is the better criterion — two segmentations of one cell overlap
-substantially, two neighbouring cells do not, and IoU therefore handles the case that defeats
-centroids, where adjacent nuclei sit closer to each other than to their own partners. It is
-implemented and callable, but ``pair_donor`` does not use it because the missing piece is the
-*polygon loader*: PhenoCycler boundaries live in ``data/redsea_scratch/geojson/`` and
-Xenium's in the SpatialData zarr, and both would need reading, warping through the transform
-(including the non-rigid field), and handing over as GeoSeries. Building that now would be
-unvalidated code — this cohort is serial-section, so there is no same-slide data to check it
-against. Pass polygons to :func:`match_by_iou` directly if you have them; wiring the loader
-in is the natural follow-up once same-slide data exists.
+``iou`` (preferred)
+    Polygon overlap. Two segmentations of one cell overlap substantially; two neighbouring
+    cells do not. That distinction is what centroid distance cannot make reliably in packed
+    tissue, where an adjacent nucleus is often nearer than the partner outline's centroid.
+    Polygons come from :mod:`phenocycler.integration.boundaries`, which reads QuPath GeoJSON
+    and Xenium ``cell_boundaries.parquet``, reconciles their units, and warps the moving side
+    through the transform — non-rigid field included, since applying only the affine would
+    leave exactly the local error the B-spline stage exists to remove.
+
+``centroid``
+    Mutual-nearest within ``max_dist_um``. Mutual rather than one-way, because one-way
+    nearest-neighbour produces many-to-one collisions exactly where segmentation disagrees
+    most.
+
+``auto`` (default) tries IoU and falls back to centroids when polygons are unavailable,
+**recording which ran** in ``stats['method']``. A silent fallback would make a polygon-loading
+failure look like a successful centroid run, and the two have different error characteristics.
 
 Unmatched cells are reported, not hidden. The two pipelines segment independently — QuPath
 on a qptiff, Xenium's own algorithm on DAPI plus the multimodal stains — so they will not
@@ -43,6 +47,7 @@ failure.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -50,7 +55,7 @@ import pandas as pd
 
 from ..config import PipelineConfig, load_config
 from .contract import read_cell_table
-from .manifest import load_manifest, paired_rows
+from .manifest import load_manifest, paired_rows, rows_for_scope
 from .register import registration_dir
 from .transform import Transform
 
@@ -170,14 +175,91 @@ def match_by_iou(
     return pd.DataFrame(keep).reset_index(drop=True)
 
 
+def _match(cfg, donor, roi, moving, fixed, tf, fixed_is_pheno, moving_xy, fixed_xy, *,
+           method, max_dist_um, min_iou, pheno_base=None):
+    """Run the requested matcher. Returns ``(pairs, method_used)``.
+
+    ``auto`` prefers IoU and falls back to centroids, recording which ran — a silent fallback
+    would make a polygon-loading failure look like a successful centroid run, and the two have
+    different error characteristics. ``iou`` re-raises instead, so an explicit request cannot
+    be quietly downgraded.
+    """
+    if method not in ("auto", "iou", "centroid"):
+        raise ValueError(f"method must be auto|iou|centroid, got {method!r}")
+
+    if method in ("auto", "iou"):
+        try:
+            mv_poly, fx_poly = _load_polygons(cfg, donor, roi, moving, fixed, tf,
+                                              fixed_is_pheno, pheno_base=pheno_base)
+            pairs = match_tables_by_iou(mv_poly, fx_poly, moving, fixed, min_iou=min_iou)
+            return pairs, "iou"
+        except Exception as exc:  # noqa: BLE001 - any loader failure falls back, loudly
+            if method == "iou":
+                raise
+            print(f"[sameslide] {donor}/{roi}: polygon matching unavailable ({exc}); "
+                  f"falling back to centroids", flush=True)
+
+    return match_by_centroid(moving_xy, fixed_xy, max_dist_um=max_dist_um), "centroid"
+
+
+def match_tables_by_iou(mv_poly, fx_poly, moving, fixed, *, min_iou):
+    """IoU-match polygons, then re-index the result onto the cell tables.
+
+    :func:`match_by_iou` returns positions into the GeoSeries it was handed, which are not the
+    positions in the cell tables the caller indexes with. Both loaders restrict to ids the
+    tables carry, so the lookup is total; the explicit filter is there because a KeyError here
+    would be swallowed by ``auto``'s fallback and read as "no polygons available".
+    """
+    pairs = match_by_iou(mv_poly, fx_poly, min_iou=min_iou)
+    if pairs.empty:
+        return pairs
+    mv_pos = {c: i for i, c in enumerate(moving.df["cell_id"])}
+    fx_pos = {c: i for i, c in enumerate(fixed.df["cell_id"])}
+    mv = [mv_pos.get(mv_poly.index[int(i)]) for i in pairs["moving_idx"]]
+    fx = [fx_pos.get(fx_poly.index[int(i)]) for i in pairs["fixed_idx"]]
+    keep = [j for j, (a, b) in enumerate(zip(mv, fx)) if a is not None and b is not None]
+    pairs = pairs.iloc[keep].reset_index(drop=True)
+    return pairs.assign(moving_idx=[mv[j] for j in keep], fixed_idx=[fx[j] for j in keep])
+
+
+def _load_polygons(cfg, donor, roi, moving, fixed, tf, fixed_is_pheno, *, pheno_base=None):
+    """Both sides' polygons in the FIXED frame, restricted to cells in the tables."""
+    from .boundaries import load_pheno_polygons, load_xenium_polygons, warp_polygons
+
+    xen = moving if fixed_is_pheno else fixed
+    pheno_poly = load_pheno_polygons(cfg, donor, roi, base=pheno_base)
+
+    man = rows_for_scope(load_manifest(cfg), roi=roi)
+    row = man[man["donor_id"].astype(str) == str(donor)]
+    bundle = str(row["xenium_bundle"].iloc[0]) if len(row) else ""
+    if not bundle:
+        raise RuntimeError(f"no xenium_bundle recorded for {donor}/{roi} in the manifest")
+    xen_poly = load_xenium_polygons(Path(bundle), cell_ids=set(xen.df["cell_id"]))
+
+    # Only the moving side is warped; the fixed frame is by definition already correct.
+    if fixed_is_pheno:
+        return warp_polygons(xen_poly, tf), pheno_poly
+    return warp_polygons(pheno_poly, tf), xen_poly
+
+
 def pair_donor(
     cfg: PipelineConfig,
     donor: str,
     roi: str = "panc",
     *,
     max_dist_um: float = DEFAULT_MAX_DIST_UM,
+    method: str = "auto",
+    min_iou: float = 0.25,
+    pheno_base=None,
 ) -> tuple[pd.DataFrame, dict]:
-    """Pair one donor's cells across modalities on the same section."""
+    """Pair one donor's cells across modalities on the same section.
+
+    ``method`` is ``'iou'`` (polygon overlap), ``'centroid'``, or ``'auto'`` — try IoU and
+    fall back to centroids when polygons are unavailable, recording which was used. IoU is
+    preferred where it can run: two segmentations of one cell overlap substantially and two
+    neighbours do not, which is the distinction centroid distance cannot make reliably in
+    packed tissue, where an adjacent nucleus is often nearer than the partner outline.
+    """
     require_same_slide(cfg)
 
     pheno = read_cell_table(cfg.cells_pheno_dir, donor, roi, modality="phenocycler")
@@ -193,12 +275,16 @@ def pair_donor(
     moving_xy = tf.apply(moving.xy())
     fixed_xy = fixed.xy()
 
-    m = match_by_centroid(moving_xy, fixed_xy, max_dist_um=max_dist_um)
+    m, used = _match(cfg, donor, roi, moving, fixed, tf, fixed_is_pheno,
+                     moving_xy, fixed_xy, method=method, max_dist_um=max_dist_um,
+                     min_iou=min_iou, pheno_base=pheno_base)
     if m.empty:
+        crit = (f"overlapping by IoU >= {min_iou}" if used == "iou"
+                else f"within {max_dist_um} um")
         return pd.DataFrame(), {
-            "donor_id": donor, "roi": roi, "n_pairs": 0,
-            "note": (f"no cell pairs within {max_dist_um} um — either the registration is "
-                     f"wrong or these are not the same section"),
+            "donor_id": donor, "roi": roi, "n_pairs": 0, "method": used,
+            "note": (f"no cell pairs {crit} — either the registration is wrong or these "
+                     f"are not the same section"),
         }
 
     out = pd.DataFrame({
@@ -208,8 +294,10 @@ def pair_donor(
                           else moving.df["cell_id"].to_numpy()[m["moving_idx"]]),
         "xen_cell_id": (moving.df["cell_id"].to_numpy()[m["moving_idx"]] if fixed_is_pheno
                         else fixed.df["cell_id"].to_numpy()[m["fixed_idx"]]),
-        "distance_um": m["distance_um"].to_numpy(),
     })
+    for col in ("distance_um", "iou"):
+        if col in m.columns:
+            out[col] = m[col].to_numpy()
 
     p_lin = (fixed.df["lineage_common"].to_numpy()[m["fixed_idx"]] if fixed_is_pheno
              else moving.df["lineage_common"].to_numpy()[m["moving_idx"]])
@@ -224,7 +312,10 @@ def pair_donor(
         "n_pheno": len(pheno.df), "n_xen": len(xen.df), "n_pairs": len(out),
         "pair_rate_pheno": len(out) / max(len(pheno.df), 1),
         "pair_rate_xen": len(out) / max(len(xen.df), 1),
-        "median_distance_um": float(out["distance_um"].median()),
+        "method": used,
+        "median_distance_um": (float(out["distance_um"].median())
+                               if "distance_um" in out.columns else float("nan")),
+        "median_iou": float(out["iou"].median()) if "iou" in out.columns else float("nan"),
         # The headline number for same-slide mode: two independent measurements of the SAME
         # cell should agree on its lineage. Unlike sequential mode this is a real accuracy,
         # not a distributional similarity.
