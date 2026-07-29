@@ -47,6 +47,7 @@ beta-to-beta matching across the pair meaningful.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -55,8 +56,8 @@ import pandas as pd
 from ..config import PipelineConfig, load_config
 from ..sections import SLIDE_XENIUM
 from .contract import partition_path, read_cell_table, write_cell_table
-from .manifest import load_manifest, paired_rows
-from .sameslide import match_by_centroid
+from .manifest import load_manifest, paired_rows, rows_for_scope
+from .sameslide import match_by_centroid, match_tables_by_iou
 
 #: Centroid cap for "these two segmentations are the same cell". Tighter than the
 #: serial-section cap: there is no section gap here, so the only disagreement is segmentation
@@ -68,12 +69,55 @@ DEFAULT_MAX_DIST_UM = 4.0
 CARRY_COLUMNS = ("endocrine_subtype",)
 
 
+def _match(cfg, donor, roi, rest, xen, offset, *, method, max_dist_um, min_iou):
+    """Match the re-stain to the transcriptome. Returns ``(pairs, method_used)``.
+
+    IoU is the better criterion here for the same reason it is in same-slide mode, and more
+    so: these really are one section, so two outlines of one cell overlap heavily while a
+    neighbour does not — even when that neighbour's centroid is nearer, which in packed islet
+    tissue it frequently is.
+
+    The re-stain polygons are shifted by the same frame offset the centroids get, not warped:
+    the two images are the same physical section on the same instrument, so the only
+    difference is where the operator put the scan origin.
+    """
+    if method not in ("auto", "iou", "centroid"):
+        raise ValueError(f"method must be auto|iou|centroid, got {method!r}")
+
+    if method in ("auto", "iou"):
+        try:
+            from shapely.affinity import translate
+
+            from .boundaries import load_pheno_polygons, load_xenium_polygons
+
+            r_poly = load_pheno_polygons(cfg, donor, roi, base=cfg.cells_pheno_xif_dir)
+            r_poly = r_poly.apply(lambda g: translate(g, float(offset[0]), float(offset[1])))
+
+            man = rows_for_scope(load_manifest(cfg), roi=roi)
+            row = man[man["donor_id"].astype(str) == str(donor)]
+            bundle = str(row["xenium_bundle"].iloc[0]) if len(row) else ""
+            if not bundle:
+                raise RuntimeError(f"no xenium_bundle for {donor}/{roi} in the manifest")
+            x_poly = load_xenium_polygons(Path(bundle), cell_ids=set(xen.df["cell_id"]))
+
+            return match_tables_by_iou(r_poly, x_poly, rest, xen, min_iou=min_iou), "iou"
+        except Exception as exc:  # noqa: BLE001 - fall back, but say so
+            if method == "iou":
+                raise
+            print(f"[postxen] {donor}/{roi}: polygon matching unavailable ({exc}); "
+                  f"falling back to centroids", flush=True)
+
+    return match_by_centroid(rest.xy() + offset, xen.xy(), max_dist_um=max_dist_um), "centroid"
+
+
 def pair_restain(
     cfg: PipelineConfig,
     donor: str,
     roi: str,
     *,
     max_dist_um: float = DEFAULT_MAX_DIST_UM,
+    method: str = "auto",
+    min_iou: float = 0.25,
     n_perm: int = 25,
     seed: int = 0,
 ) -> tuple[pd.DataFrame, dict]:
@@ -99,7 +143,8 @@ def pair_restain(
     offset = np.median(x_xy, axis=0) - np.median(r_xy, axis=0)
     r_xy = r_xy + offset
 
-    m = match_by_centroid(r_xy, x_xy, max_dist_um=max_dist_um)
+    m, used = _match(cfg, donor, roi, rest, xen, offset, method=method,
+                     max_dist_um=max_dist_um, min_iou=min_iou)
     lo, hi = x_xy.min(axis=0), x_xy.max(axis=0)
     null = float(np.mean([
         len(match_by_centroid(r_xy, np.c_[rng.uniform(lo[0], hi[0], len(x_xy)),
@@ -109,10 +154,14 @@ def pair_restain(
     stats = {
         **base,
         "n_restain": len(rest.df), "n_xenium": len(xen.df), "n_pairs": len(m),
+        "method": used,
         "frame_offset_um": float(np.hypot(*offset)),
         "pair_rate_restain": len(m) / len(rest.df),
         "pair_rate_xenium": len(m) / len(xen.df),
-        "median_distance_um": float(m["distance_um"].median()) if len(m) else float("nan"),
+        "median_distance_um": (float(m["distance_um"].median())
+                               if len(m) and "distance_um" in m.columns else float("nan")),
+        "median_iou": (float(m["iou"].median())
+                       if len(m) and "iou" in m.columns else float("nan")),
         "null_mean": null,
         "signal_over_null": len(m) / null if null > 0 else float("nan"),
     }
@@ -125,8 +174,10 @@ def pair_restain(
         "donor_id": donor, "roi": roi,
         "restain_cell_id": rest.df["cell_id"].to_numpy()[m["moving_idx"].to_numpy(int)],
         "xen_cell_id": xen.df["cell_id"].to_numpy()[m["fixed_idx"].to_numpy(int)],
-        "distance_um": m["distance_um"].to_numpy(),
     })
+    for col in ("distance_um", "iou"):
+        if col in m.columns:
+            pairs[col] = m[col].to_numpy()
     for col in CARRY_COLUMNS:
         if col in rest.df.columns:
             pairs[col] = rest.df[col].to_numpy()[m["moving_idx"].to_numpy(int)]

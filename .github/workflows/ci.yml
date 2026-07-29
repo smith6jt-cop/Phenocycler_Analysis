@@ -122,6 +122,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e '.[integration,test]'
 
+      - name: Geometry stack is actually present
+        # Same reasoning as the submodule check below: the polygon tests guard on an
+        # importorskip, so a missing geopandas would skip them and still report green.
+        run: python -c "import geopandas, shapely; print('geo ok', geopandas.__version__)"
+
       - name: Panel taxonomy is actually present
         # The crosswalk tests skip gracefully when the submodule is missing (right behaviour
         # for a local checkout), which means a silent submodule failure would look identical

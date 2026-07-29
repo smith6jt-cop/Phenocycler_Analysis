@@ -205,12 +205,40 @@ happens at four levels, none of which claims a cell-to-cell correspondence:
 **`same_slide`** — one physical section imaged twice. Cells *are* the same cells, so a
 genuine paired protein+RNA matrix is recoverable and `sameslide.py` produces it.
 
-`pair_donor` assigns by **mutual-nearest centroid** within a 5 µm cap. `match_by_iou` does
-the better polygon-overlap assignment and is callable if you can supply GeoSeries, but is not
-wired into `pair_donor`: the missing piece is a loader for PhenoCycler's GeoJSON and Xenium's
-zarr boundaries, warped through the transform. This cohort is serial-section, so there is no
-same-slide data to validate such a loader against — it is a follow-up, not a gap being
-papered over.
+`pair_donor` takes a `method`:
+
+| `method` | criterion |
+|---|---|
+| `iou` | **polygon overlap** — two segmentations of one cell overlap substantially, two neighbours do not |
+| `centroid` | mutual-nearest centroid within a 5 µm cap |
+| `auto` (default) | IoU, falling back to centroids when polygons are unavailable |
+
+IoU is preferred wherever it can run. In packed islet tissue an adjacent nucleus is often
+nearer than the partner outline's centroid, which is precisely the case centroid distance
+gets wrong and overlap does not.
+
+Polygons come from `boundaries.py`, which reads QuPath GeoJSON (`data/redsea_scratch/geojson/`)
+and Xenium `cell_boundaries.parquet`, and warps the moving side through the transform
+**vertex-wise** so the non-rigid field is applied, not just its affine part.
+
+The two formats disagree about units — the GeoJSON is in full-resolution qptiff **pixels**,
+every contract table is in **microns** — and getting that wrong does not error, it puts one
+section's polygons a thousand microns from their own cells. Rather than read the qptiff's
+resolution tags (which needs the image mounted and returns nothing when the tags are absent,
+so a missing scale silently becomes 1.0), the conversion is **fitted from the data**: both
+files describe the same cells under the same ids, so a per-axis linear fit of polygon centroid
+against `x_um`/`y_um` recovers it exactly. A fitted scale outside 0.05–2.0 µm/px, or a median
+residual above 5 µm, means the two files are not the same section and is an error rather than
+a silently wrong overlay.
+
+`auto` records which matcher actually ran in `stats['method']`. A silent fallback would make a
+polygon-loading failure look like a successful centroid run, and the two have different error
+characteristics. `method='iou'` re-raises instead of falling back, so an explicit request
+cannot be quietly downgraded.
+
+The same matching is used by `postxen.py` (S1c) for the post-Xenium re-stain, where it matters
+most: that really is one section imaged twice, so overlap is the correct criterion by
+construction.
 
 Every mode-specific module refuses to run in the wrong mode, as a hard error rather than a
 warning. The validity of every downstream claim rests on which situation holds, and a
