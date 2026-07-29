@@ -275,13 +275,19 @@ def _export_and_write(section_key: str, cfg: PipelineConfig, tissue_by_roi: dict
     tissue = tissue_by_roi.get(sec.roi, "")
     df = export_donor(sec.donor_id, source_cfg or cfg, roi=sec.roi, tissue=tissue,
                       section_key=sec.key)
-    path = partition_path(cfg.cells_pheno_dir, sec.donor_id, sec.roi)
+    # A post-Xenium re-stain shares a (donor, roi) with the PhenoCycler section but is a
+    # different piece of tissue, so it gets its own contract directory. Same partition would
+    # mean two sections' cells averaged together with nothing to show for it.
+    base = cfg.cells_pheno_xif_dir if sec.on_xenium_slide else cfg.cells_pheno_dir
+    path = partition_path(base, sec.donor_id, sec.roi)
     write_cell_table(df, path)
     counts = df["lineage_common"].value_counts().to_dict()
     print(f"[export_pheno] {sec.key} -> {sec.donor_id}/{sec.roi} "
-          f"({df['tissue'].iloc[0] if len(df) else '?'}): "
+          f"({df['tissue'].iloc[0] if len(df) else '?'}"
+          f"{', post-Xenium re-stain' if sec.on_xenium_slide else ''}): "
           f"{len(df):,} cells -> {path.parent}", flush=True)
     return {"section_key": sec.key, "donor_id": sec.donor_id, "roi": sec.roi,
+            "slide": sec.slide,
             "tissue": df["tissue"].iloc[0] if len(df) else "", "n_cells": len(df), **counts}
 
 

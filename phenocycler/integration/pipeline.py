@@ -12,15 +12,21 @@ knows how to drive the core pipeline already knows how to drive this one.
 
 Stage order depends on the mode, and the difference is not cosmetic:
 
-    sequential   manifest -> export_pheno -> import_xenium -> vocab -> structures
-                 -> register -> match -> grid -> donor -> crossmodal -> qc -> figures
-    same_slide   manifest -> export_pheno -> import_xenium -> vocab -> structures
+    sequential   manifest -> export_pheno -> import_xenium -> postxen -> vocab -> structures
+                 -> register -> match -> cellmatch -> grid -> donor -> crossmodal -> qc
+                 -> figures
+    same_slide   manifest -> export_pheno -> import_xenium -> postxen -> vocab -> structures
                  -> register -> sameslide -> grid -> donor -> qc -> figures
 
 ``match`` and ``crossmodal`` are sequential-only because they approximate a pairing that
-same-slide mode measures outright; ``sameslide`` is same-slide-only because that measurement
-does not exist across serial sections. Each module enforces its own guard, so running a stage
-directly cannot bypass the mode check either.
+same-slide mode measures outright; ``sameslide`` is same-slide-only because it claims
+whole-cell correspondence for every cell. Each module enforces its own guard, so running a
+stage directly cannot bypass the mode check either.
+
+``postxen`` runs in **both** modes, and that is not an oversight. The post-Xenium re-stain
+images the Xenium section on the PhenoCycler, so its cells are the same cells as the
+transcriptome — a same-slide relationship that is a property of that section pair, not of the
+cohort. Gating it on the cohort mode would answer the wrong question.
 
 The registration-free stages — ``donor`` and the niche half of ``grid`` — run regardless of
 whether registration succeeded. That is the point of ordering them after ``register`` but not
@@ -50,6 +56,8 @@ STAGES: list[tuple[str, str, str]] = [
     ("manifest", "integration/manifest.csv", "Donor <-> Xenium pairing manifest"),
     ("export_pheno", "integration/cells_pheno/donor_id=*", "PhenoCycler -> contract"),
     ("import_xenium", "integration/cells_xen/donor_id=*", "Xenium -> contract"),
+    ("postxen", "integration/paired/postxen_cells.parquet",
+     "Post-Xenium re-stain <-> Xenium, same slide [measurement]"),
     ("vocab", "integration/vocab_crosswalk.csv", "Lineage + marker crosswalk"),
     ("structures", "integration/structures/*/donor_id=*", "Islets / ducts / vessels"),
     ("register", "integration/registration/donor_id=*", "Serial-section registration"),
@@ -65,15 +73,15 @@ STAGES: list[tuple[str, str, str]] = [
     ("figures", "integration/figures/composition.png", "Figures"),
 ]
 
-ORDER_SEQUENTIAL = ["manifest", "export_pheno", "import_xenium", "vocab", "structures",
+ORDER_SEQUENTIAL = ["manifest", "export_pheno", "import_xenium", "postxen", "vocab", "structures",
                     "register", "match", "cellmatch", "grid", "donor", "crossmodal", "qc",
                     "figures"]
-ORDER_SAME_SLIDE = ["manifest", "export_pheno", "import_xenium", "vocab", "structures",
+ORDER_SAME_SLIDE = ["manifest", "export_pheno", "import_xenium", "postxen", "vocab", "structures",
                     "register", "sameslide", "grid", "donor", "qc", "figures"]
 
 #: Stages that need no registration, so they are never skipped because registration failed.
-REGISTRATION_FREE = {"manifest", "export_pheno", "import_xenium", "vocab", "structures",
-                     "donor", "qc"}
+REGISTRATION_FREE = {"manifest", "export_pheno", "import_xenium", "postxen", "vocab",
+                     "structures", "donor", "qc"}
 
 #: Stages that need a structural unit (islets). Not applicable to a tissue that has none —
 #: see ``tissues.STRUCTURE_KINDS``. They are skipped per-tissue, never per-run: a combined
@@ -204,6 +212,9 @@ def run_pipeline(
             from .import_xenium import run_import_xenium
             _run(name, lambda: run_import_xenium(cfg, donors=donors, roi=roi,
                                                  tissue=stage_tissue))
+        elif name == "postxen":
+            from .postxen import run_postxen
+            _run(name, lambda: run_postxen(cfg, donors, roi=roi, tissue=stage_tissue))
         elif name == "vocab":
             from .vocab import run_vocab
             _run(name, lambda: [run_vocab(cfg, _panel_genes(cfg, t), tissue=t)

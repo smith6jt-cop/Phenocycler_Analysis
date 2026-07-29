@@ -69,19 +69,42 @@ def key_from_image(image: str) -> str:
     m = _IMAGE_KEY_RE.match(str(image).strip())
     return m.group(0).lower() if m else ""
 
-#: Region token -> the ROI vocabulary the integration layer pairs on. The Xenium manifest
-#: names lymph-node regions ``pln_1..pln_3``; PhenoCycler images carry a bare ``pLN``, so a
-#: token with no index resolves to ``pln_1``.
+#: Which physical section an image is of. Both values are PhenoCycler *images* — the
+#: distinction is the slide under the objective, not the instrument.
+SLIDE_PHENO = "pheno"      # the PhenoCycler section of the block
+SLIDE_XENIUM = "xenium"    # the Xenium section, re-stained on the PhenoCycler afterwards
+
+#: Region token -> ``(roi, slide)``.
 #:
-#: ``pln_1`` because it is the region every row in ``xenium_paths.csv`` has — 26 of 26 donors
-#: listed there, with three carrying a second and one a third. Note that CSV is the *vendored
-#: upstream manifest*, not the run cohort: the analysis cohort is 20 donors, and which 20 has
-#: not been pinned anywhere in this repo. So this mapping is an inference from a superset, and
-#: it is wrong for any donor whose single PhenoCycler lymph-node section corresponds to that
-#: donor's ``pln_2`` or ``pln_3`` rather than its ``pln_1``. Pairing failures would show up as
-#: a registration that cannot align; if that happens, add a per-donor override here rather than
-#: loosening the mapping.
-REGION_TO_ROI: dict[str, str] = {"pln": "pln_1", "ln": "pln_1"}
+#: **roi.** The Xenium manifest names lymph-node regions ``pln_1..pln_3``; PhenoCycler images
+#: carry a bare ``pLN``, so a token with no index resolves to ``pln_1``. That is the region
+#: every row in ``xenium_paths.csv`` has (26 of the 26 donors listed there, three with a
+#: second and one a third) — but that CSV is the vendored upstream manifest, not the run
+#: cohort, which is 20 donors and is pinned nowhere. So it is an inference from a superset,
+#: and wrong for any donor whose single PhenoCycler lymph-node section is really that donor's
+#: ``pln_2``. It would surface as a registration that will not align; fix it with a per-donor
+#: entry here rather than by loosening the mapping.
+#:
+#: **slide.** Post-Xenium INS/GCG staining is done on the PhenoCycler and produces an ordinary
+#: qptiff, so it flows through the whole core pipeline unchanged — but it images the *Xenium*
+#: section, which makes its cells the same cells as the Xenium transcriptome. That is a
+#: genuine same-slide relationship sitting inside a serial-section cohort, and it is the only
+#: place in this dataset where protein and RNA are measured on one cell. Keeping the slide in
+#: the section key is what stops those cells being written into the PhenoCycler section's
+#: partition, where they would be silently averaged with a different piece of tissue.
+#:
+#: An unlisted token is REFUSED by :func:`parse`, not guessed at. If the post-Xenium images in
+#: your cohort use a token that is not here, the error names the file and adding one line
+#: fixes it — that is deliberately louder than defaulting.
+REGION_TO_ROI: dict[str, tuple[str, str]] = {
+    "pln": ("pln_1", SLIDE_PHENO),
+    "ln": ("pln_1", SLIDE_PHENO),
+    # Post-Xenium re-stain of the Xenium section. `xen` = pancreas, `xenpln` = lymph node.
+    "xen": ("panc", SLIDE_XENIUM),
+    "xpanc": ("panc", SLIDE_XENIUM),
+    "xenpln": ("pln_1", SLIDE_XENIUM),
+    "xpln": ("pln_1", SLIDE_XENIUM),
+}
 
 #: The ROI of a section whose filename carries no region token at all.
 DEFAULT_ROI = "panc"
@@ -97,10 +120,20 @@ class Section(NamedTuple):
     key: str          # 6539pln    — the data/cells/donor_id=* partition
     donor_id: str     # 6539       — the join key against the donor workbook
     roi: str          # pln_1      — the ROI vocabulary the Xenium manifest uses
+    slide: str = SLIDE_PHENO   # which physical section this image is of
 
     @property
     def is_default_region(self) -> bool:
         return self.roi == DEFAULT_ROI
+
+    @property
+    def on_xenium_slide(self) -> bool:
+        """True for a post-Xenium re-stain — the same cells as the Xenium transcriptome.
+
+        Consumers use this to decide whether a pairing against Xenium is a *measurement*
+        (same slide) or an approximation (serial sections).
+        """
+        return self.slide == SLIDE_XENIUM
 
 
 def parse(key: str) -> Section:
@@ -125,29 +158,33 @@ def parse(key: str) -> Section:
     region = m.group("region") or ""
     index = m.group("index") or ""
     if not region:
-        return Section(key=text, donor_id=donor, roi=DEFAULT_ROI)
+        return Section(key=text, donor_id=donor, roi=DEFAULT_ROI, slide=SLIDE_PHENO)
 
-    base = REGION_TO_ROI.get(region)
+    entry = REGION_TO_ROI.get(region)
+    base = entry[0] if entry else None
     if base is None:
         raise SectionError(
             f"section key {key!r} carries an unknown region token {region!r}; known tokens "
             f"are {sorted(REGION_TO_ROI)} (plus no token at all for {DEFAULT_ROI}). If this "
-            f"is a real region, add it to phenocycler.sections.REGION_TO_ROI — do not let it "
-            f"fall through to {DEFAULT_ROI}, which would mix two tissues in one analysis.")
+            f"is a real region — including a post-Xenium re-stain under a token not listed "
+            f"there — add one line to phenocycler.sections.REGION_TO_ROI. Do not let it fall "
+            f"through to {DEFAULT_ROI}: that would mix two sections in one partition.")
     roi = f"{base.rsplit('_', 1)[0]}_{index}" if index else base
-    return Section(key=text, donor_id=donor, roi=roi)
+    return Section(key=text, donor_id=donor, roi=roi, slide=entry[1])
 
 
-def key_for(donor_id: str, roi: str = DEFAULT_ROI) -> str:
+def key_for(donor_id: str, roi: str = DEFAULT_ROI, slide: str = SLIDE_PHENO) -> str:
     """The inverse of :func:`parse`: ``('6539', 'pln_2')`` -> ``'6539pln2'``."""
     donor = str(donor_id).strip()
     roi = str(roi).strip().lower() or DEFAULT_ROI
-    if roi == DEFAULT_ROI:
+    if roi == DEFAULT_ROI and slide == SLIDE_PHENO:
         return donor
-    base, _, index = roi.partition("_")
-    token = next((tok for tok, r in REGION_TO_ROI.items() if r.startswith(f"{base}_")), None)
+    base = roi.partition("_")[0]
+    index = roi.partition("_")[2]
+    token = next((tok for tok, (r, sl) in REGION_TO_ROI.items()
+                  if sl == slide and r.partition("_")[0] == base), None)
     if token is None:
-        raise SectionError(f"no region token maps to roi {roi!r}")
+        raise SectionError(f"no region token maps to roi {roi!r} on the {slide} slide")
     return f"{donor}{token}{index if index not in ('', '1') else ''}"
 
 

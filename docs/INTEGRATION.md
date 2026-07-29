@@ -118,6 +118,57 @@ lymph-node section corresponds to that donor's `pln_2` or `pln_3`. It would surf
 registration that will not align, not as silently wrong output; the fix is a per-donor override
 in `sections.REGION_TO_ROI`.
 
+### The post-Xenium re-stain — protein and RNA on the same cells
+
+After the Xenium run, that section is stained for INS and GCG **on the PhenoCycler**. The
+output is an ordinary qptiff, so it flows through the whole core pipeline unchanged. What
+differs is the slide underneath — it images the *Xenium* section:
+
+```
+PhenoCycler section  ──── serial ────▶  Xenium section
+ (55-plex protein)                       (5K RNA)
+                                             │
+                                        same slide
+                                             ▼
+                                   post-Xenium re-stain
+                                    (INS / GCG protein)
+```
+
+This is the only place in the cohort where protein and RNA are measured on **one cell**. The
+section key therefore carries a second dimension — which physical slide was imaged — so a
+re-stain never lands in the PhenoCycler section's partition:
+
+| image | partition | donor | roi | slide |
+|---|---|---|---|---|
+| `6539_Scan1.er.qptiff` | `6539` | 6539 | `panc` | pheno |
+| `6539xen_Scan1.er.qptiff` | `6539xen` | 6539 | `panc` | **xenium** |
+| `6539xenpLN_Scan1.er.qptiff` | `6539xenpln` | 6539 | `pln_1` | **xenium** |
+
+Re-stains export to `cells_pheno_xif/` rather than `cells_pheno/` — same `(donor, roi)`, but
+a different piece of tissue, and one partition must stay one section.
+
+`postxen` (S1c) pairs them against the transcriptome. It runs in **both** modes: the
+correspondence is a property of that section pair, not of the cohort, so gating it on
+`[integration] mode` would answer the wrong question. No registration is applied — a residual
+translation between two exports of one section is a coordinate-frame difference, estimated as
+a median offset and removed.
+
+**What this unlocks.** INS/GCG/SST are off the 5K panel, so Xenium normally calls Beta/Alpha
+from surrogate cores (PDX1, ISL1, NEUROD1, ABCC8). With the re-stain those calls are *scored
+against hormone protein on the same cell* — `qc/postxen_qc.csv` reports the agreement and
+per-subtype recall. The hormone call is then stamped onto the Xenium table, so S6b types both
+sides of the serial pair by protein rather than protein-versus-surrogate-RNA.
+
+**One caveat, enforced by scope.** Post-Xenium tissue has been through protease digestion and
+decrosslinking, so epitopes are degraded and intensities are *not* comparable to a fresh
+PhenoCycler stain. Only identity travels (`CARRY_COLUMNS`), never raw marker values. CD3e is
+excluded on the same grounds — a lower-abundance surface marker does not survive that
+chemistry, which is what the reported unreliability predicts.
+
+If your re-stains use a filename token other than `xen` / `xpanc` / `xenpln` / `xpln`, `parse`
+**refuses** it and names the file; add one line to `sections.REGION_TO_ROI`. That is
+deliberately louder than defaulting, which would merge two sections.
+
 This also makes pairing exact rather than assumed. The manifest now knows *which* PhenoCycler
 sections exist, so a donor whose lymph node was never scanned is `xenium_only` for that ROI
 instead of being reported as a pairing that does not exist.
