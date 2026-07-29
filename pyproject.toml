@@ -9,7 +9,7 @@ name = "phenocycler-analysis"
 # moment someone forgets one, and an analysis pipeline whose recorded version does not match
 # the commit that produced the results is worse than having no version at all.
 dynamic = ["version"]
-description = "Phenocycler / CODEX phenotyping pipeline: REDSEA -> RESTORE -> hormone floor -> 8-class broad lineage"
+description = "Phenocycler / CODEX phenotyping pipeline: REDSEA -> RESTORE -> hormone floor -> 7-class broad lineage"
 readme = "README.md"
 requires-python = ">=3.10"
 # Deps are intentionally UNPINNED: this package is installed editable into an existing

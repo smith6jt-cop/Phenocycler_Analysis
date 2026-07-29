@@ -10,7 +10,7 @@ optional GPU backend.
 The pipeline corrects three dominant artifacts of dense multiplexed tissue imaging —
 **lateral marker spillover** (REDSEA), **per-image intensity / autofluorescence drift**
 (RESTORE), and **false-endocrine over-calling** (a threshold-relative hormone floor) —
-and then assigns every cell to one of **eight** mutually-exclusive lineages with
+and then assigns every cell to one of **seven** mutually-exclusive lineages with
 **zero "Unassigned"** cells.
 
 ```
@@ -27,7 +27,7 @@ and then assigns every cell to one of **eight** mutually-exclusive lineages with
                                                      │
                             [4] hormone floor (K=5) ─▶ data/restore_gated_redsea/  (false-endocrine fix)
                                                      │
-                            [5] broad lineage ────────▶ data/phenotype/broad/   (8 lineages, 0 Unassigned)
+                            [5] broad lineage ────────▶ data/phenotype/broad/   (7 lineages, 0 Unassigned)
                                                      │
                             [6] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
                             [7] identity figures ─────▶ data/phenotype/celltype_marker_*.png
@@ -153,8 +153,13 @@ Set `[compute] n_jobs` in `config.ini` (or `--jobs N`) for the process pools, an
 cohort-scale HPC runs use the SLURM chain:
 
 ```bash
-bash scripts/slurm/run_full_pipeline.sh 15   # 15 donors: cells → redsea[array 0-14] → restore → lineage
+bash scripts/slurm/run_full_pipeline.sh 40   # 40 SECTIONS: cells → redsea[array 0-39] → restore(+extra) → floor/lineage/qupath/figures
 ```
+
+The array is sized in **sections**, not donors — the work unit is one image, so a donor with
+a pancreas and a lymph node contributes two (`6539` and `6539pln`). Full setup, the
+positivity-refinement loop, and the silent-failure checklist:
+**[docs/HIPERGATOR.md](docs/HIPERGATOR.md)**.
 
 ## Repository structure
 

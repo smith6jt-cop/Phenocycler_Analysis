@@ -55,7 +55,7 @@ data/
 ├── restore_gated_redsea_extra/donor_id=<id>/data_0.parquet   # Step 3 (extra): CD99/B3TUBB/MPO _pos/_norm
 ├── restore_gated_redsea.pre_hormonefloor/                    # Step 4: un-floored backup, auto-created by hormone_floor on first run (rollback point)
 ├── phenotype/
-│   ├── broad/donor_id=<id>/data_0.parquet        # Step 5: broad_lineage, assign_margin, epi_default, score_* (8)
+│   ├── broad/donor_id=<id>/data_0.parquet        # Step 5: broad_lineage, assign_margin, epi_default, score_* (7)
 │   ├── broad_lineage_composition.png             # Step 5: composition + disease-trend figure
 │   ├── celltype_marker_dotplot.png / _heatmap.png# Step 7: identity QC figures
 │   └── qupath_class/pheno_class_<id>.csv         # Step 6: object_id, broad_lineage, image (for QuPath)
