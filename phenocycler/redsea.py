@@ -396,10 +396,8 @@ def compensate_compartments(data, edge, nuc, nuc_edge, sizes, bandcount, nuccoun
         S_B    = edge  + comp_mode*edge      - S_in            # membrane == the whole band
         S_Cell = data  + comp_mode*edge      - S_in
 
-    with ``cyto = data - nuc`` and ``cyto_edge = edge - nuc_edge``. Nucleus and Cytoplasm partition
-    the cell (QuPath's own convention -- verified on this cohort: ``Cell`` is reproduced from
-    ``Nucleus``/``Cytoplasm`` and their areas at r=0.999993-0.999997, median relative error <=0.01%
-    over 332,770 cells of donor 6539), so::
+    With ``cyto = data - nuc`` and ``cyto_edge = edge - nuc_edge``, Nucleus and
+    Cytoplasm partition the contracted cell raster by construction, so::
 
         S_N + S_Y == S_Cell        exactly, pre-clip
 
