@@ -23,18 +23,27 @@
 #SBATCH --account=your_account
 
 set -euo pipefail
+# `conda activate` needs conda's shell hook, which a non-interactive SLURM shell does
+# not source. Without this the job dies immediately under `set -e` with "shell has not
+# been properly configured" — before any Python runs, so the error is opaque.
 module load conda 2>/dev/null || true
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate phenocycler_integration
 mkdir -p logs
 
 MODE="${MODE:-sequential}"
-ROI="${ROI:-panc}"
+# EMPTY = the whole cohort (every ROI of every configured tissue), which is what a bare run
+# should do. This used to default to `panc`, and since --roi overrides --tissue that meant the
+# shipped script ran pancreas only and never touched the lymph nodes — with no warning, because
+# a pancreas-only run is a perfectly valid run. Set ROI only to isolate one section:
+#   ROI=pln_2 sbatch scripts/slurm/06_integration.sh
+ROI="${ROI:-}"
 
 # Always print the pairing table first — it is where donor/roi problems surface, and it costs
 # nothing. Donors reported as `donor_unknown` need a row in data/integration/donor_overrides.csv.
 python -m phenocycler.integration.manifest --report
 
-python -m phenocycler.integration.pipeline --mode "$MODE" --roi "$ROI" "$@"
+python -m phenocycler.integration.pipeline --mode "$MODE" ${ROI:+--roi "$ROI"} "$@"
 
 # The report is the thing to read afterwards: per-donor QC verdicts plus the cross-modal
 # concordance summary.

@@ -24,6 +24,11 @@ dependencies:
   # RESTORE / metadata / plotting
   - scikit-learn=1.5    # clustering used inside vendored RESTORE
   - matplotlib=3.9
+  # phenocycler/lineage.py imports statsmodels.stats.multitest at module load for the
+  # per-donor composition FDR. It was only ever declared in pyproject.toml and
+  # environment-integration.yml, so an env built from THIS file could not run step 5 —
+  # and setup.sh's own verification imports lineage, so setup failed at [3/4].
+  - statsmodels=0.14
   - tqdm=4.66
   - openpyxl=3.1        # donor metadata .xlsx
   - h5py=3.11
