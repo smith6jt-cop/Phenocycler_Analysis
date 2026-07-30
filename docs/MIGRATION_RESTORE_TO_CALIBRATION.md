@@ -38,16 +38,32 @@ The concrete evidence the floors were tuned against: donor 6476's CD3e-positive 
 (40.3% → 2.65% under K=2, judged an over-call) versus donor 6579's (12.2% → 10.6%, judged a
 real pancreatitis T-cell mode and deliberately preserved).
 
-To settle it, either produce per-donor CD3e+/INS+ fractions from the new calibration showing
-the 6476-class over-call is absent without a floor, or add a `min_log2_threshold_ratio`
-predicate to the `stable_positive` conjunction — `marker_calibration.py` already computes
-`log2_threshold_ratio` per cell, so the hook exists.
+**That second half of the evidence is no longer available — see below — so the floor question
+has to be settled on 6476 alone.** To settle it, either produce per-donor CD3e+ fractions from
+the new calibration showing the 6476-class over-call is absent without a floor, or add a
+`min_log2_threshold_ratio` predicate to the `stable_positive` conjunction —
+`marker_calibration.py` already computes `log2_threshold_ratio` per cell, so the hook exists.
 
-**2. Donor 6579 is a direct contradiction, not a merge conflict.** `phenocycler/cohort.py`
-hard-excludes it as a pancreatitis outlier and `ensure_eligible_donors` raises if it appears.
-The K=2 immune floor was validated *on* 6579 — it is the counterexample that proved the floor
-did not simply delete immune signal. Excluding the donor and removing the floor at the same
-time removes both the guard and its evidence base.
+Note what the two quantities are, because "add a floor back" is not a like-for-like change.
+The old K was a *separation* margin in multiples of the per-image threshold. The new
+`threshold_ci_high` is a *sampling-uncertainty* margin on where the threshold sits, bootstrapped
+from ≥10,000 controls, and is therefore far narrower than a factor of two in raw intensity.
+A reinstated floor would be a third, independent predicate — not a retuning of an existing one.
+
+## Decided
+
+**Donor 6579 is excluded. Confirmed by the maintainer.** `phenocycler/cohort.py` hard-excludes
+it as a pancreatitis outlier and `ensure_eligible_donors` raises if it appears; that is the
+intended behaviour, not an artifact of the merge.
+
+The consequence is worth stating once, because it is easy to rediscover the hard way: the K=2
+immune floor was validated *on* 6579 — it was the counterexample proving the floor removed an
+over-call rather than real immune signal. Excluding the donor removes that counterexample. So
+if a separation floor is ever reinstated (question 1 above), it cannot be re-validated the way
+the original was, and a new negative control has to be chosen deliberately.
+
+Nothing in the code needs to change for this decision; it is already enforced. What changes is
+the standard of evidence for question 1.
 
 **3. The taxonomy was re-cut, implicitly.** `typing_rules.json` dissolves `Endocrine` (INS and
 GCG become Epithelial anchors; Beta/Alpha/Delta become Epithelial subtypes) and collapses
