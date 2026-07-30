@@ -1,111 +1,106 @@
-"""Unit tests for config loading, overrides, and derived paths (8-class pipeline)."""
-
 from __future__ import annotations
 
+import pytest
 
 from phenocycler import load_config
-from phenocycler.config import (LINEAGES, STRUCT_LINEAGES,
-                                DEFAULT_MARKER_PAIRS, EXTRA_MARKER_PAIRS, EXTRA_MARKERS)
+from phenocycler.cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
+from phenocycler.config import EXTRA_MARKERS, HORMONE_MARKERS, LINEAGES
 
 
-def test_defaults_and_derived_paths():
+def test_defaults_expose_only_the_current_stage_roots():
     cfg = load_config()
     assert cfg.data_dir.is_absolute()
     assert cfg.cells_dir == cfg.data_dir / "cells"
-    assert cfg.cells_redsea_dir == cfg.data_dir / "cells_redsea"
-    assert cfg.restore_gated_dir == cfg.data_dir / "restore_gated_redsea"
-    assert cfg.restore_thresholds_csv == cfg.data_dir / "restore_thresholds_redsea.csv"
-    assert cfg.broad_dir == cfg.data_dir / "phenotype" / "broad"
-    assert cfg.qupath_class_dir == cfg.data_dir / "phenotype" / "qupath_class"
-    # 8-class additions
-    assert cfg.restore_gated_extra_dir == cfg.data_dir / "restore_gated_redsea_extra"
-    assert cfg.restore_redsea_extra_dir == cfg.data_dir / "restore_redsea_extra"
-    assert cfg.restore_thresholds_extra_csv == cfg.data_dir / "restore_thresholds_extra.csv"
-    assert cfg.restore_gated_prefloor_dir == cfg.data_dir / "restore_gated_redsea.pre_hormonefloor"
-    assert cfg.redsea_reassess_dir == cfg.data_dir / "redsea_reassess"
+    assert cfg.geometry_qc_dir == cfg.data_dir / "geometry_qc"
+    assert cfg.redsea_dir == cfg.data_dir / "redsea"
+    assert cfg.selected_expression_dir == cfg.data_dir / "expression"
+    assert cfg.marker_evidence_dir == cfg.data_dir / "marker_evidence"
+    assert cfg.assignments_dir == cfg.data_dir / "assignments"
+    for legacy in (
+        "cells_redsea_dir",
+        "restore_dir",
+        "restore_pair_reviews_csv",
+    ):
+        assert not hasattr(cfg, legacy)
 
 
-def test_scientific_defaults():
+def test_fixed_scientific_defaults():
     cfg = load_config()
-    assert cfg.redsea_comp_mode == 0
+    assert cfg.cells_min_cell_area == 5.0
+    assert cfg.cell_qc_min_cell_area == 20.0
+    assert cfg.redsea_comp_mode == 1
+    assert cfg.redsea_norm_form == "donor"
     assert cfg.redsea_alpha == 1.0
-    assert cfg.redsea_edge_radius == 0
-    assert cfg.restore_model == "SSC"
-    assert cfg.restore_robust is True
-    assert cfg.restore_robust_factor == 3.0
-    assert cfg.restore_min_cell_area == 5.0
-    # lineage knobs (the false-endocrine floor + CD99 bright gate)
-    assert cfg.hormone_min_norm == 5.0
-    assert cfg.cd99_bright == 3.0
 
 
-def test_keyword_override():
-    cfg = load_config(n_jobs=8, redsea_alpha=0.5)
-    assert cfg.n_jobs == 8
-    assert cfg.redsea_alpha == 0.5
-
-
-def test_unknown_override_raises():
-    import pytest
+def test_keyword_and_unknown_overrides():
+    assert load_config(n_jobs=8, redsea_alpha=0.5).n_jobs == 8
     with pytest.raises(TypeError):
         load_config(not_a_field=1)
 
 
-def test_relative_paths_resolve_against_config_dir(tmp_path):
+def test_relative_paths_resolve_against_config_file(tmp_path):
     ini = tmp_path / "config.ini"
-    ini.write_text("[paths]\ndata_dir = mydata\nimages_dir = imgs\n")
+    ini.write_text(
+        "[paths]\n"
+        "data_dir = output\n"
+        "qupath_manifest = inputs/qupath.json\n"
+        "marker_registry = policy/markers.json\n"
+        "typing_rules = policy/types.json\n"
+    )
     cfg = load_config(ini)
-    assert cfg.data_dir == (tmp_path / "mydata").resolve()
-    assert cfg.images_dir == (tmp_path / "imgs").resolve()
+    assert cfg.data_dir == (tmp_path / "output").resolve()
+    assert cfg.qupath_manifest == (tmp_path / "inputs/qupath.json").resolve()
+    assert cfg.marker_registry == (tmp_path / "policy/markers.json").resolve()
+    assert cfg.typing_rules == (tmp_path / "policy/types.json").resolve()
 
 
-def test_absolute_paths_preserved(tmp_path):
-    ini = tmp_path / "config.ini"
-    abs_imgs = tmp_path / "abs" / "images"
-    ini.write_text(f"[paths]\nimages_dir = {abs_imgs}\n")
-    cfg = load_config(ini)
-    assert cfg.images_dir == abs_imgs
-
-
-def test_lineage_ini_section(tmp_path):
-    ini = tmp_path / "config.ini"
-    ini.write_text("[lineage]\nhormone_min_norm = 4\ncd99_bright = 2.5\n")
-    cfg = load_config(ini)
-    assert cfg.hormone_min_norm == 4.0
-    assert cfg.cd99_bright == 2.5
-
-
-def test_env_override(monkeypatch, tmp_path):
+def test_environment_overrides(monkeypatch, tmp_path):
     monkeypatch.setenv("PHENOCYCLER_JOBS", "4")
-    monkeypatch.setenv("PHENOCYCLER_DATA_DIR", str(tmp_path / "envdata"))
-    monkeypatch.setenv("PHENOCYCLER_HORMONE_MIN_NORM", "6")
+    monkeypatch.setenv("PHENOCYCLER_DATA_DIR", str(tmp_path / "data"))
     cfg = load_config()
     assert cfg.n_jobs == 4
-    assert cfg.data_dir == tmp_path / "envdata"
-    assert cfg.hormone_min_norm == 6.0
+    assert cfg.data_dir == tmp_path / "data"
 
 
-def test_discover_donors(tmp_path):
+def test_discover_donors_keeps_central_fail_closed_exclusions(tmp_path):
     cfg = load_config(data_dir=tmp_path)
-    for d in ("6539", "6450", "6414"):
-        (tmp_path / "cells" / f"donor_id={d}").mkdir(parents=True)
-    assert cfg.discover_donors() == ["6414", "6450", "6539"]   # sorted
+    for donor in ("6579", "6539", "6457", "6450"):
+        (cfg.cells_dir / f"donor_id={donor}").mkdir(parents=True)
+    assert cfg.discover_donors() == ["6450", "6539"]
+    for donor in DONOR_EXCLUSIONS:
+        with pytest.raises(ValueError, match=rf"excluded donor.*{donor}"):
+            ensure_eligible_donors(["6539", donor], context="test")
 
 
-def test_constants_shape():
-    assert len(LINEAGES) == 7
-    assert "Neural" in LINEAGES and "Neutrophil" not in LINEAGES   # Neutrophil folded into Immune
-    assert "CD99" in LINEAGES["Endocrine"]
-    assert "MPO" in LINEAGES["Immune"]                             # neutrophils (MPO) are Immune
-    assert LINEAGES["Neural"] == ["B3TUBB"]
-    assert set(STRUCT_LINEAGES) == {"Epithelial", "Fibroblast", "Muscle"}
-    assert len(DEFAULT_MARKER_PAIRS) == 10          # the validated 10-marker gates stay unchanged
-    assert len(EXTRA_MARKER_PAIRS) == 3
-    assert set(EXTRA_MARKERS) == {"CD99", "B3TUBB", "MPO"}
+def test_stale_redsea_modes_are_rejected():
+    with pytest.raises(ValueError, match="mass-conserving"):
+        load_config(redsea_norm_form="recipient")
+    with pytest.raises(TypeError, match="unknown"):
+        load_config(redsea_emit_compartments=False)
 
 
-def test_config_matches_science_modules():
-    """Guard the two independent definitions against class-count / CD99 drift."""
-    from phenocycler import lineage, marker_taxonomy
-    assert list(lineage.LNAMES) == list(LINEAGES)                 # lineage uses config's LINEAGES
-    assert load_config().cd99_bright == marker_taxonomy.CD99_BRIGHT
+# --------------------------------------------------------------------------- #
+# Integration-layer surface
+# --------------------------------------------------------------------------- #
+
+def test_integration_surface_survives_for_the_integration_layer():
+    """`phenocycler/integration/` is 22 modules of shipped code whose only coupling to the
+    core is this config surface. It arrived after this branch diverged, so nothing on the
+    core side would notice if a rebase dropped it — the failure would be an AttributeError
+    at stage-run time, not at import.
+    """
+    cfg = load_config()
+    for attr in ("integration_mode", "cells_pheno_dir", "cells_xen_dir", "manifest_csv",
+                 "panel_explorer", "tissue_list", "islet_eps_um", "qc_tissue_dice_min",
+                 "crossmodal_min_anchors", "hormone_min_norm", "cd99_bright"):
+        assert hasattr(cfg, attr), f"integration layer needs cfg.{attr}"
+    assert cfg.resolve_rois()                      # tissue -> ROI expansion works
+    assert set(LINEAGES) >= {"Immune", "Endocrine"}   # vocab.py builds its crosswalk from this
+    assert HORMONE_MARKERS and EXTRA_MARKERS
+
+
+def test_integration_mode_is_validated():
+    assert load_config(integration_mode="same_slide").integration_mode == "same_slide"
+    with pytest.raises(ValueError, match="sequential"):
+        load_config(integration_mode="bogus")

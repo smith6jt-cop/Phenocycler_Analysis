@@ -1,15 +1,10 @@
-"""
-Central configuration for the phenocycler pipeline.
+"""Compact configuration for the content-addressed workflow.
 
-Everything that was a hardcoded absolute path or a magic constant in the
-upstream ``scripts/senior/*.py`` scripts lives here instead, resolved from
-``config.ini`` (see the repo root) with environment-variable and keyword
-overrides.  The scientific defaults (REDSEA subtract-only / α=1 / 1-px band,
-RESTORE SSC model + robust guard, the 7 broad lineages) are preserved exactly;
-this module only makes the *paths* and *compute knobs* configurable.
-
-Resolution order for every value: explicit keyword override  >  environment
-variable  >  ``config.ini``  >  built-in default.
+Biological marker meaning lives in ``marker_registry.json`` and
+``typing_rules.json``.  Raw input identity lives in the QuPath cohort manifest.
+This file therefore contains only output roots, fixed image/QC parameters and
+operational compute settings; it does not duplicate marker pairs or cell-type
+rules.
 """
 
 from __future__ import annotations
@@ -20,142 +15,115 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
-# --------------------------------------------------------------------------- #
-# Scientific constants (faithful to Islet-Explorer-Senior; not usually tuned)
-# --------------------------------------------------------------------------- #
+from .cohort import filter_eligible_donors
 
-# Broad-lineage gating markers -> the seven mutually-exclusive lineages
-# (scripts/senior/assign_broad_lineage.py).  CD99 (bright-only) is an Endocrine
-# gate; Neural (B3TUBB) is carved out of the structural background; MPO
-# (neutrophils/granulocytes) is folded into Immune (neutrophils ARE immune cells).
-# CD99/B3TUBB/MPO are gated in a SEPARATE RESTORE pass (EXTRA_MARKER_PAIRS) and
-# merged by object_id at assignment time.
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_INI = _REPO_ROOT / "config.ini"
+_PACKAGE_DIR = Path(__file__).resolve().parent
+
+
+def _boolean(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# --------------------------------------------------------------------------- #
+# Legacy broad-lineage vocabulary — integration layer only.
+#
+# The core typing pipeline on this branch does NOT use these: it types from
+# marker_registry.json + typing_rules.json into its own compartments. They
+# remain because phenocycler/integration/ imports them at module scope
+# (vocab.py derives the PhenoCycler side of the PhenoCycler<->Xenium crosswalk
+# from LINEAGES) and would not import at all without them.
+#
+# They therefore describe the vocabulary the integration crosswalk was BUILT
+# against, not the vocabulary this branch's typing emits. Reconciling the two
+# is the open question tracked in docs/INTEGRATION.md; until that lands, do not
+# read these as a statement of the current taxonomy.
+# --------------------------------------------------------------------------- #
 LINEAGES: dict[str, list[str]] = {
     "Epithelial": ["Pan_Cytokeratin"],
     "Fibroblast": ["Vimentin"],
-    "Immune": ["CD3e", "CD20", "CD163", "MPO"],   # +MPO (neutrophils folded into Immune)
+    "Immune": ["CD3e", "CD20", "CD163", "MPO"],
     "Endocrine": ["INS", "GCG", "SST", "CD99"],
     "Endothelial": ["CD31"],
     "Muscle": ["SMA"],
     "Neural": ["B3TUBB"],
 }
-# Structural background is resolved by argmax of these three `_norm` scores.
-STRUCT_LINEAGES: list[str] = ["Epithelial", "Fibroblast", "Muscle"]
-
 LINEAGE_COLORS: dict[str, str] = {
     "Epithelial": "#4477AA", "Fibroblast": "#EE6677", "Immune": "#228833",
     "Endocrine": "#CCBB44", "Endothelial": "#66CCEE", "Muscle": "#AA3377",
-    "Neural": "#B5838D",   # dusty rose (CVD-safe)
-}
-# unique 3-char codes for the terse per-donor progress line (Endocrine/Endothelial
-# would otherwise collide under a naive name[:3]).
-LINEAGE_ABBR: dict[str, str] = {
-    "Epithelial": "Epi", "Fibroblast": "Fib", "Immune": "Imm", "Endocrine": "Enc",
-    "Endothelial": "Eth", "Muscle": "Mus", "Neural": "Nrl",
+    "Neural": "#B5838D",
 }
 STATUS_ORDER: list[str] = ["ND", "AAB", "T1D"]
-
-# RESTORE mutually-exclusive [target, reference] pairs
-# (scripts/senior/restore_normalize.py DEFAULT_MARKER_PAIRS).  Pan_Cytokeratin
-# is the universal negative control; CD3e<-CD163 is the documented exception.
-DEFAULT_MARKER_PAIRS: list[list[str]] = [
-    ["Pan_Cytokeratin", "Vimentin"],
-    ["Vimentin", "Pan_Cytokeratin"],
-    ["INS", "Pan_Cytokeratin"],
-    ["GCG", "Pan_Cytokeratin"],
-    ["SST", "Pan_Cytokeratin"],
-    ["CD31", "Pan_Cytokeratin"],
-    ["SMA", "Pan_Cytokeratin"],
-    ["CD3e", "CD163"],
-    ["CD20", "Pan_Cytokeratin"],
-    ["CD163", "Pan_Cytokeratin"],
-]
-
-# Extra RESTORE pass (run separately with --no-robust --no-ref-qc so the validated
-# 10-pair gates in restore_gated_redsea stay byte-identical).  These three markers
-# (Endocrine-CD99 / Neural-B3TUBB / Immune-MPO) are gated against Pan_Cytokeratin
-# into restore_gated_redsea_extra and merged into the lineage call by object_id.
-EXTRA_MARKER_PAIRS: list[list[str]] = [
-    ["CD99", "Pan_Cytokeratin"],
-    ["B3TUBB", "Pan_Cytokeratin"],
-    ["MPO", "Pan_Cytokeratin"],
-]
-EXTRA_MARKERS: list[str] = [p[0] for p in EXTRA_MARKER_PAIRS]   # CD99, B3TUBB, MPO
-
-# _pos floors applied by the hormone_floor stage before lineage assignment, to strip the
-# RESTORE marginal-positive shoulder (mean+3sigma threshold landing in the noise for sparse markers):
-#   - hormones {INS,GCG,SST} at hormone_min_norm (K=5) -- the false-endocrine fix.
-#   - immune {CD3e,CD20,CD163} at immune_min_norm (K=2) -- the false-immune over-call fix (e.g. donor
-#     6476's 40% CD3e was a threshold over-call; K=2 validated to preserve 6579's real pancreatitis
-#     T-cell mode + the ND->T1D T-gain). MPO (extra dir) is gated at immune_min_norm in lineage.py.
 HORMONE_MARKERS: list[str] = ["INS", "GCG", "SST"]
-IMMUNE_FLOOR_MARKERS: list[str] = ["CD3e", "CD20", "CD163"]   # main-dir immune markers floored in-stage
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_INI = _REPO_ROOT / "config.ini"
+EXTRA_MARKERS: list[str] = ["CD99", "B3TUBB", "MPO"]
 
 
 @dataclass
 class PipelineConfig:
-    """Resolved paths + compute knobs for a pipeline run."""
+    """Resolved workflow paths and scientific/compute parameters."""
 
-    # -- roots (absolute; usually machine-specific -> set in config.ini) ------
+    # Source and output contracts.
     data_dir: Path = _REPO_ROOT / "data"
-    images_dir: Path = _REPO_ROOT / "data" / "raw" / "images"
-    cells_csv: Path = _REPO_ROOT / "data" / "raw" / "Cellmeasurements.csv"
-    donor_metadata: Path = _REPO_ROOT / "data" / "raw" / "donor_metadata_panc.xlsx"
-    restore_vendor: Path = _REPO_ROOT / "external" / "RESTORE" / "python_code"
+    qupath_manifest: Path = _REPO_ROOT / "data" / "qupath_manifest.json"
+    marker_registry: Path = _PACKAGE_DIR / "marker_registry.json"
+    typing_rules: Path = _PACKAGE_DIR / "typing_rules.json"
 
-    # -- metadata schema -----------------------------------------------------
-    metadata_donor_col: str = "donor_id"
-    metadata_status_col: str = "disease.status"
+    # Ingest retains tiny fragments only above this structural floor. Geometry
+    # QC is a later immutable flag and never deletes rows.
+    cells_min_cell_area: float = 5.0
 
-    # -- REDSEA (scripts/senior/redsea_full.py defaults) ---------------------
+    # Geometry QC.
+    cell_qc_min_cell_area: float = 20.0
+    cell_qc_max_area_median_multiple: float = 4.0
+    cell_qc_min_cell_solidity: float = 0.70
+    cell_qc_min_raster_area_ratio: float = 0.50
+    cell_qc_max_raster_area_ratio: float = 2.00
+    cell_qc_no_cytoplasm_nc_ratio: float = 0.999
+    cell_qc_duplicate_radius_um: float = 1.0
+    cell_qc_duplicate_area_tol: float = 0.15
+
+    # REDSEA. Compartment output and fail-fast alignment are mandatory in code.
     redsea_downsample: float = 1.0
-    redsea_edge_radius: int = 0      # 0 == the 1-px cell rim
-    redsea_comp_mode: int = 0        # 0 == subtract-only
+    redsea_edge_radius: int = 0
+    redsea_comp_mode: int = 1
     redsea_alpha: float = 1.0
     redsea_gap_bridge: int = 1
+    redsea_norm_form: str = "donor"
+    redsea_exclude_no_spillover: bool = True
 
-    # -- RESTORE (scripts/senior/restore_normalize.py defaults) --------------
-    restore_model: str = "SSC"       # SSC | GMM | KMeans
-    restore_subsample: int = 15000
-    restore_robust: bool = True
-    restore_robust_factor: float = 3.0
-    restore_min_cell_area: float = 5.0
-    restore_seed: int = 0
-
-    # -- lineage (assign_broad_lineage.py + apply_hormone_floor.py + marker_taxonomy.py) --
-    hormone_min_norm: float = 5.0    # K: {INS,GCG,SST}_pos := _norm >= K (false-endocrine floor)
-    immune_min_norm: float = 2.0     # K: {CD3e,CD20,CD163,MPO}_pos := _norm >= K (false-immune floor)
-    cd99_bright: float = 3.0         # CD99_pos := CD99_norm >= this (bright-only Endocrine gate)
-
-    # -- compute -------------------------------------------------------------
-    n_jobs: int = 1                  # per-donor process pool size (1 == serial)
+    # Operational settings.
+    n_jobs: int = 1
     duckdb_threads: int = 8
-    use_gpu: bool = False            # opt-in CuPy backend for REDSEA
+    use_gpu: bool = False
     gpu_device: int = 0
 
-    # -- integration (PhenoCycler <-> Xenium; phenocycler/integration/) -------
-    # Nothing in steps 1-7 reads these; the core pipeline is unaffected.
+    # ---------------------------------------------------------------------- #
+    # Integration-layer surface (phenocycler/integration/).
+    #
+    # Consumed ONLY by the PhenoCycler <-> Xenium layer. The eight-stage core
+    # pipeline never reads any of it, and none of it enters _identity_config(),
+    # so it cannot change what a run records as its scientific configuration.
+    #
+    # It lives here because the integration layer arrived on main after this
+    # branch diverged: it is 22 modules of shipped, tested code whose only
+    # coupling to the core is this config surface. Dropping the fields would
+    # delete that work by omission rather than by decision.
+    # ---------------------------------------------------------------------- #
+    images_dir: Path = _REPO_ROOT / "data" / "raw" / "images"
+    donor_metadata: Path = _REPO_ROOT / "data" / "raw" / "donor_metadata_panc.xlsx"
+    metadata_donor_col: str = "donor_id"
+    metadata_status_col: str = "disease.status"
+    hormone_min_norm: float = 5.0    # K: {INS,GCG,SST}_pos := _norm >= K (false-endocrine floor)
+    cd99_bright: float = 3.0         # CD99_pos := CD99_norm >= this (bright-only Endocrine gate)
     integration_mode: str = "sequential"          # sequential | same_slide
     xenium_paths_csv: Path = _REPO_ROOT / "data" / "integration" / "xenium_paths.csv"
     donor_overrides_csv: Path = _REPO_ROOT / "data" / "integration" / "donor_overrides.csv"
     xenium_root: str = ""                         # optional prefix rewrite for bundle paths
     panel_explorer: Path = _REPO_ROOT / "external" / "XeniumPanelExplorer"
-    # Tissue is a property of the DATASET, fixed when it is imported, not of the analysis.
-    # The cohort is 20 donors x {PhenoCycler, Xenium} x {pancreas, pancreatic lymph node}, and
-    # every stage can run on one tissue or on both pooled — so `tissue` rides through the cell
-    # table as a column and the stage runners filter on it, rather than being a global mode.
     tissue: str = "pancreas"                      # default for datasets that do not declare one
     tissues: str = "pancreas,pancreatic_lymph_node"   # comma-separated; the cohort's tissues
-    # Where each tissue's PhenoCycler core-pipeline output lives, as
-    # `tissue=/path/to/data,tissue=/path/to/data`. Needed because the core pipeline derives
-    # donor_id as the first digit-run of the qptiff name, so a donor's pancreas and lymph-node
-    # images both land in `data/cells/donor_id=6539` and cannot be told apart afterwards. The
-    # fix is one core-pipeline data dir per tissue; this maps tissue -> that dir. Empty means
-    # every tissue shares `data_dir`, which is correct for a single-tissue cohort and is
-    # detected and refused for a multi-tissue one rather than silently duplicating cells.
     pheno_tissue_dirs: str = ""
     fixed_modality: str = "phenocycler"           # which frame registration targets
     reg_pixel_um: float = 2.0                     # raster resolution for registration
@@ -170,15 +138,6 @@ class PipelineConfig:
     match_max_dist_um: float = 200.0
     match_area_ratio: float = 2.5
     crossmodal_min_anchors: int = 8               # refuse pseudo-cell linking below this
-    # S6b cell matching inside matched islets. The thresholds are not style choices: a
-    # simulation of adjacent 5 um sections puts endocrine precision at 0.95 with a <=2 um
-    # local residual and 0.40 at 5 um, so the residual gate is what separates a measurement
-    # from a coin flip. See phenocycler/integration/cellmatch.py.
-    # Post-Xenium IF staining for INS/GCG on the Xenium section. When true, Xenium endocrine
-    # identity is a protein measurement on the same cells as the RNA rather than a surrogate
-    # inference, which is what makes protein<->protein endocrine anchors possible across the
-    # serial pair. (CD3e is excluded deliberately: post-Xenium chemistry degrades epitopes and
-    # lower-abundance surface markers do not survive it reliably.)
     xenium_hormone_if: bool = False
     cellmatch_max_dist_um: float = 3.0            # centroid cap for a candidate pair
     cellmatch_max_residual_um: float = 2.0        # skip an islet above this local residual
@@ -186,25 +145,59 @@ class PipelineConfig:
     qc_tissue_dice_min: float = 0.80
     qc_islet_rmse_max_um: float = 150.0
 
-    # cached derived-path store (not a config field)
     _config_path: Optional[Path] = field(default=None, repr=False, compare=False)
 
-    # ---- derived pipeline directories (hive-partitioned donor_id=* layout) --
+    @property
+    def runs_dir(self) -> Path:
+        return self.data_dir / "runs"
+
     @property
     def cells_dir(self) -> Path:
         return self.data_dir / "cells"
 
     @property
-    def cells_redsea_dir(self) -> Path:
-        return self.data_dir / "cells_redsea"
+    def geometry_qc_dir(self) -> Path:
+        return self.data_dir / "geometry_qc"
+
+    @property
+    def redsea_dir(self) -> Path:
+        return self.data_dir / "redsea"
+
+    @property
+    def selected_expression_dir(self) -> Path:
+        return self.data_dir / "expression"
+
+    @property
+    def reference_controls_dir(self) -> Path:
+        return self.data_dir / "reference_controls"
+
+    @property
+    def marker_evidence_dir(self) -> Path:
+        return self.data_dir / "marker_evidence"
+
+    @property
+    def assignments_dir(self) -> Path:
+        return self.data_dir / "assignments"
+
+    @property
+    def state_dir(self) -> Path:
+        return self.data_dir / "cell_states"
+
+    @property
+    def qupath_class_dir(self) -> Path:
+        return self.data_dir / "qupath_export"
+
+    @property
+    def audit_dir(self) -> Path:
+        return self.data_dir / "audit"
+
+    @property
+    def manifests_dir(self) -> Path:
+        return self.data_dir / "manifests"
 
     @property
     def redsea_scratch(self) -> Path:
-        return self.data_dir / "redsea_scratch"
-
-    @property
-    def geojson_dir(self) -> Path:
-        return self.redsea_scratch / "geojson"
+        return self.data_dir / "scratch" / "redsea"
 
     @property
     def mask_dir(self) -> Path:
@@ -214,39 +207,37 @@ class PipelineConfig:
     def inter_dir(self) -> Path:
         return self.redsea_scratch / "intermediates"
 
-    @property
-    def restore_dir(self) -> Path:
-        return self.data_dir / "restore_redsea"
+    def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
+        """Unique, eligible **donor ids** behind the discovered sections.
 
-    @property
-    def restore_gated_dir(self) -> Path:
-        return self.data_dir / "restore_gated_redsea"
+        Distinct from :meth:`discover_sections` on purpose. Stages that process images want
+        sections; the pairing manifest and the donor workbook join want donors. Conflating
+        them is how ``6539pln`` becomes a phantom donor with no metadata and no Xenium
+        counterpart, which then shows up in the manifest as a real pairing gap.
 
-    @property
-    def restore_gated_prefloor_dir(self) -> Path:
-        # pre-hormone-floor backup; the hormone_floor stage reads this and (re)writes restore_gated_dir
-        return self.data_dir / "restore_gated_redsea.pre_hormonefloor"
+        Composes the two definitions this branch and ``main`` arrived at independently: the
+        section-to-donor parse, and the fail-closed cohort exclusion. Both are load-bearing
+        and neither subsumes the other — on a one-image-per-donor cohort the parse is the
+        identity, so keeping it costs nothing and stops a multi-section donor from being
+        counted twice the moment the lymph-node sections land.
+        """
+        from .sections import parse
 
-    @property
-    def restore_redsea_extra_dir(self) -> Path:
-        return self.data_dir / "restore_redsea_extra"
+        out = set()
+        for key in self.discover_sections(from_dir):
+            try:
+                out.add(parse(key).donor_id)
+            except Exception:  # noqa: BLE001 - an unparseable key is surfaced by the stage
+                out.add(key)
+        return filter_eligible_donors(sorted(out))
 
-    @property
-    def restore_gated_extra_dir(self) -> Path:
-        return self.data_dir / "restore_gated_redsea_extra"
-
-    @property
-    def restore_thresholds_csv(self) -> Path:
-        return self.data_dir / "restore_thresholds_redsea.csv"
-
-    @property
-    def restore_thresholds_extra_csv(self) -> Path:
-        return self.data_dir / "restore_thresholds_extra.csv"
-
-    @property
-    def redsea_reassess_dir(self) -> Path:
-        return self.data_dir / "redsea_reassess"
-
+    # ---------------------------------------------------------------------- #
+    # Integration-layer derived paths and tissue/ROI helpers. Same rationale as
+    # the field block above. `broad_dir` / `restore_gated_dir` still name the
+    # legacy layout because integration/export_pheno.py has not yet been
+    # repointed at this branch's assignments/ + marker_evidence/ outputs; see
+    # docs/INTEGRATION.md for the status of that follow-up.
+    # ---------------------------------------------------------------------- #
     @property
     def phenotype_dir(self) -> Path:
         return self.data_dir / "phenotype"
@@ -256,10 +247,17 @@ class PipelineConfig:
         return self.phenotype_dir / "broad"
 
     @property
-    def qupath_class_dir(self) -> Path:
-        return self.phenotype_dir / "qupath_class"
+    def restore_gated_dir(self) -> Path:
+        return self.data_dir / "restore_gated_redsea"
 
-    # ---- derived integration directories (data/integration/*) --------------
+    @property
+    def restore_gated_extra_dir(self) -> Path:
+        return self.data_dir / "restore_gated_redsea_extra"
+
+    @property
+    def geojson_dir(self) -> Path:
+        return self.redsea_scratch / "geojson"
+
     @property
     def integration_dir(self) -> Path:
         return self.data_dir / "integration"
@@ -318,11 +316,6 @@ class PipelineConfig:
     def integration_figures_dir(self) -> Path:
         return self.integration_dir / "figures"
 
-    @property
-    def integration_export_dir(self) -> Path:
-        return self.integration_dir / "export"
-
-    # ---- tissue helpers ----------------------------------------------------
     @property
     def tissue_list(self) -> list[str]:
         """The cohort's tissues, in declaration order."""
@@ -387,7 +380,6 @@ class PipelineConfig:
                     out.append(r)
         return out
 
-    # ---- helpers -----------------------------------------------------------
     def discover_sections(self, from_dir: Optional[Path] = None) -> list[str]:
         """Section keys by globbing ``<dir>/donor_id=*`` (defaults to cells_dir).
 
@@ -398,55 +390,34 @@ class PipelineConfig:
         base = Path(from_dir) if from_dir is not None else self.cells_dir
         return sorted(p.name.split("=", 1)[1] for p in base.glob("donor_id=*"))
 
-    def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
-        """Unique **donor ids** behind the discovered sections.
-
-        Distinct from :meth:`discover_sections` on purpose. Stages that process images want
-        sections; the pairing manifest and the donor workbook join want donors. Conflating
-        them is how ``6539pln`` becomes a phantom donor with no metadata and no Xenium
-        counterpart, which then shows up in the manifest as a real pairing gap.
-        """
-        from .sections import parse
-
-        out = set()
-        for key in self.discover_sections(from_dir):
-            try:
-                out.add(parse(key).donor_id)
-            except Exception:  # noqa: BLE001 - an unparseable key is surfaced by the stage
-                out.add(key)
-        return sorted(out)
-
     def discover_section_objects(self, from_dir: Optional[Path] = None) -> list:
         """:class:`phenocycler.sections.Section` for every discovered partition."""
         from .sections import parse
 
         return [parse(k) for k in self.discover_sections(from_dir)]
 
-    def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.geojson_dir, self.mask_dir, self.inter_dir):
-            d.mkdir(parents=True, exist_ok=True)
-
-
-# --------------------------------------------------------------------------- #
-# Loading
-# --------------------------------------------------------------------------- #
-
-def _as_bool(s) -> bool:
-    return str(s).lower() in ("1", "true", "yes", "on")
-
-
-# config.ini [section] -> {ini_key: (attr_name, caster)}
 _INI_SCHEMA = {
     "paths": {
         "data_dir": ("data_dir", Path),
-        "images_dir": ("images_dir", Path),
-        "cells_csv": ("cells_csv", Path),
-        "donor_metadata": ("donor_metadata", Path),
-        "restore_vendor": ("restore_vendor", Path),
+        "qupath_manifest": ("qupath_manifest", Path),
+        "marker_registry": ("marker_registry", Path),
+        "typing_rules": ("typing_rules", Path),
     },
-    "metadata": {
-        "donor_col": ("metadata_donor_col", str),
-        "status_col": ("metadata_status_col", str),
+    "cells": {
+        "min_cell_area": ("cells_min_cell_area", float),
+    },
+    "geometry_qc": {
+        "min_cell_area": ("cell_qc_min_cell_area", float),
+        "max_area_median_multiple": (
+            "cell_qc_max_area_median_multiple",
+            float,
+        ),
+        "min_cell_solidity": ("cell_qc_min_cell_solidity", float),
+        "min_raster_area_ratio": ("cell_qc_min_raster_area_ratio", float),
+        "max_raster_area_ratio": ("cell_qc_max_raster_area_ratio", float),
+        "no_cytoplasm_nc_ratio": ("cell_qc_no_cytoplasm_nc_ratio", float),
+        "duplicate_radius_um": ("cell_qc_duplicate_radius_um", float),
+        "duplicate_area_tol": ("cell_qc_duplicate_area_tol", float),
     },
     "redsea": {
         "downsample": ("redsea_downsample", float),
@@ -454,25 +425,23 @@ _INI_SCHEMA = {
         "comp_mode": ("redsea_comp_mode", int),
         "alpha": ("redsea_alpha", float),
         "gap_bridge": ("redsea_gap_bridge", int),
+        "norm_form": ("redsea_norm_form", str),
+        "exclude_no_spillover": ("redsea_exclude_no_spillover", _boolean),
     },
-    "restore": {
-        "model": ("restore_model", str),
-        "subsample": ("restore_subsample", int),
-        "robust": ("restore_robust", lambda s: str(s).lower() in ("1", "true", "yes", "on")),
-        "robust_factor": ("restore_robust_factor", float),
-        "min_cell_area": ("restore_min_cell_area", float),
-        "seed": ("restore_seed", int),
+    "compute": {
+        "n_jobs": ("n_jobs", int),
+        "duckdb_threads": ("duckdb_threads", int),
+        "use_gpu": ("use_gpu", _boolean),
+        "gpu_device": ("gpu_device", int),
+    },
+    "metadata": {
+        "donor_col": ("metadata_donor_col", str),
+        "status_col": ("metadata_status_col", str),
     },
     "lineage": {
         "hormone_min_norm": ("hormone_min_norm", float),
         "immune_min_norm": ("immune_min_norm", float),
         "cd99_bright": ("cd99_bright", float),
-    },
-    "compute": {
-        "n_jobs": ("n_jobs", int),
-        "duckdb_threads": ("duckdb_threads", int),
-        "use_gpu": ("use_gpu", lambda s: str(s).lower() in ("1", "true", "yes", "on")),
-        "gpu_device": ("gpu_device", int),
     },
     "integration": {
         "mode": ("integration_mode", str),
@@ -485,7 +454,7 @@ _INI_SCHEMA = {
         "pheno_tissue_dirs": ("pheno_tissue_dirs", str),
         "fixed_modality": ("fixed_modality", str),
         "reg_pixel_um": ("reg_pixel_um", float),
-        "reg_nonrigid": ("reg_nonrigid", _as_bool),
+        "reg_nonrigid": ("reg_nonrigid", _boolean),
         "reg_max_disp_um": ("reg_max_disp_um", float),
         "islet_eps_um": ("islet_eps_um", float),
         "islet_min_samples": ("islet_min_samples", int),
@@ -496,7 +465,7 @@ _INI_SCHEMA = {
         "match_max_dist_um": ("match_max_dist_um", float),
         "match_area_ratio": ("match_area_ratio", float),
         "crossmodal_min_anchors": ("crossmodal_min_anchors", int),
-        "xenium_hormone_if": ("xenium_hormone_if", _as_bool),
+        "xenium_hormone_if": ("xenium_hormone_if", _boolean),
         "cellmatch_max_dist_um": ("cellmatch_max_dist_um", float),
         "cellmatch_max_residual_um": ("cellmatch_max_residual_um", float),
         "cellmatch_min_signal_over_null": ("cellmatch_min_signal_over_null", float),
@@ -505,18 +474,15 @@ _INI_SCHEMA = {
     },
 }
 
-# attr_name -> environment variable that overrides it
 _ENV_OVERRIDES = {
     "data_dir": ("PHENOCYCLER_DATA_DIR", Path),
-    "images_dir": ("PHENOCYCLER_IMAGES_DIR", Path),
-    "cells_csv": ("PHENOCYCLER_CELLS_CSV", Path),
-    "donor_metadata": ("PHENOCYCLER_DONOR_METADATA", Path),
-    "restore_vendor": ("PHENOCYCLER_RESTORE_VENDOR", Path),
+    "qupath_manifest": ("PHENOCYCLER_QUPATH_MANIFEST", Path),
     "n_jobs": ("PHENOCYCLER_JOBS", int),
-    "use_gpu": ("PHENOCYCLER_USE_GPU", _as_bool),
+    "use_gpu": ("PHENOCYCLER_USE_GPU", _boolean),
+    # Integration layer (see the quarantined block on PipelineConfig).
+    "images_dir": ("PHENOCYCLER_IMAGES_DIR", Path),
+    "donor_metadata": ("PHENOCYCLER_DONOR_METADATA", Path),
     "hormone_min_norm": ("PHENOCYCLER_HORMONE_MIN_NORM", float),
-    "immune_min_norm": ("PHENOCYCLER_IMMUNE_MIN_NORM", float),
-    # integration
     "integration_mode": ("PHENOCYCLER_INTEGRATION_MODE", str),
     "xenium_paths_csv": ("PHENOCYCLER_XENIUM_PATHS_CSV", Path),
     "xenium_root": ("PHENOCYCLER_XENIUM_ROOT", str),
@@ -525,64 +491,74 @@ _ENV_OVERRIDES = {
 }
 
 
-def load_config(config_path: Optional[os.PathLike | str] = None, **overrides) -> PipelineConfig:
-    """Build a :class:`PipelineConfig`.
+def load_config(
+    config_path: Optional[os.PathLike | str] = None,
+    **overrides,
+) -> PipelineConfig:
+    """Load config.ini, environment variables and explicit overrides."""
 
-    Parameters
-    ----------
-    config_path
-        Path to a ``config.ini``.  Defaults to ``<repo>/config.ini`` if it
-        exists; missing file is fine (built-in defaults are used).
-    **overrides
-        Keyword overrides that win over everything (values are used verbatim;
-        pass ``Path`` objects for path fields).
-    """
     cfg = PipelineConfig()
-    ini_path = Path(config_path) if config_path is not None else _DEFAULT_INI
-
+    ini_path = (
+        Path(config_path).expanduser()
+        if config_path is not None
+        else _DEFAULT_INI
+    )
     if ini_path.exists():
+        ini_path = ini_path.resolve()
         cfg._config_path = ini_path
         parser = ConfigParser(inline_comment_prefixes=("#", ";"))
         parser.read(ini_path)
         for section, mapping in _INI_SCHEMA.items():
             if not parser.has_section(section):
                 continue
-            for key, (attr, caster) in mapping.items():
+            for key, (attribute, caster) in mapping.items():
                 if parser.has_option(section, key):
                     raw = parser.get(section, key).strip()
-                    if raw != "":
-                        setattr(cfg, attr, caster(raw))
+                    if raw:
+                        setattr(cfg, attribute, caster(raw))
 
-    for attr, (env, caster) in _ENV_OVERRIDES.items():
-        raw = os.environ.get(env)
+    for attribute, (environment, caster) in _ENV_OVERRIDES.items():
+        raw = os.environ.get(environment)
         if raw:
-            setattr(cfg, attr, caster(raw))
+            setattr(cfg, attribute, caster(raw))
 
-    valid = {f.name for f in fields(cfg)}
-    for key, val in overrides.items():
+    valid = {item.name for item in fields(cfg)}
+    for key, value in overrides.items():
         if key not in valid:
             raise TypeError(f"unknown PipelineConfig override: {key!r}")
-        setattr(cfg, key, val)
+        setattr(cfg, key, value)
 
-    # Normalize path fields to absolute Paths. Relative paths resolve against the
-    # config file's directory (the repo root) — not the cwd — so the pipeline works
-    # from notebooks/, SLURM jobs, or anywhere the package is imported.
     base = ini_path.parent if ini_path.exists() else _REPO_ROOT
-    for name in ("data_dir", "images_dir", "cells_csv", "donor_metadata", "restore_vendor",
-                 "xenium_paths_csv", "donor_overrides_csv", "panel_explorer"):
-        p = Path(getattr(cfg, name)).expanduser()
-        if not p.is_absolute():
-            p = (base / p).resolve()
-        setattr(cfg, name, p)
+    for name in (
+        "data_dir",
+        "qupath_manifest",
+        "marker_registry",
+        "typing_rules",
+    ):
+        path = Path(getattr(cfg, name)).expanduser()
+        if not path.is_absolute():
+            path = (base / path).resolve()
+        setattr(cfg, name, path)
+
+    for name in ("images_dir", "donor_metadata", "xenium_paths_csv",
+                 "donor_overrides_csv", "panel_explorer"):
+        path = Path(getattr(cfg, name)).expanduser()
+        if not path.is_absolute():
+            path = (base / path).resolve()
+        setattr(cfg, name, path)
 
     if cfg.integration_mode not in ("sequential", "same_slide"):
         raise ValueError(
-            f"[integration] mode must be 'sequential' or 'same_slide', got {cfg.integration_mode!r}"
-        )
-    if cfg.fixed_modality not in ("phenocycler", "xenium"):
-        raise ValueError(
-            f"[integration] fixed_modality must be 'phenocycler' or 'xenium', "
-            f"got {cfg.fixed_modality!r}"
-        )
+            f"[integration] mode must be 'sequential' or 'same_slide', "
+            f"got {cfg.integration_mode!r}")
 
+    if cfg.redsea_norm_form != "donor":
+        raise ValueError("production REDSEA requires mass-conserving norm_form='donor'")
     return cfg
+
+
+__all__ = [
+    "PipelineConfig", "load_config",
+    # integration-layer vocabulary (see the block above)
+    "LINEAGES", "LINEAGE_COLORS", "STATUS_ORDER", "HORMONE_MARKERS", "EXTRA_MARKERS",
+]

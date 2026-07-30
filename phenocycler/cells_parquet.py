@@ -1,47 +1,43 @@
 #!/usr/bin/env python3
-"""
-Step 1 — stream the QuPath per-cell export into a tidy, donor-partitioned
-Parquet dataset via DuckDB.
+"""Stream contracted QuPath measurements into canonical donor partitions.
 
-Faithful port of ``scripts/senior/build_cells_parquet.py`` (Islet-Explorer-
-Senior).  The only changes vs. upstream are that the input CSV, output root and
-thread count come from :class:`phenocycler.config.PipelineConfig` (config.ini)
-instead of hardcoded ``~/IO60panc2nd`` paths.
-
-Input  : <cells_csv>                     (the full QuPath ``Cellmeasurements.csv``,
-                                           ~23.3M cells, ~1,228 cols, ~138 GB)
-Output : <data_dir>/cells/donor_id=<key>/*.parquet   (~65 cols: identity, spatial,
-         morphology, region, and the whole-cell marker means)
-
-``<key>`` is a **section** key, not a bare donor id — ``6539`` for a donor's pancreas and
-``6539pln`` for its lymph node, derived from the qptiff name by
-:data:`phenocycler.sections.SECTION_KEY_SQL`. One partition is one image throughout this
-pipeline: REDSEA masks a partition with a single GeoJSON, RESTORE fits one threshold set per
-partition, and micron coordinates are measured from one slide origin. Keying on the donor
-alone put a donor's two images in one partition, which is not a labelling nuisance but a
-silent correctness failure — see ``phenocycler/sections.py`` for the full argument.
+Input  : measurement CSVs named by the QuPath cohort manifest. Panels differ
+         between batches, so ingest reconciles headers and keeps the marker
+         UNION plus availability.
+Output : <run>/cells/donor_id=<id>/*.parquet with exact keys, geometry-QC
+         inputs, spatial region and one raw Cell/Nucleus source per marker.
 
 Region scheme: Parent ``Islet_N`` = core, ``Islet_N_exp20um`` = peri,
 ``Annotation (Tissue)`` / ``Root object`` = tissue, else other.
 
-Performance: DuckDB is the one already-parallel stage upstream — it streams the
-138 GB CSV out-of-core with ``PARTITION_BY donor_id`` + ZSTD.  We keep that and
-expose ``threads`` (and an optional ``memory_limit``) via config.
-
-    python -m phenocycler.cells_parquet                    # full run
-    python -m phenocycler.cells_parquet --limit 200000 --out /tmp/senior_test
+DuckDB streams large CSVs out of core with ``PARTITION_BY donor_id`` and ZSTD.
+Production execution is orchestrated by :mod:`phenocycler.pipeline`.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional, Sequence
 
-from .config import PipelineConfig, load_config
-from .sections import SECTION_KEY_SQL
+import pandas as pd
+
+from .artifacts import ContractError, QuPathCohortManifest, image_id_to_donor_id
+from .config import PipelineConfig
+
+
+REQUIRED_CONTEXT_COLUMNS = (
+    "Image",
+    "Object ID",
+    "Centroid X µm",
+    "Centroid Y µm",
+    "Parent",
+    "Cell: Area µm^2",
+    "Cell: Solidity",
+)
 
 
 def header_cols(csv_path: Path) -> list[str]:
@@ -59,54 +55,178 @@ def marker_means(cols: list[str]) -> dict[str, str]:
     return out
 
 
+def compartment_means(cols: list[str], compartment: str) -> dict[str, str]:
+    """Map one QuPath compartment's marker means to canonical marker names."""
+
+    pattern = re.compile(rf"^{re.escape(compartment)}: (.+): Mean$")
+    out = {}
+    for column in cols:
+        match = pattern.match(column)
+        if match:
+            out[column] = sanitize(match.group(1))
+    return out
+
+
 def sanitize(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", name).strip("_")
 
 
-def build_sql(csv_path: Path, out_dir: Path, limit: Optional[int],
-              min_cell_area: float) -> tuple[str, dict]:
-    cols = header_cols(csv_path)
-    mm = marker_means(cols)
-    if not mm:
-        raise SystemExit("No 'Cell: <marker>: Mean' columns found — check the CSV header.")
+def reconcile_headers(csv_paths: Sequence[Path]) -> tuple[dict[str, str], dict]:
+    """Return the UNION of marker means plus explicit per-export availability.
+
+    A batch-specific marker remains scientifically usable for donors acquired with that panel. The
+    old intersection silently discarded that information cohort-wide. Missing measurements are now
+    represented as null and accompanied by an availability table; downstream donor-local stages must
+    emit ``unavailable`` rather than treating null as negative.
+    """
+    if not csv_paths:
+        raise SystemExit(
+            "[err] the cohort manifest declares no QuPath measurement CSV"
+        )
+    missing = [str(p) for p in csv_paths if not Path(p).exists()]
+    if missing:
+        raise SystemExit("[err] QuPath cell CSV not found:\n       " + "\n       ".join(missing))
+
+    per_file = {}
+    for p in csv_paths:
+        columns = header_cols(Path(p))
+        absent = sorted(set(REQUIRED_CONTEXT_COLUMNS).difference(columns))
+        if absent:
+            raise SystemExit(
+                f"[err] QuPath export {p} is missing required canonical "
+                f"columns: {absent}"
+            )
+        mm = marker_means(columns)
+        if not mm:
+            raise SystemExit(f"No 'Cell: <marker>: Mean' columns found in {p} — check the header.")
+        per_file[Path(p)] = mm
+
+    # Key on the SANITIZED marker name: the same marker must map to the same output column in every
+    # file, and it is the sanitized name every downstream reader uses.
+    by_sanitized = {p: {sanitize(v): k for k, v in mm.items()} for p, mm in per_file.items()}
+    union = set.union(*(set(d) for d in by_sanitized.values()))
+    if not union:
+        raise SystemExit("[err] the QuPath exports share no marker means — check they are the same panel")
+
+    union_mm: dict[str, str] = {}
+    for marker in sorted(union):
+        originals = {mapping[marker] for mapping in by_sanitized.values() if marker in mapping}
+        if len(originals) != 1:
+            raise SystemExit(
+                f"[err] marker {marker!r} resolves from inconsistent QuPath columns "
+                f"{sorted(originals)}; add an explicit alias before ingest"
+            )
+        union_mm[originals.pop()] = marker
+
+    report = {
+        "files": {str(p): len(mm) for p, mm in per_file.items()},
+        "union": len(union),
+        "intersection": len(set.intersection(*(set(d) for d in by_sanitized.values()))),
+        "availability": {
+            str(p): {marker: marker in mapping for marker in sorted(union)}
+            for p, mapping in by_sanitized.items()
+        },
+    }
+    return union_mm, report
+
+
+def reconcile_compartment_headers(
+    csv_paths: Sequence[Path],
+    compartment: str,
+) -> dict[str, str]:
+    """Return a union of one raw QuPath compartment across acquisition batches."""
+
+    per_file = {
+        Path(path): compartment_means(header_cols(Path(path)), compartment)
+        for path in csv_paths
+    }
+    by_sanitized = {
+        path: {marker: original for original, marker in measurements.items()}
+        for path, measurements in per_file.items()
+    }
+    union = set().union(*(set(mapping) for mapping in by_sanitized.values()))
+    result: dict[str, str] = {}
+    for marker in sorted(union):
+        originals = {
+            mapping[marker] for mapping in by_sanitized.values() if marker in mapping
+        }
+        if len(originals) != 1:
+            raise SystemExit(
+                f"[err] {compartment} marker {marker!r} resolves from inconsistent "
+                f"QuPath columns {sorted(originals)}; add an explicit alias before ingest"
+            )
+        result[originals.pop()] = f"{compartment}__{marker}"
+    return result
+
+
+def _sql_string(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def donor_case_expression(image_to_donor: Mapping[str, str]) -> str:
+    """Exact QuPath Image -> donor SQL expression; no filename inference."""
+
+    mapping = {str(image): str(donor) for image, donor in image_to_donor.items()}
+    if not mapping:
+        raise ContractError("image_to_donor cannot be empty")
+    branches = " ".join(
+        f"WHEN {_sql_string(image)} THEN {_sql_string(mapping[image])}"
+        for image in sorted(mapping)
+    )
+    return (
+        f'CASE "Image" {branches} ELSE '
+        "error('unmapped QuPath Image: ' || coalesce(\"Image\", '<NULL>')) END"
+    )
+
+
+def build_sql(
+    csv_paths: Sequence[Path],
+    out_dir: Path,
+    limit: Optional[int],
+    min_cell_area: float,
+    *,
+    image_to_donor: Mapping[str, str],
+) -> tuple[str, dict]:
+    csv_paths = [Path(p) for p in ([csv_paths] if isinstance(csv_paths, (str, Path)) else csv_paths)]
+    mm, _report = reconcile_headers(csv_paths)
+    nucleus_mm = reconcile_compartment_headers(csv_paths, "Nucleus")
     selects = [
-        # Section key, not donor id: '6539_Scan1...' -> 6539, '6539pLN_Scan1...' -> 6539pln.
-        # The column keeps the name `donor_id` because it is the hive partition key every
-        # downstream stage already globs; `phenocycler.sections.parse` takes it apart.
-        f"{SECTION_KEY_SQL} AS donor_id",
+        f"{donor_case_expression(image_to_donor)} AS donor_id",
         '"Image" AS image',
         '"Object ID" AS object_id',
         "TRY_CAST(\"Centroid X µm\" AS DOUBLE) AS X_centroid",
         "TRY_CAST(\"Centroid Y µm\" AS DOUBLE) AS Y_centroid",
         '"Parent" AS parent_raw',
-        '"Classification" AS classification',
         ("CASE WHEN \"Parent\" LIKE '%exp20um' THEN 'peri' "
          "WHEN regexp_matches(\"Parent\", '^Islet_[0-9]+$') THEN 'core' "
          "WHEN \"Parent\" = 'Annotation (Tissue)' OR \"Parent\" LIKE 'Root object%' THEN 'tissue' "
          "ELSE 'other' END AS cell_region"),
         "regexp_extract(\"Parent\", 'Islet_([0-9]+)', 1) AS islet_num",
         "TRY_CAST(\"Cell: Area µm^2\" AS DOUBLE) AS cell_area",
-        "TRY_CAST(\"Nucleus: Area µm^2\" AS DOUBLE) AS nucleus_area",
-        # extra morphology + signed-distance columns (needed by downstream aggregation)
-        "TRY_CAST(\"Cell: Length µm\" AS DOUBLE) AS cell_length",
-        "TRY_CAST(\"Cell: Circularity\" AS DOUBLE) AS cell_circularity",
         "TRY_CAST(\"Cell: Solidity\" AS DOUBLE) AS cell_solidity",
-        "TRY_CAST(\"Cell: Max diameter µm\" AS DOUBLE) AS cell_maxdiam",
-        "TRY_CAST(\"Cell: Min diameter µm\" AS DOUBLE) AS cell_mindiam",
-        "TRY_CAST(\"Nucleus: Length µm\" AS DOUBLE) AS nucleus_length",
-        "TRY_CAST(\"Nucleus: Circularity\" AS DOUBLE) AS nucleus_circularity",
-        "TRY_CAST(\"Nucleus: Solidity\" AS DOUBLE) AS nucleus_solidity",
-        "TRY_CAST(\"Nucleus: Max diameter µm\" AS DOUBLE) AS nucleus_maxdiam",
-        "TRY_CAST(\"Nucleus: Min diameter µm\" AS DOUBLE) AS nucleus_mindiam",
-        "TRY_CAST(\"Nucleus/Cell area ratio\" AS DOUBLE) AS nc_area_ratio",
-        "TRY_CAST(\"Signed distance to annotation Islet µm\" AS DOUBLE) AS dist_islet",
-        "TRY_CAST(\"Signed distance to annotation Tissue µm\" AS DOUBLE) AS dist_tissue",
     ]
-    for orig, marker in mm.items():
-        selects.append(f'TRY_CAST("{orig}" AS DOUBLE) AS "{sanitize(marker)}"')
+    for orig, marker in mm.items():        # marker is already the sanitized name (reconcile_headers)
+        selects.append(f'TRY_CAST("{orig}" AS DOUBLE) AS "{marker}"')
+    # Nuclear marker means are the selected raw source for nuclear/state markers.
+    # Keeping only Cell + Nucleus avoids carrying four competing raw versions of
+    # every marker while preserving every source required by marker_registry.
+    for orig, output_column in nucleus_mm.items():
+        selects.append(f'TRY_CAST("{orig}" AS DOUBLE) AS "{output_column}"')
     sel = ",\n  ".join(selects)
-    src = (f"read_csv('{csv_path}', header=true, all_varchar=true, "
-           f"ignore_errors=true)")
+    # A LIST of exports, aligned by column NAME. Batch-only markers are intentionally NULL in files
+    # that did not acquire them; the availability report makes those nulls explicit downstream.
+    # DuckDB cannot combine `store_rejects` with read_csv's `union_by_name` option. Read each export
+    # with its own reject tables, then UNION ALL BY NAME at the relational layer instead.
+    raw_parts = []
+    for index, path in enumerate(csv_paths):
+        escaped = str(path).replace("'", "''")
+        raw_parts.append(
+            f"SELECT * FROM read_csv('{escaped}', header=true, all_varchar=true, "
+            f"ignore_errors=true, store_rejects=true, "
+            f"rejects_table='phenocycler_ingest_rejects_{index}', "
+            f"rejects_scan='phenocycler_ingest_reject_scans_{index}', rejects_limit=0)"
+        )
+    src = "(" + " UNION ALL BY NAME ".join(raw_parts) + ") AS qupath_exports"
     inner = f"SELECT\n  {sel}\nFROM {src}"
     if min_cell_area and min_cell_area > 0:
         # Drop degenerate sub-cell segmentation objects (QuPath emits NaN
@@ -124,51 +244,84 @@ def build_sql(csv_path: Path, out_dir: Path, limit: Optional[int],
 
 def build_cells_parquet(cfg: PipelineConfig, *, limit: Optional[int] = None,
                         memory_limit: Optional[str] = None) -> Path:
-    """Run the DuckDB CSV -> partitioned-parquet build. Returns the cells dir."""
+    """Run the DuckDB CSV -> partitioned-parquet build. Returns the cells dir.
+
+    Reads every measurement export declared by ``cfg.qupath_manifest`` in one
+    pass, preserving the panel union."""
     import duckdb
 
-    if not cfg.cells_csv.exists():
-        raise SystemExit(f"[err] QuPath cell CSV not found: {cfg.cells_csv}\n"
-                         "      set [paths] cells_csv in config.ini")
-    sql, mm = build_sql(cfg.cells_csv, cfg.data_dir, limit, cfg.restore_min_cell_area)
-    print(f"[info] markers={len(mm)} out={cfg.cells_dir} limit={limit} "
-          f"min_cell_area={cfg.restore_min_cell_area} threads={cfg.duckdb_threads}")
+    cohort = QuPathCohortManifest.read_json(cfg.qupath_manifest)
+    cohort.validate_current(mode="fast")
+    contracted_csvs = {image.measurement_csv.path for image in cohort.images}
+    csv_paths = tuple(Path(path) for path in sorted(contracted_csvs))
+    donor_mapping = image_id_to_donor_id(cohort)
+    mm, report = reconcile_headers(csv_paths)
+    for path, n in report["files"].items():
+        print(f"[info] {Path(path).name}: {n} marker means")
+    print(
+        f"[info] panel union={report['union']} intersection={report['intersection']}; "
+        "batch-specific markers are retained with explicit null availability"
+    )
+    report["cohort_manifest_content_id"] = cohort.content_id
+    report["images"] = {
+        image.image_id: {
+            "donor_id": image.donor_id,
+            "panel_id": image.panel_id,
+            "markers": [channel.marker for channel in image.channel_map],
+        }
+        for image in cohort.images
+    }
+    sql, mm = build_sql(
+        csv_paths,
+        cfg.data_dir,
+        limit,
+        cfg.cells_min_cell_area,
+        image_to_donor=donor_mapping,
+    )
+    print(f"[info] files={len(csv_paths)} markers={len(mm)} out={cfg.cells_dir} limit={limit} "
+          f"min_cell_area={cfg.cells_min_cell_area} threads={cfg.duckdb_threads}")
     cfg.data_dir.mkdir(parents=True, exist_ok=True)  # PARTITION_BY needs parent to exist
     con = duckdb.connect()
     con.execute(f"PRAGMA threads={cfg.duckdb_threads}")
     if memory_limit:
         con.execute(f"SET memory_limit='{memory_limit}'")
     con.execute("SET enable_progress_bar=false")
+    if cfg.cells_dir.exists() and any(cfg.cells_dir.iterdir()):
+        raise FileExistsError(
+            f"{cfg.cells_dir} is not empty; ingest is immutable and will not merge with a prior run"
+        )
     con.execute(sql)
+    reject_frames = [
+        con.execute(f"SELECT * FROM phenocycler_ingest_rejects_{index}").fetchdf()
+        for index in range(len(csv_paths))
+    ]
+    rejects = pd.concat(reject_frames, ignore_index=True) if reject_frames else pd.DataFrame()
+    rejects.to_parquet(cfg.data_dir / "ingest_rejects.parquet", index=False)
+    (cfg.data_dir / "panel_availability.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    if len(rejects):
+        raise ValueError(
+            f"QuPath CSV parsing rejected {len(rejects):,} row(s); inspect "
+            f"{cfg.data_dir / 'ingest_rejects.parquet'}"
+        )
     print("[done] wrote", cfg.cells_dir)
     return cfg.cells_dir
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=None, help="path to config.ini")
-    ap.add_argument("--csv", type=Path, default=None, help="override QuPath cell CSV")
-    ap.add_argument("--out", type=Path, default=None, help="override data_dir")
-    ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--min-cell-area", type=float, default=None,
-                    help="drop cells below this Cell:Area µm^2 (0 to disable)")
-    ap.add_argument("--threads", type=int, default=None)
-    ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. '64GB'")
-    a = ap.parse_args(argv)
+    """Run only the manifest-controlled ingest stage."""
 
-    overrides = {}
-    if a.csv is not None:
-        overrides["cells_csv"] = a.csv
-    if a.out is not None:
-        overrides["data_dir"] = a.out
-    if a.min_cell_area is not None:
-        overrides["restore_min_cell_area"] = a.min_cell_area
-    if a.threads is not None:
-        overrides["duckdb_threads"] = a.threads
-    cfg = load_config(a.config, **overrides)
-    build_cells_parquet(cfg, limit=a.limit, memory_limit=a.memory_limit)
-    return 0
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--config", type=Path)
+    args = parser.parse_args(argv)
+    command = ["run"]
+    if args.config is not None:
+        command.extend(["--config", str(args.config)])
+    command.extend(["--only", "ingest", "--no-export"])
+    from .pipeline import main as pipeline_main
+
+    return pipeline_main(command)
 
 
 if __name__ == "__main__":

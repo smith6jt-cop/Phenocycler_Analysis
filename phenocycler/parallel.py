@@ -1,12 +1,9 @@
-"""
-Per-donor parallel execution helpers.
+"""Per-donor parallel execution helpers.
 
-Every heavy stage of the Senior pipeline (REDSEA, RESTORE threshold+apply, broad
-lineage) processes each donor image completely independently — separate GeoJSON,
-qptiff, and output parquet — so the whole cohort is embarrassingly parallel.
-Upstream ran them strictly serially; this module fans the per-donor work out
-across processes with a bounded pool, falling back to a plain serial loop when
-``n_jobs <= 1`` (which keeps logs readable and is what the unit tests use).
+The manifest-driven workflow partitions donor work into independent image and
+Parquet artifacts. This module fans compatible donor operations out across a
+bounded process pool, falling back to a plain serial loop when ``n_jobs <= 1``
+(which keeps logs readable and is what the unit tests use).
 
 The mapped callable and its bound arguments must be picklable (they cross the
 process boundary), so pass top-level functions and dataclass/`Path`/str args.

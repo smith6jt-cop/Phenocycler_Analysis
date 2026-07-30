@@ -1,185 +1,807 @@
 #!/usr/bin/env python3
-"""
-Orchestrator — run the full raw-data → 7-class broad-lineage pipeline end to end.
-
-Idempotent ``run_step`` (skips a stage when its outputs already exist unless
-``force=True``) + a final status table, in-process against the ``phenocycler``
-package.  Stage order (the two starred stages are the corrections the upstream
-notebook / earlier port OMITTED):
-
-    cells → redsea → restore → restore_extra* → hormone_floor* → lineage → qupath → figures
-
-``hormone_floor`` (floors {INS,GCG,SST}_pos at K=5 AND {CD3e,CD20,CD163}_pos at K=2) MUST run before
-``lineage`` or the false-endocrine + false-immune over-calling returns; ``restore_extra`` gates
-B3TUBB/CD99/MPO for the Neural / Endocrine-CD99 / Immune-MPO markers.
-
-    python -m phenocycler.pipeline                       # run every missing step
-    python -m phenocycler.pipeline --only hormone_floor lineage figures
-    python -m phenocycler.pipeline --force               # re-run everything
-    python -m phenocycler.pipeline --status              # just print the status table
-"""
+"""Content-addressed QuPath → REDSEA → expression → cell-type workflow."""
 
 from __future__ import annotations
 
 import argparse
-import glob
-import shutil
+import json
+import sys
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Callable, Sequence
 
+import pandas as pd
+
+from .artifacts import (
+    CodeMetadata,
+    ContractError,
+    FileFingerprint,
+    InputArtifact,
+    PartialArtifactError,
+    QuPathCohortManifest,
+    RunManifest,
+    StageManifest,
+    StaleArtifactError,
+    sha256_json,
+)
+from .calibration_stage import (
+    METHOD_VERSION as CALIBRATION_STAGE_VERSION,
+    calibrate_expression,
+)
+from .cells_parquet import build_cells_parquet
+from .cohort import ensure_eligible_donors
 from .config import PipelineConfig, load_config
+from .expression import (
+    METHOD_VERSION as EXPRESSION_VERSION,
+    build_selected_expression,
+    read_single_partition,
+    write_donor_partition,
+)
+from .geometry_qc import GeometryQCConfig
+from .geometry_stage import (
+    METHOD_VERSION as GEOMETRY_VERSION,
+    run_geometry_qc_for_image,
+)
+from .hierarchical_typing import TypingRegistry
+from .marker_calibration import CalibrationConfig
+from .marker_registry import MarkerRegistry, load_registry
+from .qupath_export import export_assignment_frame
+from .redsea import RedseaParams, run_redsea
+from .reference_controls import (
+    METHOD_VERSION as REFERENCE_VERSION,
+    ReferenceControlConfig,
+    build_reference_controls,
+    reference_masks_from_wide,
+    reference_masks_to_wide,
+)
+from .state_markers import annotate_proliferation
+from .typing_stage import (
+    METHOD_VERSION as TYPING_STAGE_VERSION,
+    type_calibrated_cells,
+)
 
 
-# step name -> (output pattern under data_dir, human label) for the status table
-STAGES = [
-    ("cells", "cells/donor_id=*", "Raw cells (DuckDB)"),
-    ("redsea", "cells_redsea/donor_id=*", "REDSEA corrected"),
-    ("restore", "restore_gated_redsea/donor_id=*", "RESTORE gated (10 markers)"),
-    ("restore_extra", "restore_gated_redsea_extra/donor_id=*", "RESTORE gated (extra 3)"),
-    ("hormone_floor", "restore_gated_redsea/donor_id=*", "Norm floor (hormone K5 + immune K2)"),
-    ("lineage", "phenotype/broad/donor_id=*", "Broad lineage (7-class)"),
-    ("qupath", "phenotype/qupath_class/pheno_class_*.csv", "QuPath CSVs"),
-    ("figures", "phenotype/celltype_marker_dotplot.png", "Identity QC figures"),
-]
+INGEST_VERSION = "qupath-ingest-union-v2"
+REDSEA_VERSION = "redsea-compartment-only-v1"
+STATE_VERSION = "orthogonal-state-v1"
+RUN_SCHEMA_VERSION = 1
 
-ORDER = ["cells", "redsea", "restore", "restore_extra", "hormone_floor",
-         "lineage", "qupath", "figures"]
+STAGE_ORDER = (
+    "ingest",
+    "geometry",
+    "redsea",
+    "expression",
+    "controls",
+    "calibrate",
+    "type",
+    "states",
+)
+STAGE_METHODS = {
+    "ingest": INGEST_VERSION,
+    "geometry": GEOMETRY_VERSION,
+    "redsea": REDSEA_VERSION,
+    "expression": EXPRESSION_VERSION,
+    "controls": REFERENCE_VERSION,
+    "calibrate": CALIBRATION_STAGE_VERSION,
+    "type": TYPING_STAGE_VERSION,
+    "states": STATE_VERSION,
+}
+STAGE_OUTPUT_ATTRIBUTE = {
+    "ingest": "cells_dir",
+    "geometry": "geometry_qc_dir",
+    "redsea": "redsea_dir",
+    "expression": "selected_expression_dir",
+    "controls": "reference_controls_dir",
+    "calibrate": "marker_evidence_dir",
+    "type": "assignments_dir",
+    "states": "state_dir",
+}
+STAGE_SIDECARS = {
+    "ingest": ("ingest_rejects.parquet", "panel_availability.json"),
+    "expression": ("audit/expression_availability.parquet",),
+    "controls": ("audit/reference_control_models.parquet",),
+    "calibrate": ("audit/marker_calibration_models.parquet",),
+    "states": ("audit/state_models.parquet",),
+}
+STAGE_SOURCE_PATHS = {
+    "ingest": (
+        "phenocycler/cells_parquet.py",
+        "phenocycler/artifacts.py",
+        "phenocycler/cohort.py",
+    ),
+    "geometry": (
+        "phenocycler/geometry_stage.py",
+        "phenocycler/geometry_qc.py",
+        "phenocycler/redsea.py",
+        "phenocycler/artifacts.py",
+    ),
+    "redsea": (
+        "phenocycler/redsea.py",
+        "phenocycler/gpu.py",
+        "phenocycler/parallel.py",
+        "phenocycler/marker_taxonomy.py",
+        "phenocycler/marker_registry.py",
+    ),
+    "expression": (
+        "phenocycler/expression.py",
+        "phenocycler/marker_registry.py",
+    ),
+    "controls": (
+        "phenocycler/reference_controls.py",
+        "phenocycler/marker_registry.py",
+    ),
+    "calibrate": (
+        "phenocycler/calibration_stage.py",
+        "phenocycler/marker_calibration.py",
+        "phenocycler/reference_controls.py",
+        "phenocycler/marker_registry.py",
+    ),
+    "type": (
+        "phenocycler/typing_stage.py",
+        "phenocycler/hierarchical_typing.py",
+        "phenocycler/marker_registry.py",
+        "phenocycler/typing_rules.json",
+    ),
+    "states": ("phenocycler/state_markers.py",),
+}
 
 
-def _has_outputs(cfg: PipelineConfig, pattern: str) -> int:
-    return len(glob.glob(str(cfg.data_dir / pattern)))
+@dataclass(frozen=True)
+class RunContext:
+    base_config: PipelineConfig
+    config: PipelineConfig
+    cohort: QuPathCohortManifest
+    registry: MarkerRegistry
+    typing_registry: TypingRegistry
+    donors: tuple[str, ...]
+    repository: Path
+    code: CodeMetadata
+    identity_config: dict
+    run_id: str
+
+    @property
+    def run_root(self) -> Path:
+        return self.config.data_dir
+
+    def output_root(self, stage: str) -> Path:
+        return Path(getattr(self.config, STAGE_OUTPUT_ATTRIBUTE[stage]))
+
+    def stage_manifest_path(self, stage: str) -> Path:
+        return self.config.manifests_dir / f"{stage}.json"
 
 
-def _lineage_is_current(cfg: PipelineConfig) -> bool:
-    """True only if broad-lineage partitions exist AND carry the CURRENT 7-class score columns
-    (Neural present; Neutrophil folded into Immune -> absent). A stale 6-/8-class ``broad/`` therefore
-    counts as 'not done', so the lineage step re-runs.
-    """
-    files = sorted(glob.glob(str(cfg.broad_dir / "donor_id=*" / "*.parquet")))
-    if not files:
-        return False
-    try:
-        import pyarrow.parquet as pq
-        cols = set(pq.ParquetFile(files[0]).schema.names)
-    except Exception:
-        return False
-    return "score_Neural" in cols and "score_Neutrophil" not in cols
+def _identity_config(cfg: PipelineConfig) -> dict:
+    """Configuration that changes scientific content, excluding output location."""
 
-
-def _run_step(cfg, name, func, pattern, checker, force) -> None:
-    if not force:
-        if checker is not None:
-            if checker(cfg):
-                print(f"[SKIP] {name}: already complete")
-                return
-        elif pattern is not None:
-            n = _has_outputs(cfg, pattern)
-            if n:
-                print(f"[SKIP] {name}: {n} outputs already at {cfg.data_dir/pattern}")
-                return
-    print(f"\n=== {name} ===")
-    func()
-
-
-def run_pipeline(cfg: PipelineConfig, *, only=None, force=False) -> None:
-    from . import (cells_parquet, redsea, restore, hormone_floor, lineage,
-                   qupath_export, figures)
-
-    def _cells():
-        cells_parquet.build_cells_parquet(cfg)
-
-    def _redsea():
-        params = redsea.RedseaParams.from_config(cfg)
-        redsea.run_redsea(cfg, cfg.discover_sections(), params, n_jobs=cfg.n_jobs)
-
-    def _restore():
-        restore.run_restore(cfg)
-
-    def _restore_extra():
-        restore.run_restore_extra(cfg)
-
-    def _hormone_floor():
-        # Guarantee a rollback point: if no pre-floor backup exists yet, snapshot the (un-floored)
-        # gated dir to restore_gated_redsea.pre_hormonefloor BEFORE flooring it in place. Then always
-        # floor FROM that backup so the result is reproducible from a clean RESTORE (idempotent — the
-        # floor only rewrites {INS,GCG,SST}+{CD3e,CD20,CD163}_pos; _norm is untouched).
-        prefloor = cfg.restore_gated_prefloor_dir
-        if not prefloor.exists() and cfg.restore_gated_dir.exists():
-            shutil.copytree(cfg.restore_gated_dir, prefloor)
-            print(f"[hormone_floor] backed up un-floored gates -> {prefloor}")
-        src = prefloor if prefloor.exists() else cfg.restore_gated_dir
-        hormone_floor.run_hormone_floor(cfg, gated_dir=src, out_dir=cfg.restore_gated_dir)
-
-    def _lineage():
-        lineage.run_lineage(cfg)
-
-    def _qupath():
-        qupath_export.export_qupath_classes(cfg)
-
-    def _figures():
-        figures.run_figures(cfg)
-
-    # (func, existence-pattern, column-checker). hormone_floor is idempotent -> never skipped on
-    # existence (pattern None, checker None) so it always re-applies when selected.
-    steps = {
-        "cells": (_cells, "cells/donor_id=*", None),
-        "redsea": (_redsea, "cells_redsea/donor_id=*", None),
-        "restore": (_restore, "restore_gated_redsea/donor_id=*", None),
-        "restore_extra": (_restore_extra, "restore_gated_redsea_extra/donor_id=*", None),
-        "hormone_floor": (_hormone_floor, None, None),
-        "lineage": (_lineage, "phenotype/broad/donor_id=*", _lineage_is_current),
-        "qupath": (_qupath, "phenotype/qupath_class/pheno_class_*.csv", None),
-        "figures": (_figures, "phenotype/celltype_marker_dotplot.png", None),
+    return {
+        "run_schema_version": RUN_SCHEMA_VERSION,
+        "cells_min_cell_area": cfg.cells_min_cell_area,
+        "geometry_qc": {
+            "min_cell_area_um2": cfg.cell_qc_min_cell_area,
+            "max_cell_area_median_multiple": cfg.cell_qc_max_area_median_multiple,
+            "min_cell_solidity": cfg.cell_qc_min_cell_solidity,
+            "min_raster_area_ratio": cfg.cell_qc_min_raster_area_ratio,
+            "max_raster_area_ratio": cfg.cell_qc_max_raster_area_ratio,
+            "no_cytoplasm_nc_ratio": cfg.cell_qc_no_cytoplasm_nc_ratio,
+            "duplicate_radius_um": cfg.cell_qc_duplicate_radius_um,
+            "duplicate_area_tolerance": cfg.cell_qc_duplicate_area_tol,
+            "missing_geometry_policy": "fatal",
+            "duplicate_policy": "fatal",
+        },
+        "redsea": {
+            "downsample": cfg.redsea_downsample,
+            "edge_radius": cfg.redsea_edge_radius,
+            "comp_mode": cfg.redsea_comp_mode,
+            "alpha": cfg.redsea_alpha,
+            "gap_bridge": cfg.redsea_gap_bridge,
+            "norm_form": cfg.redsea_norm_form,
+            "exclude_no_spillover": cfg.redsea_exclude_no_spillover,
+            "output_schema": "Nucleus/Cytoplasm/Membrane/Cell",
+        },
+        "reference_controls": asdict(ReferenceControlConfig()),
+        "marker_calibration": asdict(CalibrationConfig()),
     }
-    selected = only or ORDER
-    for name in ORDER:
-        if name not in selected:
+
+
+def resolve_run_context(cfg: PipelineConfig) -> RunContext:
+    """Resolve and validate every source of run identity before writing output."""
+
+    cohort = QuPathCohortManifest.read_json(cfg.qupath_manifest)
+    cohort.validate_current(mode="fast")
+    donors = tuple(
+        ensure_eligible_donors(
+            cohort.expected_donors,
+            context="content-addressed Phenocycler run",
+        )
+    )
+    if donors != cohort.expected_donors:
+        raise ContractError(
+            "cohort donor order/set changed after exclusion validation"
+        )
+    registry = load_registry(cfg.marker_registry)
+    typing_registry = TypingRegistry.from_marker_registry(
+        registry, typing_rules=cfg.typing_rules
+    )
+    repository = Path(__file__).resolve().parents[1]
+    code = CodeMetadata.capture(
+        repository,
+        source_paths=("phenocycler", "pyproject.toml"),
+    )
+    identity = _identity_config(cfg)
+    run_id = sha256_json(
+        {
+            "cohort": cohort.content_id,
+            "registry": registry.fingerprint,
+            "typing_rules": typing_registry.rules_fingerprint,
+            "configuration": identity,
+            "code": code.source_sha256,
+        }
+    )[:20]
+    run_root = cfg.runs_dir / run_id
+    run_cfg = replace(cfg, data_dir=run_root)
+    return RunContext(
+        base_config=cfg,
+        config=run_cfg,
+        cohort=cohort,
+        registry=registry,
+        typing_registry=typing_registry,
+        donors=donors,
+        repository=repository,
+        code=code,
+        identity_config=identity,
+        run_id=run_id,
+    )
+
+
+def _stage_config(context: RunContext, stage: str) -> dict:
+    return {
+        "run_id": context.run_id,
+        "stage": stage,
+        "method_version": STAGE_METHODS[stage],
+        "configuration": context.identity_config,
+        "registry_fingerprint": context.registry.fingerprint,
+        "typing_rules_fingerprint": context.typing_registry.rules_fingerprint,
+    }
+
+
+def _stage_code(context: RunContext, stage: str) -> CodeMetadata:
+    return CodeMetadata.capture(
+        context.repository,
+        source_paths=STAGE_SOURCE_PATHS[stage],
+    )
+
+
+def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
+    previous = {
+        "geometry": ("ingest",),
+        "redsea": ("ingest", "geometry"),
+        "expression": ("ingest", "geometry", "redsea"),
+        "controls": ("expression",),
+        "calibrate": ("expression", "controls"),
+        "type": ("calibrate",),
+        "states": ("expression",),
+    }
+    inputs: list[InputArtifact] = []
+    if stage in {"ingest", "geometry", "redsea"}:
+        inputs.append(
+            InputArtifact.from_qupath_cohort_manifest(
+                "qupath_cohort", context.base_config.qupath_manifest
+            )
+        )
+    for dependency in previous.get(stage, ()):
+        path = context.stage_manifest_path(dependency)
+        if not path.exists():
+            raise PartialArtifactError(
+                f"{stage} requires completed stage {dependency!r}"
+            )
+        inputs.append(InputArtifact.from_stage_manifest(dependency, path))
+    if stage in {"redsea", "expression", "controls", "calibrate", "type"}:
+        inputs.append(
+            InputArtifact.from_path(
+                "marker_registry", context.base_config.marker_registry
+            )
+        )
+    if stage == "type":
+        inputs.append(
+            InputArtifact.from_path(
+                "typing_rules", context.base_config.typing_rules
+            )
+        )
+    return tuple(inputs)
+
+
+def _write_audit(context: RunContext, name: str, frame: pd.DataFrame) -> Path:
+    context.config.audit_dir.mkdir(parents=True, exist_ok=True)
+    path = context.config.audit_dir / f"{name}.parquet"
+    if path.exists():
+        raise FileExistsError(f"immutable audit artifact exists: {path}")
+    frame.to_parquet(path, index=False)
+    return path
+
+
+def _run_ingest(context: RunContext) -> None:
+    build_cells_parquet(context.config)
+
+
+def _run_geometry(context: RunContext) -> None:
+    image_by_donor = {image.donor_id: image for image in context.cohort.images}
+    for donor in context.donors:
+        cells = read_single_partition(context.config.cells_dir, donor)
+        image = image_by_donor[donor]
+        config = GeometryQCConfig(
+            pixel_size_um_x=image.pixel_size_um_x,
+            pixel_size_um_y=image.pixel_size_um_y,
+            min_cell_area_um2=context.config.cell_qc_min_cell_area,
+            max_cell_area_median_multiple=(
+                context.config.cell_qc_max_area_median_multiple
+            ),
+            min_cell_solidity=context.config.cell_qc_min_cell_solidity,
+            min_raster_area_ratio=context.config.cell_qc_min_raster_area_ratio,
+            max_raster_area_ratio=context.config.cell_qc_max_raster_area_ratio,
+            no_cytoplasm_nc_ratio=context.config.cell_qc_no_cytoplasm_nc_ratio,
+            duplicate_radius_um=context.config.cell_qc_duplicate_radius_um,
+            duplicate_area_tolerance=context.config.cell_qc_duplicate_area_tol,
+            missing_geometry_policy="fatal",
+            duplicate_policy="fatal",
+        )
+        result = run_geometry_qc_for_image(cells, image, config=config)
+        write_donor_partition(
+            result.to_frame(),
+            context.config.geometry_qc_dir,
+            donor_id=donor,
+        )
+
+
+def _run_redsea(context: RunContext) -> None:
+    params = RedseaParams.from_config(context.config)
+    run_redsea(
+        context.config,
+        list(context.donors),
+        params,
+        n_jobs=context.config.n_jobs,
+    )
+
+
+def _run_expression(context: RunContext) -> None:
+    image_by_donor = {image.donor_id: image for image in context.cohort.images}
+    availability = []
+    for donor in context.donors:
+        expression, donor_availability = build_selected_expression(
+            read_single_partition(context.config.cells_dir, donor),
+            read_single_partition(context.config.redsea_dir, donor),
+            read_single_partition(context.config.geometry_qc_dir, donor),
+            donor_id=donor,
+            acquired_markers={
+                channel.marker for channel in image_by_donor[donor].channel_map
+            },
+            registry=context.registry,
+        )
+        write_donor_partition(
+            expression,
+            context.config.selected_expression_dir,
+            donor_id=donor,
+        )
+        availability.append(donor_availability)
+    _write_audit(
+        context,
+        "expression_availability",
+        pd.concat(availability, ignore_index=True),
+    )
+
+
+def _run_controls(context: RunContext) -> None:
+    audits = []
+    for donor in context.donors:
+        expression = read_single_partition(
+            context.config.selected_expression_dir, donor
+        )
+        result = build_reference_controls(
+            expression,
+            donor_id=donor,
+            registry=context.registry,
+            value_columns={
+                marker.name: marker.name for marker in context.registry.markers
+            },
+        )
+        write_donor_partition(
+            reference_masks_to_wide(
+                result.masks_long, registry=context.registry
+            ),
+            context.config.reference_controls_dir,
+            donor_id=donor,
+        )
+        audits.append(result.audit)
+    _write_audit(
+        context,
+        "reference_control_models",
+        pd.concat(audits, ignore_index=True),
+    )
+
+
+def _run_calibrate(context: RunContext) -> None:
+    models = []
+    for donor in context.donors:
+        expression = read_single_partition(
+            context.config.selected_expression_dir, donor
+        )
+        masks_wide = read_single_partition(
+            context.config.reference_controls_dir, donor
+        )
+        result = calibrate_expression(
+            expression,
+            donor_id=donor,
+            registry=context.registry,
+            reference_controls=reference_masks_from_wide(
+                masks_wide, registry=context.registry
+            ),
+        )
+        write_donor_partition(
+            result.evidence_wide,
+            context.config.marker_evidence_dir,
+            donor_id=donor,
+        )
+        models.append(result.model_table)
+    _write_audit(
+        context,
+        "marker_calibration_models",
+        pd.concat(models, ignore_index=True),
+    )
+
+
+def _run_type(context: RunContext) -> None:
+    for donor in context.donors:
+        assignments = type_calibrated_cells(
+            read_single_partition(context.config.marker_evidence_dir, donor),
+            marker_registry=context.registry,
+            typing_registry=context.typing_registry,
+        )
+        write_donor_partition(
+            assignments,
+            context.config.assignments_dir,
+            donor_id=donor,
+        )
+
+
+def _run_states(context: RunContext) -> None:
+    audits = []
+    for donor in context.donors:
+        states, models = annotate_proliferation(
+            read_single_partition(
+                context.config.selected_expression_dir, donor
+            ),
+            donor_id=donor,
+        )
+        for row in models.itertuples(index=False):
+            states[f"{row.marker}__threshold"] = row.threshold
+            states[f"{row.marker}__model_status"] = row.status
+            states[f"{row.marker}__method"] = row.method
+        write_donor_partition(
+            states,
+            context.config.state_dir,
+            donor_id=donor,
+        )
+        audits.append(models)
+    _write_audit(
+        context,
+        "state_models",
+        pd.concat(audits, ignore_index=True),
+    )
+
+
+STAGE_RUNNERS: dict[str, Callable[[RunContext], None]] = {
+    "ingest": _run_ingest,
+    "geometry": _run_geometry,
+    "redsea": _run_redsea,
+    "expression": _run_expression,
+    "controls": _run_controls,
+    "calibrate": _run_calibrate,
+    "type": _run_type,
+    "states": _run_states,
+}
+
+
+def run_stage(context: RunContext, stage: str) -> StageManifest:
+    """Run or validate one immutable stage."""
+
+    manifest_path = context.stage_manifest_path(stage)
+    if manifest_path.exists():
+        manifest = StageManifest.read_json(manifest_path)
+        manifest.validate_current(
+            config=_stage_config(context, stage),
+            validation_mode="fast",
+        )
+        print(f"[current] {stage}: {manifest.output.total_rows:,} rows")
+        return manifest
+
+    output = context.output_root(stage)
+    if output.exists() and any(output.iterdir()):
+        raise PartialArtifactError(
+            f"{stage}: output exists without a valid stage manifest: {output}. "
+            "This content-addressed run is incomplete; inspect it before "
+            "explicitly removing only that stage directory."
+        )
+    inputs = _stage_inputs(context, stage)
+    # Validate every prerequisite before the stage is allowed to create output.
+    # StageManifest.create repeats this check after execution, closing the race
+    # where an input changes while the runner is active.
+    for input_artifact in inputs:
+        input_artifact.validate_current(mode="fast")
+    print(f"[run] {stage}")
+    STAGE_RUNNERS[stage](context)
+    manifest = StageManifest.create(
+        stage=stage,
+        method_version=STAGE_METHODS[stage],
+        expected_donors=context.donors,
+        inputs=inputs,
+        output_root=output,
+        sidecar_paths=tuple(
+            context.run_root / relative
+            for relative in STAGE_SIDECARS.get(stage, ())
+        ),
+        config=_stage_config(context, stage),
+        code=_stage_code(context, stage),
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_json(manifest_path)
+    print(
+        f"[done] {stage}: {manifest.output.total_rows:,} rows, "
+        f"manifest={manifest.content_id[:12]}"
+    )
+    return manifest
+
+
+def _export_manifest_path(context: RunContext) -> Path:
+    return context.config.manifests_dir / "qupath_export.json"
+
+
+def _validate_export(context: RunContext) -> bool:
+    path = _export_manifest_path(context)
+    if not path.exists():
+        return False
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ContractError("QuPath export manifest must be a JSON object")
+    content_id = payload.pop("content_id", None)
+    if not isinstance(content_id, str) or not content_id:
+        raise ContractError("QuPath export manifest is missing content_id")
+    if sha256_json(payload) != content_id:
+        raise StaleArtifactError("QuPath export manifest identity is invalid")
+    if payload.get("run_id") != context.run_id:
+        raise StaleArtifactError("QuPath export belongs to another run")
+    type_manifest_path = context.stage_manifest_path("type")
+    if not type_manifest_path.exists():
+        raise StaleArtifactError("QuPath export has no current type stage")
+    type_manifest = StageManifest.read_json(type_manifest_path)
+    type_manifest.validate_current(
+        config=_stage_config(context, "type"),
+        validation_mode="fast",
+    )
+    if payload.get("assignment_stage_content_id") != type_manifest.content_id:
+        raise StaleArtifactError(
+            "QuPath export does not match the current assignment stage"
+        )
+    if tuple(payload.get("expected_donors", ())) != context.donors:
+        raise StaleArtifactError(
+            "QuPath export donor contract differs from the run"
+        )
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ContractError("QuPath export manifest files must be a list")
+    if len(files) != len(context.donors):
+        raise PartialArtifactError(
+            "QuPath export does not contain exactly one file per donor"
+        )
+    for index, item in enumerate(files):
+        try:
+            fingerprint = FileFingerprint.from_dict(item)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContractError(
+                f"QuPath export file fingerprint {index} is malformed"
+            ) from exc
+        fingerprint.validate_current(mode="fast")
+    return True
+
+
+def export_qupath(context: RunContext) -> None:
+    """Write and fingerprint one uncertainty-preserving CSV per donor."""
+
+    if _validate_export(context):
+        print("[current] qupath export")
+        return
+    type_manifest = context.stage_manifest_path("type")
+    if not type_manifest.exists():
+        raise PartialArtifactError("QuPath export requires the type stage")
+    current_type = StageManifest.read_json(type_manifest)
+    current_type.validate_current(
+        config=_stage_config(context, "type"),
+        validation_mode="fast",
+    )
+    paths = []
+    for donor in context.donors:
+        paths.extend(
+            export_assignment_frame(
+                read_single_partition(context.config.assignments_dir, donor),
+                read_single_partition(context.config.cells_dir, donor).loc[
+                    :, ["object_id", "image"]
+                ],
+                context.config.qupath_class_dir,
+            )
+        )
+    payload = {
+        "run_id": context.run_id,
+        "expected_donors": list(context.donors),
+        "assignment_stage_content_id": current_type.content_id,
+        "files": [asdict(FileFingerprint.capture(path)) for path in paths],
+    }
+    payload["content_id"] = sha256_json(payload)
+    manifest_path = _export_manifest_path(context)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_path.exists():
+        raise FileExistsError(manifest_path)
+    manifest_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(f"[done] qupath export: {len(paths)} files")
+
+
+def run_pipeline(
+    context: RunContext,
+    *,
+    stages: Sequence[str] = STAGE_ORDER,
+    export: bool = True,
+) -> RunManifest | None:
+    """Run selected stages and write a complete run manifest when possible."""
+
+    context.run_root.mkdir(parents=True, exist_ok=True)
+    for stage in stages:
+        run_stage(context, stage)
+    if export and "type" in stages:
+        export_qupath(context)
+
+    all_paths = [context.stage_manifest_path(stage) for stage in STAGE_ORDER]
+    if not all(path.exists() for path in all_paths):
+        return None
+    # Existence is not completion. Validate every stage—including stages not
+    # selected in this invocation—before writing run.json or advancing LATEST.
+    for stage, path in zip(STAGE_ORDER, all_paths, strict=True):
+        manifest = StageManifest.read_json(path)
+        if manifest.stage != stage:
+            raise ContractError(
+                f"manifest at {path} declares stage {manifest.stage!r}, "
+                f"expected {stage!r}"
+            )
+        manifest.validate_current(
+            config=_stage_config(context, stage),
+            validation_mode="fast",
+        )
+    run_config = {
+        **context.identity_config,
+        "cohort_content_id": context.cohort.content_id,
+        "registry_fingerprint": context.registry.fingerprint,
+        "typing_rules_fingerprint": context.typing_registry.rules_fingerprint,
+    }
+    run_manifest = RunManifest.create(
+        run_name=context.run_id,
+        expected_donors=context.donors,
+        stage_manifest_paths=all_paths,
+        config=run_config,
+        code=context.code,
+    )
+    run_manifest_path = context.run_root / "run.json"
+    if run_manifest_path.exists():
+        current = RunManifest.read_json(run_manifest_path)
+        current.validate_current(
+            config=run_config,
+            validation_mode="fast",
+        )
+        if current.content_id != run_manifest.content_id:
+            raise StaleArtifactError(
+                "completed run manifest differs from the current stage set"
+            )
+        run_manifest = current
+    else:
+        run_manifest.write_json(run_manifest_path)
+    context.base_config.runs_dir.mkdir(parents=True, exist_ok=True)
+    (context.base_config.runs_dir / "LATEST").write_text(
+        context.run_id + "\n", encoding="utf-8"
+    )
+    print(f"[complete] run {context.run_id}")
+    return run_manifest
+
+
+def status(context: RunContext) -> int:
+    """Print evidence-backed stage status; return nonzero for stale/partial state."""
+
+    print(f"run_id {context.run_id}")
+    healthy = True
+    for stage in STAGE_ORDER:
+        path = context.stage_manifest_path(stage)
+        if not path.exists():
+            print(f"  {stage:11s} MISSING")
+            healthy = False
             continue
-        fn, pat, checker = steps[name]
-        _run_step(cfg, name, fn, pat, checker, force)
-    print_status(cfg)
-
-
-def print_status(cfg: PipelineConfig) -> None:
-    print("\n" + "=" * 60)
-    print(f"{'stage':<30}{'outputs':>10}   status")
-    print("-" * 60)
-    for name, pattern, label in STAGES:
-        n = _has_outputs(cfg, pattern)
-        if name == "lineage":
-            state = "OK (7-class)" if _lineage_is_current(cfg) else ("STALE (re-run)" if n else "MISSING")
-        elif name == "hormone_floor":
-            state = "OK" if n else "MISSING"   # in-place; presence of restore_gated is the proxy
+        try:
+            manifest = StageManifest.read_json(path)
+            manifest.validate_current(
+                config=_stage_config(context, stage),
+                validation_mode="fast",
+            )
+        except (ContractError, OSError, ValueError) as exc:
+            print(f"  {stage:11s} STALE   {exc}")
+            healthy = False
         else:
-            state = "OK" if n else "MISSING"
-        print(f"{label:<30}{n:>10}   {state}")
-    print("=" * 60)
+            print(
+                f"  {stage:11s} CURRENT "
+                f"{manifest.output.total_rows:>12,} rows "
+                f"{manifest.content_id[:12]}"
+            )
+    try:
+        export_current = _validate_export(context)
+    except (ContractError, OSError, ValueError) as exc:
+        print(f"  {'qupath':11s} STALE   {exc}")
+        healthy = False
+    else:
+        print(f"  {'qupath':11s} {'CURRENT' if export_current else 'MISSING'}")
+        healthy &= export_current
+    return 0 if healthy else 1
 
-    # The optional PhenoCycler <-> Xenium integration layer picks up from `phenotype/broad/`.
-    # It is a separate orchestrator with its own (heavier) environment, so it is only
-    # mentioned here — never run as part of this pipeline, whose stage list and dependencies
-    # are deliberately unchanged by it.
-    n_integration = _has_outputs(cfg, "integration/*")
-    if n_integration:
-        print(f"[integration] {n_integration} artifact(s) under {cfg.data_dir/'integration'} — "
-              f"`python -m phenocycler.integration.pipeline --status` for detail")
+
+def _selected_stages(only: Sequence[str] | None, through: str | None) -> tuple[str, ...]:
+    if only and through:
+        raise ValueError("--only and --through cannot be combined")
+    if only:
+        return tuple(only)
+    if through:
+        return STAGE_ORDER[: STAGE_ORDER.index(through) + 1]
+    return STAGE_ORDER
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=None)
-    ap.add_argument("--only", nargs="*", default=None, choices=ORDER)
-    ap.add_argument("--jobs", type=int, default=None)
-    ap.add_argument("--force", action="store_true")
-    ap.add_argument("--status", action="store_true", help="print status and exit")
-    a = ap.parse_args(argv)
-    cfg = load_config(a.config)
-    if a.jobs is not None:
-        cfg.n_jobs = a.jobs
-    if a.status:
-        print_status(cfg)
+def main(argv=None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "manifest":
+        from .qupath_manifest import main as manifest_main
+
+        return manifest_main(raw[1:])
+    if not raw or raw[0].startswith("-"):
+        raw.insert(0, "run")
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run = subparsers.add_parser("run")
+    run.add_argument("--config", type=Path)
+    run.add_argument("--jobs", type=int)
+    run.add_argument("--only", nargs="+", choices=STAGE_ORDER)
+    run.add_argument("--through", choices=STAGE_ORDER)
+    run.add_argument("--no-export", action="store_true")
+    show = subparsers.add_parser("status")
+    show.add_argument("--config", type=Path)
+    export_parser = subparsers.add_parser("export")
+    export_parser.add_argument("--config", type=Path)
+    args = parser.parse_args(raw)
+
+    overrides = {}
+    if getattr(args, "jobs", None) is not None:
+        overrides["n_jobs"] = args.jobs
+    cfg = load_config(args.config, **overrides)
+    if args.command == "status" and not Path(cfg.qupath_manifest).exists():
+        # `status` is the first thing anyone runs, including on a checkout with no data at
+        # all, so answering "there is no cohort manifest yet, here is how to make one" beats
+        # a FileNotFoundError traceback out of the artifact reader. Every other subcommand
+        # still hard-fails, because they cannot do anything useful without the manifest.
+        print(f"no cohort manifest at {cfg.qupath_manifest}")
+        print("  phenocycler manifest template --out data/qupath_manifest_spec.json")
+        print("  phenocycler manifest create --spec data/qupath_manifest_spec.json "
+              "--out data/qupath_manifest.json")
         return 0
-    run_pipeline(cfg, only=a.only, force=a.force)
+    context = resolve_run_context(cfg)
+    if args.command == "status":
+        return status(context)
+    if args.command == "export":
+        export_qupath(context)
+        return 0
+    stages = _selected_stages(args.only, args.through)
+    run_pipeline(context, stages=stages, export=not args.no_export)
     return 0
 
 

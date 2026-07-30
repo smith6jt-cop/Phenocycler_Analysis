@@ -5,41 +5,35 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "phenocycler-analysis"
 # Version is derived from git tags by setuptools-scm — see [tool.setuptools_scm] below.
-# It is deliberately NOT a literal here: a hardcoded string and a git tag drift apart the
-# moment someone forgets one, and an analysis pipeline whose recorded version does not match
-# the commit that produced the results is worse than having no version at all.
+# Deliberately NOT a literal: a hardcoded string and a git tag drift apart the moment
+# someone forgets one, and an analysis pipeline whose recorded version does not match the
+# commit that produced the results is worse than having no version at all. This branch
+# already hashes the source tree into every run_id for the same reason.
 dynamic = ["version"]
-description = "Phenocycler / CODEX phenotyping pipeline: REDSEA -> RESTORE -> hormone floor -> 7-class broad lineage"
+description = "Manifest-driven Phenocycler expression calibration and hierarchical cell typing"
 readme = "README.md"
 requires-python = ">=3.10"
-# Deps are intentionally UNPINNED: this package is installed editable into an existing
-# analysis env (e.g. Islet-Explorer-Senior's `scvi-env`, Python 3.13 / numpy 2.2) and must
-# not fight that env's resolved versions. Pinned reference versions live in environment.yml.
-# The SSC RESTORE model additionally needs `spams` (install `spams-bin`), left out here so pip
-# does not try to build it.
+# Runtime bounds remain unpinned here so editable installs can share an existing
+# scientific Python environment.  The reproducible conda reference versions
+# live in environment.yml.
 dependencies = [
     "numpy",
     "pandas",
     "pyarrow",
     "scipy",
     "scikit-image",
-    "scikit-learn",
-    "matplotlib",
     "statsmodels",
     "tifffile",
     "imagecodecs",
     "duckdb",
+    # integration/manifest.py reads the donor metadata workbook.
     "openpyxl",
-    # phenocycler/restore.py imports tqdm at module load to build the headless stubs the
-    # vendored RESTORE needs. It was only ever declared in environment.yml, so the conda env
-    # masked the omission and `pip install -e .` produced an installation that could not run
-    # the RESTORE stage. CI caught this on its first run.
-    "tqdm",
 ]
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
 test = ["pytest"]
+notebook = ["jupyterlab", "ipykernel", "ipywidgets"]
 # PhenoCycler <-> Xenium integration (phenocycler/integration/). The core pipeline never
 # imports these; every integration module degrades to a clear ImportError naming the extra.
 # `maxfuse` is deliberately absent — its only release is 0.0.2 (2023) with unpinned deps, so
@@ -62,6 +56,10 @@ phenocycler = "phenocycler.pipeline:main"
 
 [tool.setuptools]
 packages = ["phenocycler", "phenocycler.integration"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+phenocycler = ["marker_registry.json", "typing_rules.json"]
 
 [tool.setuptools_scm]
 # Version comes from the nearest git tag. A tagged commit gives a clean release version

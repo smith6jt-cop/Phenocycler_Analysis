@@ -1,54 +1,32 @@
-name: phenocycler_analysis
-# Focused environment for the raw-data -> broad-lineage pipeline
-# (REDSEA -> RESTORE -> broad lineage). Downstream single-cell embedding
-# (scVI), trajectory, spatial analysis and the Shiny app are out of scope and
-# are intentionally NOT dependencies here.
+name: phenocycler-analysis
+# Reference environment for the manifest-driven QuPath -> REDSEA ->
+# donor-marker calibration -> hierarchical typing workflow. Downstream
+# embedding, trajectory and application stacks are intentionally out of scope.
 channels:
   - conda-forge
-  - bioconda
 dependencies:
   - python=3.11
 
-  # Core numerics / dataframes
+  # Runtime dependencies mirrored from pyproject.toml.
   - numpy=1.26
   - scipy=1.13
   - pandas=2.2
-  - pyarrow=16          # parquet I/O (hive-partitioned donor_id=* layout)
-  - duckdb=1.0          # out-of-core CSV -> parquet (Step 1)
-
-  # Imaging / geometry (REDSEA)
-  - scikit-image=0.24   # rasterize, find_boundaries, morphology
-  - tifffile=2024.7     # qptiff channel reads
-  - imagecodecs=2024.6  # qptiff/zlib codecs for tifffile
-
-  # RESTORE / metadata / plotting
-  - scikit-learn=1.5    # clustering used inside vendored RESTORE
-  - matplotlib=3.9
-  # phenocycler/lineage.py imports statsmodels.stats.multitest at module load for the
-  # per-donor composition FDR. It was only ever declared in pyproject.toml and
-  # environment-integration.yml, so an env built from THIS file could not run step 5 —
-  # and setup.sh's own verification imports lineage, so setup failed at [3/4].
+  - pyarrow=16
+  - duckdb=1.0
+  - scikit-image=0.24
   - statsmodels=0.14
-  - tqdm=4.66
-  - openpyxl=3.1        # donor metadata .xlsx
-  - h5py=3.11
+  - tifffile=2024.7
+  - imagecodecs=2024.6
 
-  # Notebooks + tests
+  # Development, notebooks and verification.
   - jupyterlab=4.2
   - ipykernel=6.29
   - ipywidgets=8.1
   - pytest=8.3
-
   - pip=24
-  - pip:
-      # SSC model for RESTORE (Sparse Subspace Clustering). Prebuilt wheel.
-      - spams-bin
-      # RESTORE's headless-stubbed plotting deps are replaced at runtime, so
-      # holoviews/selenium are NOT required.
 
 # ---------------------------------------------------------------------------
 # Optional GPU acceleration (install manually into the env if you have CUDA):
-#   pip install cupy-cuda12x                 # REDSEA bincount + sparse F@edge
-#   pip install rapids-singlecell            # (further GPU single-cell, downstream)
-# Then set [compute] use_gpu = true in config.ini and run REDSEA with n_jobs=1.
+#   python -m pip install cupy-cuda12x
+# Then set [compute] use_gpu = true and run with one donor worker per GPU.
 # ---------------------------------------------------------------------------

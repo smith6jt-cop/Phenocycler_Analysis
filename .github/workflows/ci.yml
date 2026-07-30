@@ -89,8 +89,11 @@ jobs:
           python -c "
           import phenocycler
           from phenocycler import load_config
-          for m in ('cells_parquet', 'redsea', 'restore', 'hormone_floor', 'lineage',
-                    'qupath_export', 'figures', 'pipeline', 'parallel', 'gpu'):
+          for m in ('artifacts', 'calibration_stage', 'cells_parquet', 'cohort', 'expression',
+                    'geometry_qc', 'geometry_stage', 'gpu', 'hierarchical_typing',
+                    'marker_calibration', 'marker_registry', 'marker_taxonomy', 'parallel',
+                    'pipeline', 'qupath_export', 'qupath_manifest', 'redsea',
+                    'reference_controls', 'sections', 'state_markers', 'typing_stage'):
               __import__(f'phenocycler.{m}')
           print('core modules import OK')
           "
@@ -139,6 +142,7 @@ jobs:
 
       - name: Stage tables render without any data
         run: |
-          python -m phenocycler.pipeline --status
+          # The core CLI is subcommand-based on this branch: `status`, not `--status`.
+          python -m phenocycler.pipeline status
           python -m phenocycler.integration.pipeline --status
           python -m phenocycler.integration.manifest --report

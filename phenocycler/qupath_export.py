@@ -1,59 +1,100 @@
 #!/usr/bin/env python3
-"""
-Step 6 (optional QC) — export the broad lineage as per-image CSVs keyed by
-QuPath's detection UUID, for the companion ``scripts/groovy/import_broad_lineage.groovy``
-(UUID match -> set PathClass directly).
-
-Faithful port of ``scripts/senior/export_broad_class_for_qupath.py``.  QuPath's
-``PathObject.getID()`` is exactly our ``object_id``, so matching is exact (no
-centroid rounding) and the class is set in one step.
-
-    python -m phenocycler.qupath_export
-    -> <phenotype_dir>/qupath_class/pheno_class_<donor>.csv   (object_id, broad_lineage, image)
-"""
+"""Export hierarchical labels and their uncertainty to QuPath-keyed CSVs."""
 
 from __future__ import annotations
 
 import argparse
-import glob
 from pathlib import Path
 
 import pandas as pd
 
-from .config import PipelineConfig, load_config
+EXPORT_COLUMNS = (
+    "object_id",
+    "image",
+    "broad_type",
+    "specific_type",
+    "assignment_status",
+    "confidence",
+    "best_broad_type",
+    "best_specific_type",
+    "broad_assignment_status",
+    "specific_assignment_status",
+    "ranked_broad_probabilities",
+    "ranked_specific_probabilities",
+    "ranked_probabilities",
+)
 
 
-def export_qupath_classes(cfg: PipelineConfig) -> Path:
-    """Write per-donor pheno_class CSVs for the QuPath importer. Returns the output dir."""
-    out = cfg.qupath_class_dir
-    out.mkdir(parents=True, exist_ok=True)
-    total = 0
-    for bf in sorted(glob.glob(str(cfg.broad_dir / "donor_id=*" / "*.parquet"))):
-        donor = bf.split("donor_id=")[1].split("/")[0]
-        b = pd.read_parquet(bf, columns=["object_id", "broad_lineage"])
-        cells = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
-        if not cells:
-            print(f"[{donor}] WARN no cells parquet; skipped")
-            continue
-        img = pd.read_parquet(cells[0], columns=["object_id", "image"])
-        merged = b.merge(img.astype({"object_id": str}), on="object_id", how="inner")
-        merged = merged[["object_id", "broad_lineage", "image"]]
-        csv = out / f"pheno_class_{donor}.csv"
-        merged.to_csv(csv, index=False)
-        total += len(merged)
-        print(f"[{donor}] {len(merged):,} cells -> {csv.name}", flush=True)
-    print(f"\n[done] {total:,} cells across "
-          f"{len(glob.glob(str(out/'pheno_class_*.csv')))} images -> {out}")
-    return out
+def export_assignment_frame(
+    assignments: pd.DataFrame,
+    cell_context: pd.DataFrame,
+    out_dir: Path,
+) -> list[Path]:
+    """Write the current hierarchical assignment schema, one CSV per image.
+
+    The full uncertainty contract is exported instead of collapsing ambiguous or unavailable cells
+    into a named QuPath class. ``compartment`` and ``cell_type`` compatibility columns are included
+    for the existing importer, but always mirror the authoritative broad/specific fields.
+    """
+    required = {
+        "object_id",
+        "donor_id",
+        "broad_type",
+        "specific_type",
+        "assignment_status",
+        "confidence",
+        "best_broad_type",
+        "best_specific_type",
+        "broad_assignment_status",
+        "specific_assignment_status",
+        "ranked_broad_probabilities",
+        "ranked_specific_probabilities",
+        "ranked_probabilities",
+    }
+    missing = required - set(assignments)
+    if missing:
+        raise KeyError(f"assignments missing required columns: {sorted(missing)}")
+    if not {"object_id", "image"} <= set(cell_context):
+        raise KeyError("cell_context must contain object_id and image")
+    left = assignments.copy()
+    right = cell_context[["object_id", "image"]].copy()
+    left["object_id"] = left["object_id"].astype(str)
+    right["object_id"] = right["object_id"].astype(str)
+    if left["object_id"].duplicated().any() or right["object_id"].duplicated().any():
+        raise ValueError("object_id must be unique in assignments and cell_context")
+    merged = left.merge(right, on="object_id", how="left", validate="one_to_one")
+    if merged["image"].isna().any():
+        raise ValueError(f"{int(merged['image'].isna().sum())} assignments have no image context")
+    merged["compartment"] = merged["broad_type"]
+    merged["cell_type"] = merged["specific_type"]
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for (donor, image), frame in merged.groupby(
+        ["donor_id", "image"], sort=True, dropna=False
+    ):
+        path = out_dir / f"cell_assignments_{donor}.csv"
+        if path.exists():
+            raise FileExistsError(f"immutable QuPath export already exists: {path}")
+        columns = list(EXPORT_COLUMNS) + ["compartment", "cell_type"]
+        frame[columns].to_csv(path, index=False)
+        paths.append(path)
+    return paths
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=None)
-    a = ap.parse_args(argv)
-    export_qupath_classes(load_config(a.config))
-    return 0
+    """Run the manifest-controlled QuPath export."""
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--config", type=Path)
+    args = parser.parse_args(argv)
+    command = ["export"]
+    if args.config is not None:
+        command.extend(["--config", str(args.config)])
+    from .pipeline import main as pipeline_main
+
+    return pipeline_main(command)
 
 
 if __name__ == "__main__":
