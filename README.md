@@ -33,7 +33,10 @@ not introduce thresholds, donor exclusions, or typing rules of their own.
   model-estimation eligibility, and physical spillover context are separate
   decisions. Spillover-ineligible polygons are removed before REDSEA contact
   construction; analysis-ineligible cells remain in the UUID universe but
-  export as unavailable.
+  export as unavailable. An InstanSeg fragment without a usable nucleus is
+  never eligible for analysis, estimation, or physical spillover context.
+  Known duplicated islet detections use an explicit deterministic survivor
+  policy; duplicate copies are excluded from all three roles.
 - Each registered marker has one authoritative intensity source and
   compartment. An acquired marker with a missing required source is an error;
   a marker absent from a panel remains explicitly unavailable.
@@ -84,7 +87,10 @@ For every image, retain:
 Use [`scripts/groovy/export_cells_geojson.groovy`](scripts/groovy/export_cells_geojson.groovy)
 to export geometry with the QuPath detection UUID intact. Nucleus geometry may
 be embedded as `nucleusGeometry` in the cell GeoJSON or supplied as a separate
-UUID-matched GeoJSON. Always pass the intended output directory as the first
+UUID-matched GeoJSON. New exports must contain a usable nucleus for every cell.
+Historical cell-only fragments may remain in a source export for provenance,
+but geometry QC rejects them from analysis, model estimation, and REDSEA
+spillover context. Always pass the intended output directory as the first
 script argument (`--args "<output-dir>"`); the exporter refuses to run without
 it.
 
@@ -132,26 +138,92 @@ typing_rules = phenocycler/typing_rules.json
 Run and inspect the complete workflow:
 
 ```bash
-python -m phenocycler.pipeline run --config config.ini --jobs 4
+python -m phenocycler.pipeline run --config config.ini --pipelined
 python -m phenocycler.pipeline status --config config.ini
 ```
+
+`--pipelined` keeps ingest as a cohort barrier, then schedules independent
+donor work as soon as its own prerequisites are complete. For example, REDSEA
+for one donor can run while geometry rasterization continues for another.
+Every donor-stage output is atomically written and receives an immutable
+receipt before it can unlock downstream work. The ordinary cohort stage
+manifest is sealed after all receipts for that stage are current.
+
+The operational limits live in `[compute]`:
+
+```ini
+n_jobs = 4
+geometry_workers = 2
+redsea_workers = 1
+downstream_workers = 4
+```
+
+`n_jobs` is the total number of simultaneously running tasks. The other values
+are group-specific ceilings within that total. Geometry, REDSEA, and
+downstream work use separate process pools, preventing a REDSEA GPU context
+from migrating across workers. With `use_gpu = true`, REDSEA is always limited
+to one task on the configured GPU.
 
 Useful bounded runs are:
 
 ```bash
 # Run the dependency prefix through expression selection.
-python -m phenocycler.pipeline run --config config.ini --through expression
+python -m phenocycler.pipeline run --config config.ini \
+  --pipelined --through expression
 
 # Run named stages only; their prerequisite manifests must already be current.
 python -m phenocycler.pipeline run --config config.ini \
   --only controls calibrate type states
 
 # Build all analytical stages without the QuPath handoff.
-python -m phenocycler.pipeline run --config config.ini --no-export
+python -m phenocycler.pipeline run --config config.ini \
+  --pipelined --no-export
 
 # Export a current typing result later.
 python -m phenocycler.pipeline export --config config.ini
 ```
+
+If geometry stopped at the first duplicated-islet donor after completing a
+duplicate-free prefix under `duplicate_policy = fatal`, resume the corrected
+`deterministic_keep` run without rebuilding ingest or rerasterizing that
+prefix:
+
+```bash
+python -m phenocycler.pipeline resume \
+  --config config.ini \
+  --from-run <failed_run_id> \
+  --from-donor <first_unfinished_donor>
+```
+
+The resume command verifies the source ingest manifest, code, cohort, filter,
+bytes, donor/UUID universes, geometry policy transition, and absence of
+duplicate groups in every reused geometry donor. It hard-links ingest files
+to avoid another data copy. The completed geometry prefix is value-preserving
+re-encoded only to give its optional duplicate columns the same Parquet types
+as later duplicate-bearing donors. Resume receipts are included in the new
+stage manifests. The reusable geometry prefix immediately becomes eligible
+for REDSEA while geometry resumes at the unfinished donor. By default the
+command continues through all later stages; add `--through geometry` to stop
+after sealing the resumed geometry stage.
+
+If a run started before donor receipts were available and was stopped only
+after sealing geometry, recover its manifested geometry and any fully written
+REDSEA donor files into the receipt queue with:
+
+```bash
+python -m phenocycler.pipeline recover \
+  --config config.ini \
+  --from-run <stopped_run_id>
+```
+
+Recovery does not accept arbitrary partial files. It validates the source
+ingest and geometry manifests, scientific configuration, code lineage, donor
+set, row/UUID universes, and geometry content. Every surviving REDSEA Parquet
+must pass a complete all-column scan and match the current schema, donor,
+ingest row count, and UUID universe. Accepted files are hard-linked into a new
+content-addressed run and receive donor receipts; scratch files are never
+adopted. Use `--prepare-only` to create and inspect the verified handoff
+without starting the queue.
 
 Run `status` immediately before a standalone export and proceed only when all
 analytical stages are `CURRENT` (the QuPath line may still be `MISSING`). Run
@@ -162,16 +234,19 @@ QuPath. This validates the typing artifact and fingerprinted handoff together.
 intentional `--no-export` run it reports that export as missing and returns
 nonzero until `export` is run.
 
-The stage order is fixed:
+The donor-local dependency graph is fixed:
 
 ```text
-ingest -> geometry -> redsea -> expression -> controls
-       -> calibrate -> type -> states
+ingest (cohort barrier)
+  └─ geometry[d] -> redsea[d] -> expression[d] -> controls[d]
+                                      │              └─ calibrate[d] -> type[d]
+                                      └─ states[d]
 ```
 
 `--only` does not infer or rebuild dependencies. This makes every requested
 transition explicit and prevents an interactive notebook from quietly
-substituting a different upstream result.
+substituting a different upstream result. Pipelined execution accepts
+dependency prefixes through `--through`; it does not accept `--only`.
 
 ## Review notebooks
 

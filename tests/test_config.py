@@ -28,6 +28,8 @@ def test_fixed_scientific_defaults():
     cfg = load_config()
     assert cfg.cells_min_cell_area == 5.0
     assert cfg.cell_qc_min_cell_area == 20.0
+    assert cfg.cell_qc_missing_geometry_policy == "exclude"
+    assert cfg.cell_qc_duplicate_policy == "deterministic_keep"
     assert cfg.redsea_comp_mode == 1
     assert cfg.redsea_norm_form == "donor"
     assert cfg.redsea_alpha == 1.0
@@ -37,6 +39,23 @@ def test_keyword_and_unknown_overrides():
     assert load_config(n_jobs=8, redsea_alpha=0.5).n_jobs == 8
     with pytest.raises(TypeError):
         load_config(not_a_field=1)
+
+
+def test_pipeline_worker_limits_are_loaded_and_validated(tmp_path):
+    ini = tmp_path / "config.ini"
+    ini.write_text(
+        "[compute]\n"
+        "geometry_workers = 2\n"
+        "redsea_workers = 1\n"
+        "downstream_workers = 6\n"
+    )
+    cfg = load_config(ini)
+    assert cfg.pipeline_geometry_workers == 2
+    assert cfg.pipeline_redsea_workers == 1
+    assert cfg.pipeline_downstream_workers == 6
+
+    with pytest.raises(ValueError, match="worker limits"):
+        load_config(ini, pipeline_geometry_workers=0)
 
 
 def test_relative_paths_resolve_against_config_file(tmp_path):
@@ -104,3 +123,13 @@ def test_integration_mode_is_validated():
     assert load_config(integration_mode="same_slide").integration_mode == "same_slide"
     with pytest.raises(ValueError, match="sequential"):
         load_config(integration_mode="bogus")
+
+
+def test_invalid_missing_geometry_policy_is_rejected():
+    with pytest.raises(ValueError, match="missing_geometry_policy"):
+        load_config(cell_qc_missing_geometry_policy="accept")
+
+
+def test_invalid_duplicate_policy_is_rejected():
+    with pytest.raises(ValueError, match="duplicate_policy"):
+        load_config(cell_qc_duplicate_policy="accept_all")

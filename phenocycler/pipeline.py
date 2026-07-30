@@ -110,12 +110,14 @@ STAGE_SOURCE_PATHS = {
         "phenocycler/cohort.py",
     ),
     "geometry": (
+        "phenocycler/donor_pipeline.py",
         "phenocycler/geometry_stage.py",
         "phenocycler/geometry_qc.py",
         "phenocycler/redsea.py",
         "phenocycler/artifacts.py",
     ),
     "redsea": (
+        "phenocycler/donor_pipeline.py",
         "phenocycler/redsea.py",
         "phenocycler/gpu.py",
         "phenocycler/parallel.py",
@@ -123,26 +125,33 @@ STAGE_SOURCE_PATHS = {
         "phenocycler/marker_registry.py",
     ),
     "expression": (
+        "phenocycler/donor_pipeline.py",
         "phenocycler/expression.py",
         "phenocycler/marker_registry.py",
     ),
     "controls": (
+        "phenocycler/donor_pipeline.py",
         "phenocycler/reference_controls.py",
         "phenocycler/marker_registry.py",
     ),
     "calibrate": (
+        "phenocycler/donor_pipeline.py",
         "phenocycler/calibration_stage.py",
         "phenocycler/marker_calibration.py",
         "phenocycler/reference_controls.py",
         "phenocycler/marker_registry.py",
     ),
     "type": (
+        "phenocycler/donor_pipeline.py",
         "phenocycler/typing_stage.py",
         "phenocycler/hierarchical_typing.py",
         "phenocycler/marker_registry.py",
         "phenocycler/typing_rules.json",
     ),
-    "states": ("phenocycler/state_markers.py",),
+    "states": (
+        "phenocycler/donor_pipeline.py",
+        "phenocycler/state_markers.py",
+    ),
 }
 
 
@@ -185,8 +194,8 @@ def _identity_config(cfg: PipelineConfig) -> dict:
             "no_cytoplasm_nc_ratio": cfg.cell_qc_no_cytoplasm_nc_ratio,
             "duplicate_radius_um": cfg.cell_qc_duplicate_radius_um,
             "duplicate_area_tolerance": cfg.cell_qc_duplicate_area_tol,
-            "missing_geometry_policy": "fatal",
-            "duplicate_policy": "fatal",
+            "missing_geometry_policy": cfg.cell_qc_missing_geometry_policy,
+            "duplicate_policy": cfg.cell_qc_duplicate_policy,
         },
         "redsea": {
             "downsample": cfg.redsea_downsample,
@@ -341,8 +350,8 @@ def _run_geometry(context: RunContext) -> None:
             no_cytoplasm_nc_ratio=context.config.cell_qc_no_cytoplasm_nc_ratio,
             duplicate_radius_um=context.config.cell_qc_duplicate_radius_um,
             duplicate_area_tolerance=context.config.cell_qc_duplicate_area_tol,
-            missing_geometry_policy="fatal",
-            duplicate_policy="fatal",
+            missing_geometry_policy=context.config.cell_qc_missing_geometry_policy,
+            duplicate_policy=context.config.cell_qc_duplicate_policy,
         )
         result = run_geometry_qc_for_image(cells, image, config=config)
         write_donor_partition(
@@ -718,7 +727,19 @@ def status(context: RunContext) -> int:
     for stage in STAGE_ORDER:
         path = context.stage_manifest_path(stage)
         if not path.exists():
-            print(f"  {stage:11s} MISSING")
+            if stage != "ingest":
+                from .donor_pipeline import donor_progress
+
+                completed, expected = donor_progress(context, stage)
+            else:
+                completed, expected = 0, len(context.donors)
+            if completed:
+                print(
+                    f"  {stage:11s} IN PROGRESS "
+                    f"{completed:>3}/{expected:<3} donor receipts"
+                )
+            else:
+                print(f"  {stage:11s} MISSING")
             healthy = False
             continue
         try:
@@ -763,6 +784,14 @@ def main(argv=None) -> int:
         from .qupath_manifest import main as manifest_main
 
         return manifest_main(raw[1:])
+    if raw and raw[0] == "resume":
+        from .resume import main as resume_main
+
+        return resume_main(raw[1:])
+    if raw and raw[0] == "recover":
+        from .recovery import main as recovery_main
+
+        return recovery_main(raw[1:])
     if not raw or raw[0].startswith("-"):
         raw.insert(0, "run")
 
@@ -774,6 +803,15 @@ def main(argv=None) -> int:
     run.add_argument("--only", nargs="+", choices=STAGE_ORDER)
     run.add_argument("--through", choices=STAGE_ORDER)
     run.add_argument("--no-export", action="store_true")
+    run.add_argument(
+        "--pipelined",
+        "--donor-pipeline",
+        dest="pipelined",
+        action="store_true",
+    )
+    run.add_argument("--geometry-workers", type=int)
+    run.add_argument("--redsea-workers", type=int)
+    run.add_argument("--downstream-workers", type=int)
     show = subparsers.add_parser("status")
     show.add_argument("--config", type=Path)
     export_parser = subparsers.add_parser("export")
@@ -783,6 +821,15 @@ def main(argv=None) -> int:
     overrides = {}
     if getattr(args, "jobs", None) is not None:
         overrides["n_jobs"] = args.jobs
+    worker_overrides = {
+        "geometry_workers": "pipeline_geometry_workers",
+        "redsea_workers": "pipeline_redsea_workers",
+        "downstream_workers": "pipeline_downstream_workers",
+    }
+    for argument, config_name in worker_overrides.items():
+        value = getattr(args, argument, None)
+        if value is not None:
+            overrides[config_name] = value
     cfg = load_config(args.config, **overrides)
     if args.command == "status" and not Path(cfg.qupath_manifest).exists():
         # `status` is the first thing anyone runs, including on a checkout with no data at
@@ -801,6 +848,17 @@ def main(argv=None) -> int:
         export_qupath(context)
         return 0
     stages = _selected_stages(args.only, args.through)
+    if getattr(args, "pipelined", False):
+        if args.only:
+            parser.error("--pipelined supports --through, not --only")
+        from .donor_pipeline import run_pipelined_pipeline
+
+        run_pipelined_pipeline(
+            context,
+            stages=stages,
+            export=not args.no_export,
+        )
+        return 0
     run_pipeline(context, stages=stages, export=not args.no_export)
     return 0
 

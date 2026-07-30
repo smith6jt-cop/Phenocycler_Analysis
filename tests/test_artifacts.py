@@ -50,6 +50,7 @@ def _write_geojson(
     *,
     include_nucleus: bool = True,
     missing_cell_index: int | None = None,
+    missing_nucleus_index: int | None = None,
 ):
     features = []
     for index, object_id in enumerate(object_ids):
@@ -59,7 +60,7 @@ def _write_geojson(
             "geometry": None if index == missing_cell_index else _geometry(float(index)),
             "properties": {"objectType": "cell"},
         }
-        if include_nucleus:
+        if include_nucleus and index != missing_nucleus_index:
             feature["nucleusGeometry"] = _geometry(float(index) + 0.2)
         features.append(feature)
     path.write_text(json.dumps({"type": "FeatureCollection", "features": features}))
@@ -212,6 +213,29 @@ def test_qupath_manifest_fails_on_missing_or_duplicate_geometry(tmp_path):
     _write_geojson(geojson, missing_cell_index=1)
     with pytest.raises(GeometryContractError, match="no usable cell geometry"):
         QuPathImageManifest.create(**kwargs)
+
+
+def test_qupath_manifest_records_partially_missing_embedded_nuclei(tmp_path):
+    csv_path, qptiff, geojson = _qupath_inputs(tmp_path)
+    _write_geojson(geojson, missing_nucleus_index=0)
+    manifest = QuPathImageManifest.create(
+        donor_id="1",
+        image_id="image",
+        measurement_csv=csv_path,
+        qptiff=qptiff,
+        cell_geojson=geojson,
+        nucleus_geojson=geojson,
+        pixel_size_um_x=1.0,
+        pixel_size_um_y=1.0,
+        panel_id="panel",
+        channel_map=(ChannelMapping("DAPI", "DAPI", 0),),
+        segmentation_version="seg-v1",
+    )
+
+    assert manifest.cell_geometry.feature_count == 2
+    assert manifest.cell_geometry.nucleus_geometry_count == 1
+    assert manifest.nucleus_geometry.primary_geometry_count == 1
+    manifest.validate_current(mode="content")
 
 
 def _write_partition(root: Path, donor: str, object_ids, values=None):

@@ -15,10 +15,10 @@ Different image records may point to the same batched measurement CSV.
 
 | Source | Required contract |
 |---|---|
-| QuPath measurement CSV | Exact `Image` and `Object ID` values; centroids, parent, cell area/solidity, cell marker means, and nucleus means for registered nuclear/state markers |
+| QuPath measurement CSV(s) | Exact `Image` and `Object ID` values; centroids, parent, cell area/solidity, cell marker means, and nucleus means for registered nuclear/state markers |
 | qptiff | Original channel stack used for REDSEA; channel order and names must agree with the declared map |
 | cell GeoJSON | One feature per detection, with feature `id` equal to the QuPath UUID and a usable cell geometry |
-| nucleus geometry | Either `nucleusGeometry` embedded in the cell GeoJSON or a separate UUID-matched nucleus GeoJSON |
+| nucleus geometry | Either `nucleusGeometry` embedded in the cell GeoJSON or a separate UUID-matched nucleus GeoJSON; every QC-accepted cell must have one |
 | image metadata | Positive X/Y pixel size, panel ID, channel map, and a non-empty segmentation version; the current REDSEA path requires isotropic X/Y pixels |
 
 The canonical key is the QuPath `Object ID`, represented downstream as
@@ -68,13 +68,17 @@ is:
   "cohort_name": "islet-phenocycler",
   "expected_donors": ["D001"],
   "defaults": {
-    "measurement_csv": "raw/CellMeasurements.csv",
+    "measurement_csv": [
+      "raw/CellMeasurementsBatch1.csv",
+      "raw/CellMeasurementsBatch2.csv"
+    ],
     "segmentation_version": "qupath-project-commit-or-model-version"
   },
   "images": [
     {
       "donor_id": "D001",
       "image_id": "exact QuPath Image column value",
+      "measurement_csv_index": 0,
       "qptiff": "raw/D001.qptiff",
       "cell_geojson": "raw/D001_cells.geojson",
       "nucleus_geojson": null,
@@ -87,8 +91,24 @@ is:
 }
 ```
 
-`nucleus_geojson: null` declares that each cell feature carries
+`measurement_csv` may be one path or a list of batched exports. When it is a
+list, every image declares the zero-based `measurement_csv_index` containing
+that image. The manifest fingerprints each unique export once, and ingest
+combines all declared exports with `UNION ALL BY NAME` so panel-specific
+measurement columns remain available.
+
+The cohort manifest's exact `image_id` values are an ingest allow-list. Rows
+for other images in a shared export are ignored before donor assignment. The
+CSV files must still be scanned to locate those rows because CSV has no index,
+but only contracted cohort rows are written to the cell Parquet dataset.
+
+`nucleus_geojson: null` declares that nucleus polygons are embedded as
 `nucleusGeometry`; a path declares a separate nucleus FeatureCollection.
+Historical combined exports may also contain InstanSeg fragments without the
+embedded member. Their absence is fingerprinted in the manifest and those
+objects receive `missing_nucleus_geometry`; they can never be analysis- or
+estimation-eligible and their polygons are removed from REDSEA spillover
+context.
 `channel_map: null` asks the manifest builder to derive canonical marker names
 from the qptiff channel metadata. An explicit map uses:
 
@@ -203,7 +223,8 @@ fields are:
 Analysis eligibility and estimation eligibility are intentionally different. A
 real cell with no measurable cytoplasm, for example, may remain in the analysis
 universe but must not estimate a cytoplasmic background model. Missing geometry
-or prohibited duplicates is fatal.
+never produces an accepted cell: a missing nucleus excludes that object, while
+a missing canonical cell polygon or prohibited duplicate remains fatal.
 
 ## Authoritative expression
 
@@ -414,13 +435,26 @@ data/
         ├── run.json
         ├── manifests/
         │   ├── ingest.json
+        │   ├── ingest_reuse.json                  # only for verified reuse
         │   ├── geometry.json
+        │   ├── geometry_resume.json               # only for verified resume
+        │   ├── geometry_recovery.json             # only for verified recovery
+        │   ├── redsea_recovery.json               # only for verified recovery
         │   ├── redsea.json
         │   ├── expression.json
         │   ├── controls.json
         │   ├── calibrate.json
         │   ├── type.json
         │   ├── states.json
+        │   ├── donors/
+        │   │   └── donor_id=<id>/
+        │   │       ├── geometry.json
+        │   │       ├── redsea.json
+        │   │       ├── expression.json
+        │   │       ├── controls.json
+        │   │       ├── calibrate.json
+        │   │       ├── type.json
+        │   │       └── states.json
         │   └── qupath_export.json                  # when exported
         ├── cells/donor_id=<id>/*.parquet
         ├── ingest_rejects.parquet
@@ -434,6 +468,7 @@ data/
         ├── cell_states/donor_id=<id>/*.parquet
         ├── qupath_export/cell_assignments_<id>.csv # when exported
         ├── audit/
+        │   ├── donors/<audit_name>/donor_id=<id>/data.parquet
         │   ├── expression_availability.parquet
         │   ├── reference_control_models.parquet
         │   ├── marker_calibration_models.parquet
@@ -458,11 +493,25 @@ Each stage manifest records:
   hashes;
 - exact fingerprints for stage-owned availability and audit sidecars.
 
-A stage directory is immutable within a run. Non-empty output without a valid
-manifest is a partial artifact and fails. Changed inputs, configuration, code,
-schemas, donors, output bytes, or sidecar bytes make a manifest stale and also
-fail. Correct the source contract and run again; the changed content resolves
-to a new `run_id`.
+With donor-pipelined execution, each post-ingest partition first receives a
+donor-stage receipt under `manifests/donors/`. That receipt carries the same
+config/code/input/output contracts at donor scope and owns its donor-local
+audit file. Once every donor receipt for a stage is current, the pipeline
+concatenates the donor audits, seals the ordinary cohort stage manifest, and
+includes every donor receipt among that manifest's fingerprinted sidecars.
+Thus donor receipts permit cross-stage scheduling without weakening the
+cohort-level archival contract.
+
+A donor partition is immutable within a run. In pipelined mode, a non-empty
+donor partition without its valid donor receipt is partial and fails; current
+receipts remain valid while the cohort stage manifest is still pending. In
+stage mode, non-empty output without the stage manifest remains partial.
+Changed inputs, configuration, code, schemas, donors, output bytes, receipt
+bytes, or sidecar bytes make the owning contract stale and also fail. Correct
+the source contract and run again; the changed content resolves to a new
+`run_id`. Cross-run reuse is limited to the specialized `pipeline resume` and
+`pipeline recover` contracts: they verify their documented transitions,
+record reuse receipts, and seal new stage manifests under the new run ID.
 
 ## Storage, privacy, and retention
 

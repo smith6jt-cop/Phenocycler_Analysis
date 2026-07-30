@@ -83,6 +83,10 @@ class PipelineConfig:
     cell_qc_no_cytoplasm_nc_ratio: float = 0.999
     cell_qc_duplicate_radius_um: float = 1.0
     cell_qc_duplicate_area_tol: float = 0.15
+    cell_qc_duplicate_policy: str = "fatal"
+    # InstanSeg fragments without a nucleus remain auditable source objects but
+    # cannot enter analysis, model estimation, or physical spillover context.
+    cell_qc_missing_geometry_policy: str = "exclude"
 
     # REDSEA. Compartment output and fail-fast alignment are mandatory in code.
     redsea_downsample: float = 1.0
@@ -98,6 +102,9 @@ class PipelineConfig:
     duckdb_threads: int = 8
     use_gpu: bool = False
     gpu_device: int = 0
+    pipeline_geometry_workers: int = 1
+    pipeline_redsea_workers: int = 1
+    pipeline_downstream_workers: int = 2
 
     # ---------------------------------------------------------------------- #
     # Integration-layer surface (phenocycler/integration/).
@@ -418,6 +425,8 @@ _INI_SCHEMA = {
         "no_cytoplasm_nc_ratio": ("cell_qc_no_cytoplasm_nc_ratio", float),
         "duplicate_radius_um": ("cell_qc_duplicate_radius_um", float),
         "duplicate_area_tol": ("cell_qc_duplicate_area_tol", float),
+        "duplicate_policy": ("cell_qc_duplicate_policy", str),
+        "missing_geometry_policy": ("cell_qc_missing_geometry_policy", str),
     },
     "redsea": {
         "downsample": ("redsea_downsample", float),
@@ -433,6 +442,9 @@ _INI_SCHEMA = {
         "duckdb_threads": ("duckdb_threads", int),
         "use_gpu": ("use_gpu", _boolean),
         "gpu_device": ("gpu_device", int),
+        "geometry_workers": ("pipeline_geometry_workers", int),
+        "redsea_workers": ("pipeline_redsea_workers", int),
+        "downstream_workers": ("pipeline_downstream_workers", int),
     },
     "metadata": {
         "donor_col": ("metadata_donor_col", str),
@@ -554,6 +566,28 @@ def load_config(
 
     if cfg.redsea_norm_form != "donor":
         raise ValueError("production REDSEA requires mass-conserving norm_form='donor'")
+    if cfg.cell_qc_missing_geometry_policy not in {"fatal", "exclude"}:
+        raise ValueError(
+            "geometry_qc missing_geometry_policy must be 'fatal' or 'exclude'"
+        )
+    if cfg.cell_qc_duplicate_policy not in {"fatal", "deterministic_keep"}:
+        raise ValueError(
+            "geometry_qc duplicate_policy must be 'fatal' or "
+            "'deterministic_keep'"
+        )
+    worker_limits = {
+        "geometry_workers": cfg.pipeline_geometry_workers,
+        "redsea_workers": cfg.pipeline_redsea_workers,
+        "downstream_workers": cfg.pipeline_downstream_workers,
+    }
+    invalid_workers = [
+        name for name, value in worker_limits.items() if value < 1
+    ]
+    if invalid_workers:
+        raise ValueError(
+            "pipeline worker limits must be >= 1: "
+            f"{sorted(invalid_workers)}"
+        )
     return cfg
 
 

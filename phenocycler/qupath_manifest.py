@@ -30,6 +30,36 @@ def _path(base: Path, value: str | Path) -> Path:
     return result.resolve() if result.is_absolute() else (base / result).resolve()
 
 
+def _measurement_path(base: Path, row: Mapping[str, Any]) -> Path:
+    """Resolve one image's source from a single path or shared path list."""
+
+    value = row["measurement_csv"]
+    if isinstance(value, (str, Path)):
+        if row.get("measurement_csv_index") is not None:
+            raise ValueError(
+                "measurement_csv_index is only valid when measurement_csv is a list"
+            )
+        return _path(base, value)
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(
+            "measurement_csv must be a path or a non-empty list of paths"
+        )
+    paths = tuple(_path(base, item) for item in value)
+    if len(set(paths)) != len(paths):
+        raise ValueError("measurement_csv contains duplicate paths")
+    index = row.get("measurement_csv_index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise ValueError(
+            "images using multiple measurement_csv paths require an integer "
+            "measurement_csv_index"
+        )
+    if not 0 <= index < len(paths):
+        raise ValueError(
+            f"measurement_csv_index {index} is outside 0..{len(paths) - 1}"
+        )
+    return paths[index]
+
+
 def _channels_from_qptiff(path: Path) -> tuple[ChannelMapping, ...]:
     tf, _pages, names, _shape, _pixel_size = qptiff_channels(path, 0)
     tf.close()
@@ -96,7 +126,7 @@ def create_cohort_manifest(
     images: list[QuPathImageManifest] = []
     for raw_row in rows:
         row = {**payload.get("defaults", {}), **dict(raw_row)}
-        measurement = _path(base, row["measurement_csv"])
+        measurement = _measurement_path(base, row)
         qptiff = _path(base, row["qptiff"])
         cell_geojson = _path(base, row["cell_geojson"])
         nucleus_value = row.get("nucleus_geojson")
@@ -153,13 +183,17 @@ def example_specification() -> dict[str, Any]:
         "cohort_name": "islet-phenocycler",
         "expected_donors": ["DONOR_ID"],
         "defaults": {
-            "measurement_csv": "/absolute/path/CellMeasurements.csv",
+            "measurement_csv": [
+                "/absolute/path/CellMeasurementsBatch1.csv",
+                "/absolute/path/CellMeasurementsBatch2.csv",
+            ],
             "segmentation_version": "qupath-project-commit-or-model-version",
         },
         "images": [
             {
                 "donor_id": "DONOR_ID",
                 "image_id": "exact QuPath Image column value",
+                "measurement_csv_index": 0,
                 "qptiff": "/absolute/path/image.qptiff",
                 "cell_geojson": "/absolute/path/cells__image.geojson",
                 "nucleus_geojson": None,

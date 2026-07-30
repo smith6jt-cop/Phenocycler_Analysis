@@ -153,7 +153,12 @@ raster-to-QuPath area agreement, nucleus/cell area ratio, geometry presence,
 and spatial duplicate detection. Current defaults include a 20 µm² cell area
 minimum, four times the donor median maximum, 0.70 solidity minimum, 0.5–2.0
 raster-area ratio, and duplicate checks within 1 µm with 15% area tolerance.
-All identity-affecting values are captured in the run ID.
+The cohort configuration explicitly uses `duplicate_policy =
+deterministic_keep` for the known duplicated islet detections: a QC-viable
+nucleus-bearing copy is preferred, then the copy retaining the most raster
+pixels, then the lexicographically first UUID. Every non-survivor is excluded
+from analysis, estimation, and REDSEA physical context. All identity-affecting
+values are captured in the run ID.
 
 The three flags must not be collapsed. A real cell with essentially no
 cytoplasm may remain analysis eligible for nuclear measurements while being
@@ -161,8 +166,11 @@ unfit to estimate a cytoplasmic background. Conversely, a polygon excluded
 from cell-level analysis may still be required to describe a real shared
 boundary during spillover correction.
 
-Missing geometry and prohibited duplicates fail closed. Geometry QC does not
-delete the canonical cell universe.
+A missing nucleus fails closed at the cell level: the object receives
+`missing_nucleus_geometry` and is ineligible for analysis and model
+estimation. Its cell polygon is also removed from physical spillover context
+before REDSEA. Missing canonical cell geometry and prohibited duplicates
+remain stage-fatal. Geometry QC does not delete the canonical cell universe.
 
 ## Stage 3: REDSEA
 
@@ -187,7 +195,9 @@ least 0.80 and a median raster/QuPath ratio between 0.25 and 4.
 Nucleus geometry may be embedded as `nucleusGeometry` in each cell feature or
 supplied as a separate UUID-matched GeoJSON. Separate nucleus labels are
 relabelled into the cell-mask label space and intersected with their own cell
-before correction.
+before correction. An embedded feature without a nucleus is retained only for
+audit; its polygon is removed before correction and it cannot receive an
+accepted cell identity or state call.
 
 The marker registry decides whether an authoritative marker later uses:
 
@@ -537,13 +547,14 @@ sampled digest.
 Run the complete workflow:
 
 ```bash
-python -m phenocycler.pipeline run --config config.ini --jobs 4
+python -m phenocycler.pipeline run --config config.ini --pipelined
 ```
 
 Run a dependency prefix:
 
 ```bash
-python -m phenocycler.pipeline run --config config.ini --through calibrate
+python -m phenocycler.pipeline run --config config.ini \
+  --pipelined --through calibrate
 ```
 
 Run exact named stages whose dependencies already have current manifests:
@@ -552,6 +563,99 @@ Run exact named stages whose dependencies already have current manifests:
 python -m phenocycler.pipeline run --config config.ini \
   --only type states
 ```
+
+For the narrow case where `duplicate_policy = fatal` stopped geometry at the
+first donor containing duplicated islet detections, reuse the verified ingest
+and completed duplicate-free geometry prefix in the corrected
+`deterministic_keep` run:
+
+```bash
+python -m phenocycler.pipeline resume \
+  --config config.ini \
+  --from-run <failed_run_id> \
+  --from-donor <first_unfinished_donor>
+```
+
+This is not an unchecked partial-output override. It requires identical ingest
+code, cohort input, ingest filter, donor set, and ingest content; requires the
+only geometry configuration change to be `fatal -> deterministic_keep`;
+verifies each prefix donor's exact row/UUID universe, nucleus-exclusion
+semantics, and absence of duplicate groups; and records both reuse operations
+in fingerprinted receipts. Ingest is hard-linked, not copied. Prefix geometry
+values are preserved while its two all-null duplicate fields are re-encoded
+with stable Parquet types. The default is to continue through the donor task
+queue, so reusable-prefix REDSEA work can overlap geometry beginning at the
+unfinished donor. Use `--through geometry` for a bounded resume.
+
+For a stopped run that predates donor receipts but has a complete, current
+geometry manifest, use the separate recovery contract:
+
+```bash
+python -m phenocycler.pipeline recover \
+  --config config.ini \
+  --from-run <stopped_run_id>
+```
+
+The source process must be fully stopped first. Recovery validates the source
+ingest and geometry manifests, producing code, complete scientific
+configuration, donor set, row counts, schemas, and UUID universes. It then
+hard-links the complete geometry dataset and publishes one current geometry
+receipt per donor. An unmanifested REDSEA donor is accepted only when its
+single final `data_0.parquet` opens cleanly, passes a full-column scan, has the
+exact current schema and donor identity, and matches that donor's ingest
+row/UUID universe. Source scratch and incomplete donor directories are
+ignored. The accepted REDSEA donors receive receipts and can enter expression
+as soon as the queue starts; unfinished donors return to REDSEA.
+
+Add `--prepare-only` to perform and record the handoff without launching work.
+Recovery writes `geometry_recovery.json` and, when applicable,
+`redsea_recovery.json`; both are fingerprinted by the donor receipts.
+
+### Donor receipts and task resources
+
+Ingest remains a cohort barrier because the shared measurement exports are
+scanned together. Every later task is donor-local:
+
+```text
+geometry[d] -> redsea[d] -> expression[d] -> controls[d]
+                                  │              └─ calibrate[d] -> type[d]
+                                  └─ states[d]
+```
+
+A downstream task becomes ready only after each required upstream donor
+receipt validates. A receipt records its donor, method, scientific
+configuration, relevant code hash, upstream receipt or manifest identifiers,
+output schema, row count, UUID-universe hash, file fingerprints, and any
+donor-local audit sidecar. Writes use a temporary file and atomic rename; the
+receipt is published last. Cohort stage manifests remain the archival and
+notebook contract. They are sealed from the complete receipt set and
+fingerprint every receipt.
+
+The queue has three dedicated process pools and enforces both a total task
+limit and group limits:
+
+```ini
+[compute]
+n_jobs = 4
+geometry_workers = 2
+redsea_workers = 1
+downstream_workers = 4
+use_gpu = false
+gpu_device = 0
+```
+
+At most `n_jobs` tasks run at once. The group settings are ceilings within that
+total, so this example permits two memory-heavy geometry tasks, one REDSEA
+task, and any remaining slot for downstream work. When `use_gpu = true`, the
+REDSEA pool is forced to one worker for the configured device even if
+`redsea_workers` is larger. Separate pools keep the GPU context in the REDSEA
+worker and keep geometry memory pressure bounded.
+
+`status` reports `IN PROGRESS n/N donor receipts` until a cohort stage is
+sealed. Re-running the same pipelined command validates and skips current
+receipts. If all receipts exist but execution stopped before the aggregate
+manifest was written, the next invocation seals that manifest without
+recomputing donors.
 
 Check every stage and the QuPath export:
 
@@ -596,18 +700,25 @@ A missing required manifest stops the selected stage.
 | excess contamination | incompatible-reference controls contain too much target signal | audit biology/pairing and retain indeterminate results |
 | marker panel absent | marker was not measured | retain unavailable state |
 | required typing evidence invalid | broad absence cannot be established | retain unavailable/ambiguous; do not call `Other` |
-| output exists without manifest | interrupted or foreign partial artifact | inspect it; never bless it by fabricating a manifest |
+| cohort output exists without manifest | interrupted or foreign stage-mode partial artifact | inspect it; never bless it by fabricating a manifest |
+| donor output exists without donor receipt | interruption occurred after the atomic data write but before provenance publication | quarantine that exact donor partition and its donor audit, then rerun the pipelined command |
+| fatal duplicate policy stopped at the first duplicate-bearing donor | ingest and a duplicate-free geometry prefix may be reusable | use the verified `pipeline resume` contract with the source run and first unfinished donor |
+| stopped pre-receipt run has a complete geometry manifest and some complete REDSEA donors | the old stage-barrier process cannot attach to the donor queue | stop every old worker, then use the verified `pipeline recover` contract |
 | manifest or output stale | bytes, schema, UUID universe, config, or code differ | correct the cause and create the newly addressed run |
 | audit/availability sidecar stale | a stage-owned diagnostic changed or disappeared | treat the stage as stale; do not regenerate the sidecar independently |
 
 Never repair a contract failure by copying a donor partition from another run,
 editing a generated manifest, reallocating alpha to available markers, or
-adding a notebook-only cutoff.
+adding a notebook-only cutoff. Cross-run reuse is permitted only through the
+narrow verified resume command above, which creates a newly addressed run and
+fingerprinted provenance receipts.
 
 For a verified transient interruption that left output before its manifest,
 quarantine the exact unmanifested stage directory and its stage-owned
 sidecars, then rerun the same stage. Do not remove current upstream manifests
-or broadly clear the run root. The sidecar ownership is:
+or broadly clear the run root. Under pipelined execution, a current donor
+receipt is resumable and must not be removed; only an exact orphan partition
+without a receipt is quarantined. The aggregate sidecar ownership is:
 
 | Stage | Sidecars |
 |---|---|

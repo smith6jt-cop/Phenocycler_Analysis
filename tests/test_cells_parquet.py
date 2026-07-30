@@ -137,12 +137,24 @@ def test_donor_id_comes_from_the_exact_manifest_mapping(tmp_path):
     assert dict(zip(df.object_id, df.donor_id)) == {"a": "6374", "b": "115", "c": "6450"}
 
 
-def test_unmapped_image_fails_instead_of_guessing_a_donor(tmp_path):
-    with pytest.raises(Exception, match="unmapped QuPath Image"):
-        _run(
-            tmp_path,
-            [_row("a", 60.0, image="contains9999_but_is_not_contracted.qptiff")],
+def test_out_of_cohort_image_in_a_shared_export_is_ignored(tmp_path):
+    rows = [
+        _row("included", 60.0, image="6374_Scan1.er.qptiff"),
+        _row("excluded", 60.0, image="6457_Scan1.er.qptiff"),
+    ]
+    df, _ = _run(tmp_path, rows, 20.0)
+    assert df.object_id.tolist() == ["included"]
+
+
+def test_empty_manifest_image_mapping_still_fails_closed(tmp_path):
+    csv_path = _csv(tmp_path, [_row("a", 60.0)])
+    with pytest.raises(Exception, match="image_to_donor cannot be empty"):
+        cp.build_sql(
+            csv_path,
+            tmp_path / "out",
+            None,
             20.0,
+            image_to_donor={},
         )
 
 

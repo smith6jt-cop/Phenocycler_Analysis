@@ -366,6 +366,15 @@ def test_rasterize_mask_reads_nucleus_geometry(tmp_path):
     # the nucleus is a strict subset of its own cell, per label
     assert ((nuc == 0) | (nuc == mask)).all()
     assert (nuc == 1).sum() < (mask == 1).sum()
+    _, presence_ids, _, nucleus_presence = redsea.rasterize_mask(
+        p,
+        shape=(10, 10),
+        downsample=1.0,
+        with_nucleus=True,
+        return_nucleus_presence=True,
+    )
+    assert presence_ids == oids
+    assert nucleus_presence == [True, False]
     # back-compat: the 2-tuple form is unchanged
     mask2, oids2 = redsea.rasterize_mask(p, shape=(10, 10), downsample=1.0)
     assert np.array_equal(mask2, mask) and oids2 == oids

@@ -19,6 +19,7 @@ dependencies:
   - imagecodecs=2024.6
 
   # Development, notebooks and verification.
+  - jupyter=1.1
   - jupyterlab=4.2
   - ipykernel=6.29
   - ipywidgets=8.1

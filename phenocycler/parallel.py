@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 
 def resolve_jobs(n_jobs: int, n_items: int) -> int:
@@ -28,6 +28,35 @@ def resolve_jobs(n_jobs: int, n_items: int) -> int:
     if n_jobs <= 0:
         n_jobs = cpu
     return max(1, min(n_jobs, cpu, max(1, n_items)))
+
+
+def terminate_process_pool_workers(
+    executors: Mapping[str, ProcessPoolExecutor],
+) -> None:
+    """Terminate only children owned by the supplied process executors.
+
+    Python 3.12 has no public ``terminate_workers`` method. Capturing each
+    executor's child mapping before non-waiting shutdown prevents interrupted
+    pools from continuing submitted donor work as orphan processes.
+    """
+
+    processes = []
+    for executor in executors.values():
+        mapping = getattr(executor, "_processes", None)
+        if mapping:
+            processes.extend(mapping.values())
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=2.0)
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    for process in processes:
+        process.join(timeout=2.0)
+    for executor in executors.values():
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def map_donors(
@@ -78,8 +107,12 @@ def map_donors(
         return results
 
     out: dict[str, object] = {}
-    with ProcessPoolExecutor(max_workers=jobs) as ex:
-        fut_to_donor = {ex.submit(func, d): d for d in donors}
+    executor = ProcessPoolExecutor(max_workers=jobs)
+    fut_to_donor = {
+        executor.submit(func, donor): donor for donor in donors
+    }
+    aborting = False
+    try:
         for fut in as_completed(fut_to_donor):
             d = fut_to_donor[fut]
             try:
@@ -89,6 +122,15 @@ def map_donors(
                     raise
                 print(f"[parallel] donor {d} FAILED: {exc}", flush=True)
                 out[d] = None
+    except BaseException:
+        aborting = True
+        for future in fut_to_donor:
+            future.cancel()
+        terminate_process_pool_workers({"donors": executor})
+        raise
+    finally:
+        if not aborting:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     if ordered:
         return [out.get(d) for d in donors]

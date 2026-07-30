@@ -58,6 +58,40 @@ def _counts_for_canonical_ids(
     )
 
 
+def _presence_for_canonical_ids(
+    geometry_object_ids: Sequence[object],
+    geometry_presence: Sequence[object],
+    canonical_object_ids: Sequence[object],
+) -> np.ndarray:
+    if len(geometry_presence) != len(geometry_object_ids):
+        raise ContractError(
+            "nucleus geometry presence must align with geometry object IDs"
+        )
+    positions = {
+        str(object_id): index
+        for index, object_id in enumerate(geometry_object_ids)
+    }
+    if len(positions) != len(geometry_object_ids):
+        raise ContractError("geometry object IDs are not unique")
+    missing = [
+        str(object_id)
+        for object_id in canonical_object_ids
+        if str(object_id) not in positions
+    ]
+    if missing:
+        raise ContractError(
+            f"{len(missing):,} canonical cells lack geometry "
+            f"(examples={missing[:5]})"
+        )
+    return np.asarray(
+        [
+            bool(geometry_presence[positions[str(object_id)]])
+            for object_id in canonical_object_ids
+        ],
+        dtype=bool,
+    )
+
+
 def geometry_metrics_from_masks(
     cells: pd.DataFrame,
     *,
@@ -65,6 +99,7 @@ def geometry_metrics_from_masks(
     cell_geometry_object_ids: Sequence[object],
     nucleus_mask: np.ndarray,
     nucleus_geometry_object_ids: Sequence[object],
+    nucleus_geometry_presence: Sequence[object] | None = None,
 ) -> pd.DataFrame:
     """Create the exact input table consumed by :func:`evaluate_geometry_metrics`."""
 
@@ -75,11 +110,17 @@ def geometry_metrics_from_masks(
     if cells["object_id"].isna().any() or cells["object_id"].astype(str).duplicated().any():
         raise ContractError("canonical cell object_id values must be non-null and unique")
     ids = cells["object_id"].astype(str).to_numpy()
+    if nucleus_geometry_presence is None:
+        nucleus_geometry_presence = [True] * len(nucleus_geometry_object_ids)
     return pd.DataFrame(
         {
             "object_id": ids,
             "cell_geometry_present": True,
-            "nucleus_geometry_present": True,
+            "nucleus_geometry_present": _presence_for_canonical_ids(
+                nucleus_geometry_object_ids,
+                nucleus_geometry_presence,
+                ids,
+            ),
             "centroid_x_um": pd.to_numeric(cells["X_centroid"], errors="coerce"),
             "centroid_y_um": pd.to_numeric(cells["Y_centroid"], errors="coerce"),
             "cell_area_um2": pd.to_numeric(cells["cell_area"], errors="coerce"),
@@ -143,8 +184,12 @@ def run_geometry_qc_for_image(
         )
 
     if image.combined_geometry_file:
-        cell_mask, cell_ids, nucleus_mask = rasterize_mask(
-            Path(image.cell_geojson.path), shape, 1.0, with_nucleus=True
+        cell_mask, cell_ids, nucleus_mask, nucleus_presence = rasterize_mask(
+            Path(image.cell_geojson.path),
+            shape,
+            1.0,
+            with_nucleus=True,
+            return_nucleus_presence=True,
         )
         nucleus_ids = cell_ids
     else:
@@ -157,6 +202,7 @@ def run_geometry_qc_for_image(
         nucleus_mask = _separate_nucleus_mask(
             raw_nucleus_mask, nucleus_ids, cell_mask, cell_ids
         )
+        nucleus_presence = [True] * len(nucleus_ids)
 
     metrics = geometry_metrics_from_masks(
         cells,
@@ -164,6 +210,7 @@ def run_geometry_qc_for_image(
         cell_geometry_object_ids=cell_ids,
         nucleus_mask=nucleus_mask,
         nucleus_geometry_object_ids=nucleus_ids,
+        nucleus_geometry_presence=nucleus_presence,
     )
     qc_config = config or GeometryQCConfig(
         pixel_size_um_x=image.pixel_size_um_x,
