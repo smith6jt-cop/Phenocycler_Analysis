@@ -34,29 +34,39 @@
  * it safe to run afterwards too, but running first keeps the ordering unambiguous.
  *
  * Headless:
- *   /home/smith6jt/QuPath/bin/QuPath script \
- *       --project /home/smith6jt/IO60panc2nd/project.qpproj \
- *       --image "6539_Scan1.er.qptiff - resolution #1" \
- *       /home/smith6jt/IO60panc2nd/scripts/0_cell_detection.groovy
+ *   QuPath script --project project.qpproj --image "exact image name" \
+ *       scripts/groovy/0_cell_detection.groovy --args "/path/to/instanseg/model"
  */
 
 import qupath.lib.images.servers.ColorTransforms
 
 // ==================== PARAMETERS ====================
-// Matches every run recorded in the project workflow history (QuPath 0.7.0).
-String MODEL_PATH   = "/home/smith6jt/QuPath/v0.7/instanseg/downloaded/fluorescence_nuclei_and_cells-0.1.1"
-String DEVICE       = "gpu0"      // "cpu" if no CUDA device
+String MODEL_PATH = (
+    args != null && args.size() > 0 ? args[0]?.trim() : ""
+)
+if (MODEL_PATH == null || MODEL_PATH.isEmpty()) {
+    throw new IllegalArgumentException(
+        "Pass the InstanSeg model path as the first script argument."
+    )
+}
+String DEVICE = (
+    args != null && args.size() > 1 && args[1]?.trim()
+        ? args[1].trim()
+        : (System.getenv("PHENOCYCLER_DEVICE") ?: "gpu0")
+) // use "cpu" on systems without CUDA
 int    TILE_DIMS    = 512
 int    PAD          = 32
 int    N_THREADS    = 32
-boolean MAKE_MEASUREMENTS = false // measurements come from 2_fast_cell_measurements.groovy
+boolean MAKE_MEASUREMENTS = false // measurement export is a separate QuPath project step
 String TISSUE_CLASS = "Tissue"
-double DUP_RADIUS_UM = 1.0        // post-run duplicate check; matches phenocycler.cell_qc
+double DUP_RADIUS_UM = 1.0        // align with [geometry_qc] duplicate_radius_um
 double DUP_AREA_TOL  = 0.15
 // ====================================================
 
 def server = getCurrentServer()
-if (server == null) { println "ERROR: no image open."; return }
+if (server == null) {
+    throw new IllegalStateException("No image is open; cell detection cannot run.")
+}
 def imageName = getProjectEntry()?.getImageName() ?: server.getMetadata()?.getName()
 println "[detect] image: ${imageName}"
 
@@ -65,8 +75,9 @@ resetSelection()
 selectObjectsByClassification(TISSUE_CLASS)
 def selected = getSelectedObjects()
 if (selected.isEmpty()) {
-    println "ERROR: no '${TISSUE_CLASS}' annotation found. Create it before running detection."
-    return
+    throw new IllegalStateException(
+        "No '${TISSUE_CLASS}' annotation found. Create it before running detection."
+    )
 }
 
 // ---- 2. refuse anything that is not Tissue --------------------------------
@@ -77,8 +88,9 @@ if (!offending.isEmpty()) {
     println "ERROR: selection contains ${offending.size()} non-${TISSUE_CLASS} object(s):"
     offending.groupBy { it.getPathClass()?.toString() ?: 'Unclassified' }
              .each { k, v -> println "         ${k}: ${v.size()}" }
-    println "       Detection would segment their contents a SECOND time. Refusing to run."
-    return
+    throw new IllegalStateException(
+        "Detection would segment non-${TISSUE_CLASS} contents a second time; refusing to run."
+    )
 }
 println "[detect] selected ${selected.size()} '${TISSUE_CLASS}' annotation(s) — nothing else."
 
@@ -146,9 +158,10 @@ for (entry in buckets) {
     }
 }
 if (dupPairs > 0) {
-    println "ERROR: ${dupPairs} duplicate detection pair(s) found after detection."
-    println "       Two objects share a centroid within ${DUP_RADIUS_UM} um with matching area."
-    println "       This is the selectAnnotations() failure — the detections are NOT usable."
+    throw new IllegalStateException(
+        "${dupPairs} duplicate detection pair(s) found after detection: two objects share a " +
+        "centroid within ${DUP_RADIUS_UM} um with matching area. The detections are not usable."
+    )
 } else {
     println "[detect] duplicate check: PASS (0 pairs within ${DUP_RADIUS_UM} um)"
 }

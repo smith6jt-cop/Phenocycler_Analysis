@@ -1,234 +1,313 @@
-# Phenocycler / CODEX Analysis — REDSEA → RESTORE → Broad Lineage
+# Phenocycler analysis
 
-A notebook- and Python-based pipeline for **Phenocycler (CODEX) spatial-proteomics**
-analysis, from raw imaging output through **broad lineage classification**. It is a
-faithful, optimized port of the "Senior phenotyping pipeline" from
-[Islet-Explorer-Senior](https://github.com/smith6jt-cop/Islet-Explorer-Senior),
-restructured into a reusable, testable package with per-donor parallelism and an
-optional GPU backend.
+This package turns an explicitly declared QuPath cohort into donor-local marker
+evidence, hierarchical cell identities, and UUID-keyed tables for review in
+QuPath.
 
-The pipeline corrects the two dominant artifacts of dense multiplexed tissue imaging —
-**lateral marker spillover** (REDSEA) and **per-image intensity / autofluorescence drift**
-(RESTORE, over a curated web of directional mutually-exclusive marker pairs) — and then
-assigns every cell to one of **5 compartments** by an ordered residual gating tree, with an
-explicit **`Other`** terminal for cells that fail every gate (real panel gaps, not force-assigned).
+The production workflow is:
 
+```text
+QuPath cohort manifest
+  -> measurement ingest
+  -> geometry QC
+  -> REDSEA boundary-spillover correction
+  -> authoritative per-marker expression
+  -> deterministic donor-local reference controls
+  -> marker calibration with uncertainty
+  -> broad and parent-constrained specific typing
+  -> separate process-state annotation
+  -> uncertainty-preserving QuPath export
 ```
- raw .qptiff  ─┐
-               ├─(QuPath segmentation, prerequisite)─┐
- GeoJSON ──────┘                                     │
-                                                     ▼
- Cellmeasurements.csv ──▶ [1] cells_parquet (DuckDB) ──▶ data/cells/
-                                                     │
- qptiff + GeoJSON ─────────▶ [2] REDSEA spillover ───▶ data/cells_redsea/
-                                                     │
-                            [3] RESTORE normalize ───▶ data/restore_gated_redsea/
-                                (SSC, per-image;      │   {m}_pos / _norm / _log2r — ONE pass, all markers
-                                 curated pairs)       │
-                                                     │
-                            [4] broad phenotyping ────▶ data/phenotype/broad/  (5 compartments + Other;
-                                (ordered residual)    │                         compartment + cell_type)
-                                                     │
-                            [5] QuPath export ────────▶ data/phenotype/qupath_class/*.csv  (optional QC)
-                            [6] identity figures ─────▶ data/phenotype/celltype_marker_*.png
+
+The command-line pipeline, its production APIs, and its versioned registries
+are authoritative. Notebooks are review-oriented views that may invoke those
+same immutable stage APIs; they are not an alternative implementation and must
+not introduce thresholds, donor exclusions, or typing rules of their own.
+
+## What the workflow guarantees
+
+- Every source image is declared in an immutable cohort manifest. Donors are
+  never inferred from filenames.
+- The QuPath `object_id` UUID is the cell key from ingest through export.
+- Geometry QC precedes REDSEA and uses geometry only. Analysis eligibility,
+  model-estimation eligibility, and physical spillover context are separate
+  decisions. Spillover-ineligible polygons are removed before REDSEA contact
+  construction; analysis-ineligible cells remain in the UUID universe but
+  export as unavailable.
+- Each registered marker has one authoritative intensity source and
+  compartment. An acquired marker with a missing required source is an error;
+  a marker absent from a panel remains explicitly unavailable.
+- Reference controls are donor-local, deterministic, spatially balanced, and
+  selected without looking at the target marker, phenotype annotations, or the
+  frequency of target-positive cells.
+- Calibration preserves the corrected intensity, a zero-centered log2
+  threshold ratio, an empirical upper-tail probability, the threshold
+  uncertainty interval, and a four-state call:
+  `positive`, `negative`, `indeterminate`, or `unavailable`.
+- Broad types are evaluated simultaneously. There are no ordered residual
+  gates, prevalence-derived cutoffs, or forced assignments.
+- Specific types are constrained by an accepted broad parent. State markers
+  such as Ki67 and PCNA are reported separately and cannot change cell
+  identity.
+- Every run and stage is content addressed. Partial, stale, or donor-incomplete
+  output fails closed instead of being silently reused.
+
+The detailed scientific and operational contract is in
+[the workflow guide](docs/WORKFLOW.md). Input, output, and column contracts are
+in [the data guide](DATA_README.md).
+
+## Install
+
+Python 3.10 or newer is required. In an activated analysis environment:
+
+```bash
+python -m pip install -e .
 ```
+
+For development:
+
+```bash
+python -m pip install -e '.[test]'
+pytest -q
+```
+
+## 1. Export the QuPath inputs
+
+For every image, retain:
+
+- the QuPath cell-measurement CSV;
+- the matching `.qptiff`;
+- full-resolution cell and nucleus geometry;
+- the exact value in the CSV `Image` column;
+- pixel calibration, panel identity, channel mapping, and segmentation version.
+
+Use [`scripts/groovy/export_cells_geojson.groovy`](scripts/groovy/export_cells_geojson.groovy)
+to export geometry with the QuPath detection UUID intact. Nucleus geometry may
+be embedded as `nucleusGeometry` in the cell GeoJSON or supplied as a separate
+UUID-matched GeoJSON. Always pass the intended output directory as the first
+script argument (`--args "<output-dir>"`); the exporter refuses to run without
+it.
+
+## 2. Create the cohort manifest
+
+Generate a versioned specification template:
+
+```bash
+python -m phenocycler.pipeline manifest template --out cohort-spec.json
+```
+
+Edit the specification, then fingerprint and validate its sources:
+
+```bash
+python -m phenocycler.pipeline manifest create \
+  --spec cohort-spec.json \
+  --out data/qupath_manifest.json
+```
+
+Measurement CSVs receive a full SHA-256 fingerprint by default. Large qptiffs
+use an explicitly recorded deterministic sampled fingerprint by default; use
+`--qptiff-hash-mode full` when full-file hashing is practical.
+
+The specification schema and a complete example are in
+[DATA_README.md](DATA_README.md#cohort-specification).
+
+## 3. Configure and run
+
+At minimum, the configuration identifies the data root and cohort manifest:
+
+```ini
+[paths]
+data_dir = data
+qupath_manifest = data/qupath_manifest.json
+```
+
+The package defaults supply the marker registry and typing rules. A project can
+pin explicit paths to reviewed copies:
+
+```ini
+marker_registry = phenocycler/marker_registry.json
+typing_rules = phenocycler/typing_rules.json
+```
+
+Run and inspect the complete workflow:
+
+```bash
+python -m phenocycler.pipeline run --config config.ini --jobs 4
+python -m phenocycler.pipeline status --config config.ini
+```
+
+Useful bounded runs are:
+
+```bash
+# Run the dependency prefix through expression selection.
+python -m phenocycler.pipeline run --config config.ini --through expression
+
+# Run named stages only; their prerequisite manifests must already be current.
+python -m phenocycler.pipeline run --config config.ini \
+  --only controls calibrate type states
+
+# Build all analytical stages without the QuPath handoff.
+python -m phenocycler.pipeline run --config config.ini --no-export
+
+# Export a current typing result later.
+python -m phenocycler.pipeline export --config config.ini
+```
+
+Run `status` immediately before a standalone export and proceed only when all
+analytical stages are `CURRENT` (the QuPath line may still be `MISSING`). Run
+it again after export and require success before importing the CSVs into
+QuPath. This validates the typing artifact and fingerprinted handoff together.
+
+`status` checks the QuPath handoff as well as analytical stages. After an
+intentional `--no-export` run it reports that export as missing and returns
+nonzero until `export` is run.
+
+The stage order is fixed:
+
+```text
+ingest -> geometry -> redsea -> expression -> controls
+       -> calibrate -> type -> states
+```
+
+`--only` does not infer or rebuild dependencies. This makes every requested
+transition explicit and prevents an interactive notebook from quietly
+substituting a different upstream result.
+
+## Review notebooks
+
+The notebooks follow the same four conceptual checkpoints:
+
+1. [`01_qupath_ingest_and_geometry_qc.ipynb`](notebooks/01_qupath_ingest_and_geometry_qc.ipynb)
+   reviews the cohort contract, ingest, and geometry decisions.
+2. [`02_redsea_spillover.ipynb`](notebooks/02_redsea_spillover.ipynb)
+   reviews REDSEA alignment, compartments, and authoritative expression.
+3. [`03_marker_calibration.ipynb`](notebooks/03_marker_calibration.ipynb)
+   reviews reference-control and donor-marker calibration audits.
+4. [`04_hierarchical_cell_typing.ipynb`](notebooks/04_hierarchical_cell_typing.ipynb)
+   reviews hierarchy, state, and the optional QuPath handoff.
+
+Their optional execution cells call `run_stage` or `export_qupath`, which apply
+the same manifest validation and immutability checks as the CLI. Notebook cells
+must not write stage files directly.
+
+## Marker evidence, not frequency gates
+
+Calibration is performed independently for each donor and active marker. The
+marker registry declares a biologically incompatible counterpart used only to
+form a target-independent reference mask. Within that mask, a deterministic
+spatial rank selects controls. The target background and tail are then
+estimated robustly and a fixed empirical upper-tail decision is bootstrapped.
+
+The key outputs answer different questions:
+
+| Value | Interpretation |
+|---|---|
+| authoritative intensity | selected corrected signal in the marker's declared compartment |
+| `log2_threshold_ratio` | signed distance from the donor-local threshold; zero is the threshold |
+| `empirical_tail_probability` | finite-sample upper-tail probability under the donor-local controls |
+| threshold interval | bootstrap uncertainty in the decision boundary |
+| expression state | stable positive/negative, indeterminate, or unavailable |
+
+This representation addresses donor-to-donor scale and background without
+using positive-cell frequency as evidence. A rare population does not weaken
+its own cutoff, and a common population does not move its cutoff upward.
+
+For mutually exclusive marker families, the registry preallocates a 1%
+family-wise error rate using a fixed Bonferroni allocation. Family membership
+is declared before data are inspected; absent panel markers do not donate their
+error budget to the markers that remain. This is a 1% family bound, not a 1%
+per-marker threshold.
+
+Annotations and existing QuPath classifications are audit context only. They
+are forbidden as reference-control inputs and cannot define calibration or
+identity.
+
+## Identity and state
+
+Broad identity evaluates evidence for Immune, Endothelial, Epithelial, Neural,
+and Mesenchymal classes simultaneously. It retains the best candidate, ranked
+class probabilities, assignment confidence, and one of:
+`anchor`, `inferred`, `ambiguous`, `other`, or `unavailable`.
+
+`Other` is permitted only when every required broad model is valid and
+negative. Missing or invalid evidence cannot be converted into `Other`.
+Specific typing is parent constrained, so unresolved children retain a
+`<Parent>-unclassified` label rather than crossing broad compartments.
+
+Two panel-specific rules are deliberate:
+
+- SST is subtype-only evidence for Delta after an Epithelial parent is
+  accepted. SST never creates broad Epithelial evidence.
+- CD11b contributes to Immune evidence and is calibrated against
+  E-cadherin, its declared incompatible reference.
+
+Process-state calls are stored in a separate `cell_states` artifact. They do not
+rewrite broad or specific identity.
+
+## Runs and failure behavior
+
+The run identifier is derived from the cohort content ID, marker-registry
+fingerprint, typing-rules fingerprint, identity-affecting configuration, and
+relevant source-code hash. Outputs live below:
+
+```text
+data/runs/<run_id>/
+```
+
+Each stage writes a manifest containing its exact inputs, configuration, source
+hash, expected donors, output schema, row counts, object-ID universe, and
+fingerprints for its audit/availability sidecars. A complete analytical run
+writes `run.json`; `data/runs/LATEST` records its run ID. QuPath export has its
+own manifest because it is a separate handoff.
+
+Existing valid content is reused. The pipeline stops when it finds any of the
+following:
+
+- source data, registry, rules, configuration, or code changed;
+- a donor or expected partition is missing;
+- an output schema or UUID universe changed;
+- an audit or availability sidecar changed or disappeared;
+- an acquired marker's required source column is absent;
+- geometry is missing or object IDs are duplicated;
+- a non-empty output exists without a valid manifest.
+
+Do not repair these failures by deleting manifests or mixing files between run
+directories. Correct the declared input or configuration and create the new
+content-addressed run.
+
+## Outputs
+
+The principal artifacts under a run are:
+
+- `expression/`: one authoritative intensity per registered marker;
+- `reference_controls/`: donor/reference membership and deterministic ranks;
+- `marker_evidence/`: calibrated per-cell expression evidence and uncertainty;
+- `assignments/`: broad and specific identity with ranked alternatives;
+- `cell_states/`: process-state annotations kept separate from identity;
+- `qupath_export/`: UUID-keyed identity CSVs that retain uncertainty;
+- `audit/`: expression availability, control models, calibration models, and
+  state models;
+- `manifests/`: immutable stage and export contracts.
+
+See [DATA_README.md](DATA_README.md#run-layout) for the full tree and schemas.
+Use
+[`scripts/groovy/import_cell_assignments.groovy`](scripts/groovy/import_cell_assignments.groovy)
+for a validation-first UUID import that keeps broad, specific, and uncertainty
+decisions separate. Run `status` first: the importer validates every CSV row
+but intentionally leaves QuPath detections outside the canonical ingest
+universe (for example, fragments below the structural area floor) unchanged.
+
+## Migration note
+
+The former RESTORE and ordered-residual lineage path is retired. Its thresholds,
+positive fractions, normalized columns, and cell labels are not valid inputs
+to this workflow and must not be mixed with a content-addressed run.
 
 ## Scope
 
-**In scope (this repo):** raw QuPath outputs → cells parquet → REDSEA → RESTORE →
-broad lineage → optional QuPath re-import for visual QC.
-
-**Out of scope / downstream:** image processing before segmentation (illumination
-correction, stitching, registration, autofluorescence removal — use
-[KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI)), scVI embedding, trajectory /
-pseudotime, islet aggregation, spatial neighborhood analysis, per-lineage
-subclustering, and the interactive R Shiny app.
-
-## What REDSEA and RESTORE do
-
-- **REDSEA** (Bai et al., *Front. Immunol.* 2021) removes signal that bleeds across
-  shared cell boundaries. `phenocycler/redsea.py` is a scalable pixel-level
-  reimplementation (the reference `redseapy` does not scale): per donor it rasterizes
-  the QuPath GeoJSON to an int32 mask, sums each qptiff channel per cell and per 1-px
-  boundary band with `np.bincount`, builds an 8-connected sparse contact graph, and
-  applies `corrected = clip(data − α·(F @ edge))` (subtract-only, α=1, 1-px band by
-  default).
-- **RESTORE** (Chang et al., *Commun. Biol.* 2020) normalizes per-image intensity using
-  mutually-exclusive marker pairs. **RETIRED 2026-07-23 — the paired driver
-  (`restore.run_restore`) and its curated web (`MARKER_PAIRS` / `FUNCTIONAL_PAIRS`) are
-  deleted**, and the pipeline's `restore` stage now raises: ten of those pairs referenced
-  CD20, which is too sparse in pancreas to define a negative control, and there is no
-  mechanical substitute. The manuscript-faithful replacement uses an **NNMF separator** and
-  a divisor equal to the **MAXIMUM** target intensity among the accepted target-negative
-  controls — `phenocycler/restore_validation.py`, entry point
-  `python -m phenocycler.restore_validation evaluate-locked`. Nothing is accepted yet
-  (Gate 2 of 7); see `docs/restore_faithful_rebuild_plan.md` in the parent repo.
-  *Retired description, kept for context:* `phenocycler/restore.py` drove the **vendored**
-  RESTORE (`external/RESTORE`, git submodule) headlessly, fitting KMeans/GMM/**SSC**
-  per image × pair (SSC the default), with a robust cohort-median guard on degenerate
-  thresholds; the pairs were a **curated directional web** in which each
-  `[target, counterpart]` thresholded the target against a biologically mutually-exclusive
-  counterpart (e.g. `E_cadherin ← CD31`, `B3TUBB ← CD3e`, intra-islet `INS ↔ GCG`) — not a
-  single universal reference, all markers thresholded in ONE pass.
-- **Broad phenotyping** (`lineage.py`) assigns each cell by an **ordered residual gating tree**:
-  Epithelial (E-cadherin) → Endothelial (CD31) → Neural (B3TUBB) → Immune (marker union + NK) →
-  Mesenchymal (SMA then Vimentin), each gate on the residual of the prior; cells failing every
-  gate → **`Other`**. Endocrine (β/α/δ) and Exocrine are the hormone⁺/⁻ sub-branches of
-  Epithelial. Output: `compartment` (5 + Other) + finer `cell_type`.
-
-## Installation
-
-```bash
-git clone --recurse-submodules https://github.com/smith6jt-cop/Phenocycler_Analysis.git
-cd Phenocycler_Analysis
-bash setup.sh          # inits the RESTORE submodule, creates the conda env, verifies imports
-conda activate phenocycler_analysis
-pip install spams-bin  # SSC model for RESTORE (if not already pulled by environment.yml)
-```
-
-If you cloned without `--recurse-submodules`: `git submodule update --init --recursive`.
-
-**Consuming this as a dependency (e.g. from Islet-Explorer-Senior).** The package is
-config-driven, so it can be added as a git submodule and installed *editable* into an
-existing analysis environment instead of its own conda env:
-
-```bash
-pip install -e .    # into your existing env (e.g. Senior's scvi-env, Python 3.13 / numpy 2.2)
-```
-
-`environment.yml` pins a self-contained reference env (Python 3.11); when embedding in
-another project, run under that project's interpreter and point `config.ini` (or the
-`PHENOCYCLER_*` env vars) at its data.
-
-## Quick start
-
-1. Edit `config.ini` `[paths]` to point at your raw `.qptiff` images, the QuPath
-   `Cellmeasurements.csv`, and the donor-metadata workbook (see `DATA_README.md`).
-2. Export per-cell GeoJSON from QuPath (`scripts/groovy/export_cells_geojson.groovy`).
-3. Run the whole pipeline (idempotent — skips completed steps):
-
-```bash
-python -m phenocycler.pipeline            # cells → redsea → restore → lineage → qupath → figures
-python -m phenocycler.pipeline --status   # just show what exists
-```
-
-Or run steps individually / interactively via the notebooks:
-
-```
-notebooks/00_prerequisites_qupath.ipynb   # upstream + GeoJSON export
-notebooks/01_build_cells_parquet.ipynb
-notebooks/02_redsea_spillover.ipynb
-notebooks/03_restore_normalize.ipynb
-notebooks/04_broad_lineage.ipynb
-notebooks/05_qupath_export.ipynb
-notebooks/00_run_full_pipeline.ipynb      # thin orchestrator
-```
-
-Every step is also a module CLI, e.g. `python -m phenocycler.redsea --all --jobs 4`.
-
-## Performance & acceleration
-
-Upstream, only the DuckDB build and scVI were parallel; REDSEA, RESTORE and lineage
-ran strictly serially. **Every stage is per-donor embarrassingly parallel**, which is
-the primary optimization here.
-
-| Step | Engine | Parallelism | GPU |
-|------|--------|-------------|-----|
-| 1. cells_parquet | DuckDB (out-of-core) | multithreaded (`[compute] duckdb_threads`) | n/a (I/O bound) |
-| 2. REDSEA | NumPy + SciPy-sparse | per-donor pool (`--jobs`) **or** SLURM array (one donor/task) | optional CuPy (`--gpu`): `bincount` + sparse `F@edge` |
-| 3. RESTORE | vendored RESTORE (SSC) | per-donor apply pool (`--jobs`); subsample cap keeps SSC tractable | — |
-| 4. broad phenotyping | vectorized NumPy | per-donor pool (`--jobs`) | — |
-| 5. QuPath export | pandas | serial (I/O-light) | — |
-| 6. identity figures | pandas + matplotlib | streaming | — |
-
-Set `[compute] n_jobs` in `config.ini` (or `--jobs N`) for the process pools, and
-`use_gpu = true` (+ `pip install cupy-cuda12x`) for the REDSEA CuPy path. For
-cohort-scale HPC runs use the SLURM chain:
-
-```bash
-bash scripts/slurm/run_full_pipeline.sh 15   # 15 donors: cells → redsea[array 0-14] → restore → lineage
-```
-
-## Repository structure
-
-```
-phenocycler/            installable package
-  config.py             config.ini loader + derived paths (no hardcoded paths)
-  cells_parquet.py      Step 1 — DuckDB CSV -> partitioned parquet
-  redsea.py             Step 2 — pixel REDSEA (+ parallel driver + CuPy backend)
-  restore.py            Step 3 — RESTORE driver (headless stubs, robust LUT, parallel apply)
-  lineage.py            Step 4 — ordered residual gating tree (5 compartments + Other)
-  marker_taxonomy.py    TYPE / PROCESS / EXCLUDED marker split (single source of truth)
-  qupath_export.py      Step 5 — per-image UUID-keyed CSVs for QuPath
-  figures.py            Step 6 — cell-type × marker identity dotplot + heatmap
-  pipeline.py           idempotent orchestrator + status table
-  parallel.py           per-donor process pool
-  gpu.py                optional CuPy/RAPIDS backend with CPU fallback
-external/RESTORE/       vendored RESTORE (git submodule, commit 38df59b)
-notebooks/              thin step notebooks + orchestrator
-scripts/groovy/         QuPath export/import Groovy scripts
-scripts/R/              RESTORE efficacy diagnostic (mxnorm) + its installer (R 4.5.1)
-scripts/slurm/          HiPerGator SLURM (per-donor array) scripts
-docs/RESTORE_PAIR_REVIEW_WORKFLOW.txt
-                        authoritative human pair-review workflow copied into each bundle
-tests/                  pytest: REDSEA math, RESTORE guard, ordered-residual lineage invariants
-config.ini              paths + tunables
-pyproject.toml          editable-install metadata (pip install -e .)
-```
-
-Generated RESTORE review bundles must be entered through
-`START_HERE_RESTORE_REVIEW.txt`. Reviewers record decisions only in
-`review_decisions.csv`; the larger queue and manifest tables are provenance. The
-Step 2 horizontal line is the RESTORE divisor, not an exclusion boundary:
-input-QC-retained NNMF target-component cells at or left of the Step 1 reference
-separator remain target lineage evidence even when their normalized target value is at
-or below one. Cells below both raw input floors remain double-low and cannot be rescued
-by component assignment.
-
-Donors **6457 and 6579 are excluded until further notice from every analysis
-stage**. Donor 6457 had poor DAPI staining that prevented accurate Phenocycler
-channel registration; donor 6579 is excluded by maintainer decision as a
-pancreatitis outlier. Raw and REDSEA files may be retained for provenance, but
-automatic donor discovery filters both donors and explicit API/CLI analysis
-requests containing either donor fail closed.
-
-## Testing
-
-```bash
-pytest tests/            # REDSEA compensation, contact matrix, rasterize; RESTORE robust
-                         # guard; lineage hierarchy (zero Unassigned); config; parallel
-```
-
-The tests need no imaging data (they use synthetic masks/frames) and run in ~2 s.
-
-## Prerequisites (upstream of this repo)
-
-1. **Image processing** — for *this* cohort, the Akoya instrument only
-   (`ImageProcessingApplied=OffsetAndShading`, `AutofluorescenceSubtracted=True` in the qptiff XML;
-   maintainer, 2026-07-25). [KINTSUGI](https://github.com/smith6jt-cop/KINTSUGI) (illumination
-   correction → stitching → deconvolution → EDF → registration → autofluorescence removal) is the
-   general upstream chain but was **not used here** — see `DATA_README.md`.
-2. **Segmentation** — QuPath cell detection via **`scripts/groovy/0_cell_detection.groovy`**, then
-   export the per-cell measurement CSV and full-resolution GeoJSON
-   (`scripts/groovy/export_cells_geojson.groovy`).
-
-   > Use that script, not a hand-run detection. Detection was the one unscripted stage and it was run
-   > with `selectAnnotations()`, which selects the Tissue annotation **and** every nested `Islet_N`;
-   > InstanSeg runs inference per selected parent and does not deduplicate across parents, so every
-   > nucleus inside an islet was segmented twice. 311,340 duplicate detections across 7 donors, 100%
-   > inside islets, roughly doubling islet cell counts. The script selects Tissue by classification,
-   > refuses to run if anything else is selected, and verifies no two detections share a centroid.
-
-## Citations
-
-- **REDSEA** — Bai, Y. et al. *Adjacent Cell Marker Lateral Spillover Compensation and
-  Reinforcement for Multiplexed Images.* Front. Immunol. 12:652631 (2021).
-- **RESTORE** — Chang, Y.H. et al. *RESTORE: Robust intEnSiTy nORmalization mEthod for
-  multiplexed imaging.* Commun. Biol. 3:111 (2020).
-- **KINTSUGI** — Smith, J.A. et al. *Protocol for processing and analyzing multiplexed
-  images...* STAR Protocols 6:103976 (2025).
-
-## Acknowledgments
-
-University of Florida Research Computing (HiPerGator). Pipeline logic ported from
-`smith6jt-cop/Islet-Explorer-Senior`; RESTORE vendored from `smith6jt-cop/RESTORE`.
+This repository begins with QuPath measurement, geometry, and qptiff outputs.
+Image registration, illumination correction, segmentation-model development,
+and downstream spatial-neighborhood or trajectory analyses are separate
+workflows. The goal here is a reproducible per-cell evidence layer that supports
+eventual assignment of every cell while preserving honest ambiguity whenever
+the panel or calibration cannot support a specific call.

@@ -1,9 +1,4 @@
-"""Unit tests for the canonical cells-parquet build.
-
-`build_sql` had no test at all before 2026-07-26, despite owning the pipeline's only cell filter and
-defining the canonical cell universe that REDSEA, the RESTORE compartment extraction and
-`load_validation_sample` all derive from by join.
-"""
+"""Unit tests for the canonical cells-parquet build."""
 
 from __future__ import annotations
 
@@ -58,12 +53,23 @@ def _csv(tmp_path, rows) -> Path:
     return p
 
 
-def _run(tmp_path, rows, min_cell_area):
+def _run(tmp_path, rows, min_cell_area, image_to_donor=None):
     duckdb = pytest.importorskip("duckdb")
     csv_path = _csv(tmp_path, rows)
     out = tmp_path / "out"
     (out / "cells").mkdir(parents=True, exist_ok=True)
-    sql, mm = cp.build_sql(csv_path, out, None, min_cell_area)
+    mapping = (
+        {"6374_Scan1.er.qptiff": "6374"}
+        if image_to_donor is None
+        else image_to_donor
+    )
+    sql, mm = cp.build_sql(
+        csv_path,
+        out,
+        None,
+        min_cell_area,
+        image_to_donor=mapping,
+    )
     duckdb.connect().execute(sql)
     # donor_id is a hive PARTITION key (a `donor_id=<id>` directory), not a stored column, so it has
     # to come back off the path — exactly as `config.discover_donors` reads it in production.
@@ -80,7 +86,10 @@ def _run(tmp_path, rows, min_cell_area):
 def test_marker_means_maps_only_whole_cell_means():
     mm = cp.marker_means(HEADER)
     assert mm == {"Cell: DAPI: Mean": "DAPI", "Cell: E-cadherin: Mean": "E-cadherin"}
-    assert "Nucleus: DAPI: Mean" not in mm      # nuclear compartment is not carried forward
+    assert "Nucleus: DAPI: Mean" not in mm
+    assert cp.compartment_means(HEADER, "Nucleus") == {
+        "Nucleus: DAPI: Mean": "DAPI"
+    }
 
 
 def test_sanitize_matches_the_redsea_column_convention():
@@ -109,14 +118,32 @@ def test_non_finite_area_is_always_dropped(tmp_path):
     assert sorted(df.object_id) == ["ok"]
 
 
-def test_donor_id_is_the_first_digit_run_of_the_image_name(tmp_path):
+def test_donor_id_comes_from_the_exact_manifest_mapping(tmp_path):
     rows = [
         _row("a", 60.0, image="6374_Scan1.er.qptiff"),
         _row("b", 60.0, image="HDL115pancLN_Scan1.er.qptiff"),
         _row("c", 60.0, image="6450panc_Scan1.er.qptiff"),
     ]
-    df, _ = _run(tmp_path, rows, 20.0)
+    df, _ = _run(
+        tmp_path,
+        rows,
+        20.0,
+        image_to_donor={
+            "6374_Scan1.er.qptiff": "6374",
+            "HDL115pancLN_Scan1.er.qptiff": "115",
+            "6450panc_Scan1.er.qptiff": "6450",
+        },
+    )
     assert dict(zip(df.object_id, df.donor_id)) == {"a": "6374", "b": "115", "c": "6450"}
+
+
+def test_unmapped_image_fails_instead_of_guessing_a_donor(tmp_path):
+    with pytest.raises(Exception, match="unmapped QuPath Image"):
+        _run(
+            tmp_path,
+            [_row("a", 60.0, image="contains9999_but_is_not_contracted.qptiff")],
+            20.0,
+        )
 
 
 def test_cell_region_scheme(tmp_path):
@@ -134,18 +161,114 @@ def test_cell_region_scheme(tmp_path):
     assert dict(zip(df.object_id, df.islet_num))["core"] == "7"
 
 
-def test_morphology_columns_needed_by_cell_qc_are_all_present(tmp_path):
-    """cell_qc reads these directly off the canonical parquet — none may go missing."""
+def test_morphology_columns_needed_by_geometry_qc_are_all_present(tmp_path):
+    """Geometry QC reads these from canonical cells; none may go missing."""
     df, _ = _run(tmp_path, [_row("a", 60.0)], 20.0)
-    from phenocycler.cell_qc import QC_SOURCE_COLUMNS
+    from phenocycler.geometry_stage import GEOMETRY_SOURCE_COLUMNS
 
-    missing = set(QC_SOURCE_COLUMNS) - set(df.columns)
+    missing = set(GEOMETRY_SOURCE_COLUMNS) - set(df.columns)
     assert not missing, f"cells parquet is missing QC inputs: {sorted(missing)}"
 
 
 def test_build_sql_rejects_a_csv_with_no_marker_columns(tmp_path):
     p = tmp_path / "bad.csv"
     with open(p, "w", newline="") as f:
-        csv.writer(f).writerow(["Image", "Object ID", "Cell: Area µm^2"])
+        csv.writer(f).writerow(cp.REQUIRED_CONTEXT_COLUMNS)
     with pytest.raises(SystemExit, match="No 'Cell: <marker>: Mean' columns"):
-        cp.build_sql(p, tmp_path / "out", None, 20.0)
+        cp.build_sql(
+            p,
+            tmp_path / "out",
+            None,
+            20.0,
+            image_to_donor={"image": "D"},
+        )
+
+
+# --------------------------------------------------------------- multi-export ingest (2026-07-29)
+
+
+def _csv_named(tmp_path, name, rows, header):
+    """One QuPath export with an explicit header (so batches can differ)."""
+    p = tmp_path / name
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    return p
+
+
+def _two_batch_exports(tmp_path):
+    """Batch 1 carries CD38, batch 2 carries b-Catenin1 — the real panel difference in this cohort."""
+    h1 = HEADER + ["Cell: CD38: Mean"]
+    h2 = HEADER + ["Cell: b-Catenin1: Mean"]
+    r1 = {**_row("a", 50.0, image="6374_Scan1.er.qptiff"), "Cell: CD38: Mean": "111"}
+    r2 = {**_row("b", 50.0, image="6523_Scan1.er.qptiff"), "Cell: b-Catenin1: Mean": "222"}
+    return (_csv_named(tmp_path, "batch1.csv", [r1], h1),
+            _csv_named(tmp_path, "batch2.csv", [r2], h2))
+
+
+def test_reconcile_headers_keeps_union_and_records_availability(tmp_path):
+    """Batch-specific markers remain usable for donors that acquired them."""
+    p1, p2 = _two_batch_exports(tmp_path)
+    union, report = cp.reconcile_headers([p1, p2])
+
+    assert set(union.values()) == {"DAPI", "E_cadherin", "CD38", "b_Catenin1"}
+    assert report["union"] == 4
+    assert report["intersection"] == 2
+    assert report["files"] == {str(p1): 3, str(p2): 3}
+    assert report["availability"][str(p1)]["CD38"]
+    assert not report["availability"][str(p1)]["b_Catenin1"]
+    assert report["availability"][str(p2)]["b_Catenin1"]
+    assert not report["availability"][str(p2)]["CD38"]
+
+
+def test_reconcile_headers_fails_loudly_on_a_missing_export(tmp_path):
+    p1, _ = _two_batch_exports(tmp_path)
+    with pytest.raises(SystemExit, match="not found"):
+        cp.reconcile_headers([p1, tmp_path / "absent.csv"])
+    with pytest.raises(SystemExit, match="cohort manifest.*no QuPath measurement CSV"):
+        cp.reconcile_headers([])
+
+
+def test_build_sql_reads_every_export_in_one_pass(tmp_path):
+    """Both batches must reach the output, aligned by NAME (their column counts differ)."""
+    duckdb = pytest.importorskip("duckdb")
+    p1, p2 = _two_batch_exports(tmp_path)
+    out = tmp_path / "out"
+    (out / "cells").mkdir(parents=True, exist_ok=True)
+    mapping = {
+        "6374_Scan1.er.qptiff": "6374",
+        "6523_Scan1.er.qptiff": "6523",
+    }
+    sql, mm = cp.build_sql(
+        [p1, p2], out, None, 20.0, image_to_donor=mapping
+    )
+    assert "UNION ALL BY NAME" in sql
+    duckdb.connect().execute(sql)
+
+    donors = sorted(d.name.split("=", 1)[1] for d in (out / "cells").glob("donor_id=*"))
+    assert donors == ["6374", "6523"]                 # a donor from each batch
+    frames = [pd.read_parquet(f) for f in sorted((out / "cells").rglob("*.parquet"))]
+    for frame in frames:
+        assert {"DAPI", "E_cadherin", "CD38", "b_Catenin1"} <= set(frame.columns)
+        assert "Nucleus__DAPI" in frame
+    by_object = pd.concat(frames, ignore_index=True).set_index("object_id")
+    assert by_object.loc["a", "CD38"] == 111
+    assert pd.isna(by_object.loc["a", "b_Catenin1"])
+    assert by_object.loc["b", "b_Catenin1"] == 222
+    assert pd.isna(by_object.loc["b", "CD38"])
+
+
+def test_build_sql_still_accepts_a_single_path(tmp_path):
+    """Back-compat: one export is the degenerate case of the list, not a separate code path."""
+    p1, _ = _two_batch_exports(tmp_path)
+    mapping = {"6374_Scan1.er.qptiff": "6374"}
+    sql_single, mm_single = cp.build_sql(
+        p1, tmp_path / "out", None, 20.0, image_to_donor=mapping
+    )
+    sql_list, mm_list = cp.build_sql(
+        [p1], tmp_path / "out", None, 20.0, image_to_donor=mapping
+    )
+    assert sql_single == sql_list and mm_single == mm_list
+    assert "CD38" in mm_single.values()               # nothing dropped when there is nothing to reconcile

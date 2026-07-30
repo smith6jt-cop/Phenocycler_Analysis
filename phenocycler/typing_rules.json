@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "rules_version": "hierarchical-typing-rules-v1",
+  "marker_registry_version": "marker-calibration-registry-v1",
+  "description": "Curated biological interpretation layered over the marker calibration registry. Broad models are simultaneous; subtypes are interpreted only inside an accepted parent.",
+  "broad": {
+    "Immune": {
+      "anchors": ["CD3e", "CD79a", "CD68", "MPO"],
+      "support": ["CD8", "CD4", "Iba1", "CD206", "CD11c", "CD11b"],
+      "exclusions": ["E_cadherin"]
+    },
+    "Endothelial": {
+      "anchors": ["CD31"],
+      "support": ["CD34", "Podoplanin"],
+      "exclusions": ["E_cadherin"]
+    },
+    "Epithelial": {
+      "anchors": ["E_cadherin", "Pan_Cytokeratin", "INS", "GCG"],
+      "support": ["Ker8_18", "Keratin_5", "EpCAM"],
+      "exclusions": ["CD31"]
+    },
+    "Neural": {
+      "anchors": ["B3TUBB"],
+      "support": [],
+      "exclusions": ["E_cadherin"]
+    },
+    "Mesenchymal": {
+      "anchors": ["Vimentin", "SMA"],
+      "support": [],
+      "exclusions": ["E_cadherin", "CD31", "CD3e"]
+    }
+  },
+  "subtypes": {
+    "T_cell": {
+      "parent": "Immune",
+      "anchors": ["CD3e"],
+      "support": ["CD4", "CD8"],
+      "exclusions": ["CD68", "CD79a", "MPO"],
+      "required": ["CD3e"]
+    },
+    "B_lineage": {
+      "parent": "Immune",
+      "anchors": ["CD79a"],
+      "support": [],
+      "exclusions": ["CD3e", "CD68", "MPO"],
+      "required": ["CD79a"]
+    },
+    "Macrophage": {
+      "parent": "Immune",
+      "anchors": ["CD68", "Iba1"],
+      "support": ["CD206", "CD11b"],
+      "exclusions": ["CD3e", "CD79a", "MPO"],
+      "required": ["CD68", "Iba1"]
+    },
+    "Myeloid_APC": {
+      "parent": "Immune",
+      "anchors": ["CD11c"],
+      "support": ["CD11b"],
+      "exclusions": ["CD3e", "CD79a", "MPO"],
+      "required": ["CD11c"]
+    },
+    "Neutrophil": {
+      "parent": "Immune",
+      "anchors": ["MPO"],
+      "support": [],
+      "exclusions": ["CD3e", "CD79a", "CD68"],
+      "required": ["MPO"]
+    },
+    "Beta": {
+      "parent": "Epithelial",
+      "anchors": ["INS"],
+      "support": [],
+      "exclusions": ["GCG"],
+      "required": ["INS"]
+    },
+    "Alpha": {
+      "parent": "Epithelial",
+      "anchors": ["GCG"],
+      "support": [],
+      "exclusions": ["INS"],
+      "required": ["GCG"]
+    },
+    "Delta": {
+      "parent": "Epithelial",
+      "anchors": ["SST"],
+      "support": [],
+      "exclusions": [],
+      "required": ["SST"]
+    },
+    "Lymphatic_endothelial": {
+      "parent": "Endothelial",
+      "anchors": ["Podoplanin"],
+      "support": [],
+      "exclusions": [],
+      "required": ["Podoplanin"]
+    },
+    "CD34_endothelial": {
+      "parent": "Endothelial",
+      "anchors": ["CD34"],
+      "support": [],
+      "exclusions": ["Podoplanin"],
+      "required": ["CD34"]
+    },
+    "SMA_positive_mesenchymal": {
+      "parent": "Mesenchymal",
+      "anchors": ["SMA"],
+      "support": [],
+      "exclusions": [],
+      "required": ["SMA"]
+    }
+  }
+}

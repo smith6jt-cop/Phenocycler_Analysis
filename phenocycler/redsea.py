@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""
-Step 2 — scalable pixel-level REDSEA (lateral spillover correction).
+"""Scalable pixel-level REDSEA lateral-spillover correction.
 
-Faithful port of ``scripts/senior/redsea_full.py`` (Islet-Explorer-Senior).  It
-reimplements the REDSEA math (Bai et al. 2021, *Front. Immunol.*) scalably — the
-reference ``redseapy`` does not scale (dense cellNum² matrix, whole-image reads,
-pure-python pixel loops):
+The implementation preserves the REDSEA operator while using sparse contacts
+and channel-at-a-time qptiff reads:
 
     data[i,ch]     = whole-cell SUM of channel ch over cell i's pixels   (np.bincount)
     edge[i,ch]     = SUM over cell i's boundary band (1-px inner rim)     (np.bincount)
@@ -14,28 +11,11 @@ pure-python pixel loops):
     corrected_sum  = clip( data + comp_mode*edge - alpha*(F @ edge), 0 )
     corrected_mean = corrected_sum / cell_area_px
 
-Defaults (METHOD v10, 2026-07-25): ``comp_mode=1`` (subtract + reinforce, the Bai et al. default),
-``norm_form="donor"`` (the published mass-conserving operator), ``alpha=1.0``, ``edge_radius=0``
-(the 1-px cell rim), ``gap_bridge=1``, and nuclear/ECM channels passed through uncorrected
-(``marker_taxonomy.NO_SPILLOVER``).  The pre-v10 defaults — ``comp_mode=0``, ``norm_form="recipient"``,
-every channel corrected — are still reachable by config/CLI to reproduce v9 artifacts; see
-``compensate`` for why they over-subtract.  Mask source is per-cell GeoJSON exported from QuPath;
-the qptiff is read one channel at a time.
-
-Additions vs. upstream:
-  * config-driven paths (no hardcoded ``/home/smith6jt/...``);
-  * per-donor multiprocessing (``--jobs`` / ``n_jobs``) — every donor is
-    independent, so this scales near-linearly and is the primary speed-up;
-  * an optional CuPy backend (``--gpu`` / ``use_gpu``) for the per-channel
-    ``bincount`` accumulation and the sparse ``F @ edge`` matmul.  GPU is meant
-    for ``n_jobs=1`` (one donor on the device at a time); combine GPU with a
-    SLURM array for cohort-scale parallelism instead of a local process pool.
-
-    python -m phenocycler.redsea --donor 6539            # smoke test (smallest)
-    python -m phenocycler.redsea --all --jobs 4          # 4 donors in parallel
-    python -m phenocycler.redsea --all --gpu             # CuPy accumulation/matmul
-    python -m phenocycler.redsea --all --reconcile-existing
-                                                            # filter existing outputs to raw-cell IDs
+The mandatory output resolves that same operator into
+Nucleus/Cytoplasm/Membrane/Cell means. Nucleus and Cytoplasm conserve the
+whole-cell result exactly before non-negativity clipping. The content-addressed
+pipeline is the production entry point; this module contains the numerical
+implementation and a thin stage-only command.
 """
 
 from __future__ import annotations
@@ -49,7 +29,6 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -88,13 +67,6 @@ class RedseaParams:
     save_intermediates: bool = False
     use_gpu: bool = False
     gpu_device: int = 0
-    # -- optional per-channel alpha + receptivity ("brightness") gate: the abandoned "keratin
-    #    lever", kept ADDITIVE and OFF by default.  When these stay at their defaults the
-    #    compensation is bit-identical to scalar-alpha REDSEA. --
-    alpha_per_channel: Optional[str] = None   # 'Name=val,Name2=val2'; unlisted channels use `alpha`
-    gate_brightness: bool = False             # enable the receptivity gate
-    gate_channels: Optional[str] = None       # comma-separated aggressor channels (default keratins+Vim)
-    gate_kappa: float = 1.0                   # gate aggressiveness
 
     @classmethod
     def from_config(cls, cfg: PipelineConfig, **overrides) -> "RedseaParams":
@@ -115,24 +87,71 @@ class RedseaParams:
 
 
 # --------------------------------------------------------------------------- discovery
+def contracted_image(cfg: PipelineConfig, donor: str):
+    """Return the donor's exact image record from the cohort manifest."""
+
+    from .artifacts import QuPathCohortManifest
+
+    cohort = QuPathCohortManifest.read_json(cfg.qupath_manifest)
+    matches = [image for image in cohort.images if image.donor_id == str(donor)]
+    if len(matches) != 1:
+        raise ValueError(
+            f"QuPath cohort contract has {len(matches)} images for donor {donor}"
+        )
+    return matches[0]
+
+
 def donor_image(cfg: PipelineConfig, donor: str) -> str:
-    """The QuPath image string for this donor (from the cells parquet)."""
-    f = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
-    if not f:
-        raise SystemExit(f"[err] no {cfg.cells_dir}/donor_id={donor}")
-    return str(pd.read_parquet(f[0], columns=["image"]).image.iloc[0])
+    """The exact QuPath ``Image`` value contracted for this donor."""
+
+    return contracted_image(cfg, donor).image_id
 
 
 def resolve_paths(cfg: PipelineConfig, donor: str):
-    img = donor_image(cfg, donor)
-    tag = re.sub(r"[^A-Za-z0-9._-]", "_", img)          # matches the Groovy sanitization
-    geojson = cfg.geojson_dir / f"cells__{tag}.geojson"
-    qptiff = cfg.images_dir / img.split(" - ")[0].strip()  # '...qptiff - resolution #1' -> '...qptiff'
-    if not geojson.exists():
-        raise SystemExit(f"[err] missing geojson: {geojson}\n      run export_cells_geojson.groovy for {img}")
-    if not qptiff.exists():
-        raise SystemExit(f"[err] missing qptiff: {qptiff}")
-    return img, geojson, qptiff
+    image = contracted_image(cfg, donor)
+    image.validate_current(mode="fast")
+    return (
+        image,
+        Path(image.cell_geojson.path),
+        Path(image.nucleus_geojson.path),
+        image.combined_geometry_file,
+        Path(image.qptiff.path),
+    )
+
+
+def validated_channel_markers(image, channel_names) -> list[str]:
+    """Validate qptiff metadata against the manifest and return canonical markers."""
+
+    names = [str(name) for name in channel_names]
+    declared = tuple(
+        sorted(image.channel_map, key=lambda item: item.channel_index)
+    )
+    if len(declared) != len(names):
+        raise ValueError(
+            f"{image.image_id}: manifest declares {len(declared)} channels "
+            f"but qptiff contains {len(names)}"
+        )
+    if tuple(channel.channel_index for channel in declared) != tuple(
+        range(len(names))
+    ):
+        raise ValueError(
+            f"{image.image_id}: channel indices do not exactly cover qptiff"
+        )
+    mismatches = [
+        (
+            channel.channel_index,
+            channel.channel_name,
+            names[channel.channel_index],
+        )
+        for channel in declared
+        if channel.channel_name != names[channel.channel_index]
+    ]
+    if mismatches:
+        raise ValueError(
+            f"{image.image_id}: qptiff channel metadata differs from manifest "
+            f"(examples={mismatches[:5]})"
+        )
+    return [channel.marker for channel in declared]
 
 
 # --------------------------------------------------------------------------- qptiff
@@ -167,42 +186,98 @@ def read_channel(pages, ch, dtype=np.float32):
 
 
 # --------------------------------------------------------------------------- rasterize
-def rasterize_mask(geojson: Path, shape, downsample: float):
+def _draw_geometry(target, geom, label, shape, s):
+    """Rasterize one (Multi)Polygon into `target` at `label`; carve interior rings. Returns #holes."""
+    n_holes = 0
+    polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+    for poly in polys:                           # poly = [exterior, hole1, ...]
+        ext = np.asarray(poly[0], dtype=np.float64)
+        if ext.shape[0] < 3:
+            continue
+        cc = ext[:, 0] * s                        # x -> col
+        rr = ext[:, 1] * s                        # y -> row
+        pr, pc = draw_polygon(rr, cc, shape=shape)
+        target[pr, pc] = label
+        for hole in poly[1:]:                     # carve interior rings back to background
+            h = np.asarray(hole, dtype=np.float64)
+            if h.shape[0] < 3:
+                continue
+            n_holes += 1
+            hr, hc = draw_polygon(h[:, 1] * s, h[:, 0] * s, shape=shape)
+            target[hr, hc] = 0
+    return n_holes
+
+
+def rasterize_mask(geojson: Path, shape, downsample: float, with_nucleus: bool = False):
     """Rasterize per-cell polygons into an int32 instance mask. label = feature_index+1.
-    Returns (mask, object_ids[list]) where object_ids[label-1] is the cell's UUID."""
+    Returns (mask, object_ids[list]) where object_ids[label-1] is the cell's UUID.
+
+    ``with_nucleus`` additionally rasterizes each feature's ``nucleusGeometry`` -- which QuPath's
+    GeoJSON export already carries alongside the cell polygon, and which this function ignored until
+    2026-07-29 -- into a second label image with the SAME labels, and returns
+    ``(mask, object_ids, nucleus_mask)``. The nucleus raster is intersected with the final cell raster
+    (``nuc == mask`` or 0) so that N is a strict subset of Cell per label: the compartment
+    decomposition in :func:`compensate_compartments` needs ``nuc <= data`` and
+    ``nuccount <= sizes`` to hold exactly, and cell polygons drawn later can otherwise overwrite an
+    earlier cell's pixels while its nucleus raster still claims them. Cells whose nucleusGeometry is
+    absent (segmentation fragments; every CANONICAL cell has one) get an empty nucleus and therefore
+    a NaN Nucleus mean, never a silent zero."""
     log(f"  [raster] loading {geojson.name} ...")
     feats = json.load(open(geojson))["features"]
     n = len(feats)
     mask = np.zeros(shape, dtype=np.int32)
+    nuc_mask = np.zeros(shape, dtype=np.int32) if with_nucleus else None
     oids = [None] * n
     s = 1.0 / downsample
     n_holes = 0
+    n_nuc = 0
     t0 = time.time()
     for i, ft in enumerate(feats):
         oids[i] = ft.get("id")
         label = i + 1
-        g = ft["geometry"]
-        gtype = g["type"]
-        polys = g["coordinates"] if gtype == "MultiPolygon" else [g["coordinates"]]
-        for poly in polys:                       # poly = [exterior, hole1, ...]
-            ext = np.asarray(poly[0], dtype=np.float64)
-            if ext.shape[0] < 3:
-                continue
-            cc = ext[:, 0] * s                    # x -> col
-            rr = ext[:, 1] * s                    # y -> row
-            pr, pc = draw_polygon(rr, cc, shape=shape)
-            mask[pr, pc] = label
-            for hole in poly[1:]:                 # carve interior rings back to background
-                h = np.asarray(hole, dtype=np.float64)
-                if h.shape[0] < 3:
-                    continue
-                n_holes += 1
-                hr, hc = draw_polygon(h[:, 1] * s, h[:, 0] * s, shape=shape)
-                mask[hr, hc] = 0
+        n_holes += _draw_geometry(mask, ft["geometry"], label, shape, s)
+        if with_nucleus:
+            ng = ft.get("nucleusGeometry")
+            if ng is not None:
+                n_nuc += 1
+                _draw_geometry(nuc_mask, ng, label, shape, s)
         if (i + 1) % 100000 == 0:
             log(f"  [raster] {i+1:,}/{n:,} ({(time.time()-t0):.0f}s)")
     log(f"  [raster] {n:,} cells, {n_holes} holes carved, {time.time()-t0:.0f}s")
-    return mask, oids
+    if not with_nucleus:
+        return mask, oids
+    # Keep only nucleus pixels the cell raster still agrees with (see docstring).
+    np.putmask(nuc_mask, nuc_mask != mask, 0)
+    log(f"  [raster] nuclei: {n_nuc:,}/{n:,} features carried a nucleusGeometry")
+    return mask, oids, nuc_mask
+
+
+def relabel_nucleus_mask(
+    nucleus_mask: np.ndarray,
+    nucleus_object_ids,
+    cell_mask: np.ndarray,
+    cell_object_ids,
+) -> np.ndarray:
+    """Relabel a separate nucleus raster into the cell raster label space."""
+
+    cell_labels = {
+        str(object_id): index
+        for index, object_id in enumerate(cell_object_ids, start=1)
+    }
+    if len(cell_labels) != len(cell_object_ids):
+        raise ValueError("cell geometry object IDs are not unique")
+    if len(set(map(str, nucleus_object_ids))) != len(nucleus_object_ids):
+        raise ValueError("nucleus geometry object IDs are not unique")
+    lookup = np.zeros(len(nucleus_object_ids) + 1, dtype=cell_mask.dtype)
+    for index, object_id in enumerate(nucleus_object_ids, start=1):
+        try:
+            lookup[index] = cell_labels[str(object_id)]
+        except KeyError as exc:
+            raise ValueError(
+                f"nucleus object {object_id!r} has no cell geometry"
+            ) from exc
+    relabelled = lookup[np.asarray(nucleus_mask)]
+    return np.where(relabelled == cell_mask, relabelled, 0)
 
 
 # --------------------------------------------------------------------------- contact matrix
@@ -253,29 +328,6 @@ def contact_matrix_gapbridge(mask, n, grow):
 
 
 # --------------------------------------------------------------------------- compensate
-DEFAULT_GATE_CHANNELS = ["Pan_Cytokeratin", "Ker8_18", "Keratin_5", "Vimentin"]
-
-
-def parse_alpha_per_channel(spec, cols, default):
-    """Build a length-C per-channel alpha vector from 'Name=val,Name2=val2' (unlisted -> `default`).
-    Warns on any name not in `cols`. Returns None if spec is falsy (caller uses the scalar `default`)."""
-    if not spec:
-        return None
-    a = np.full(len(cols), float(default), dtype=np.float64)
-    ci = {c: k for k, c in enumerate(cols)}
-    for tok in str(spec).split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        name, _, val = tok.partition("=")
-        name = name.strip()
-        if name not in ci:
-            log(f"  [alpha] WARNING: channel '{name}' not in the panel — ignored")
-            continue
-        a[ci[name]] = float(val)
-    return a
-
-
 def apply_no_spillover_mask(params, cols, alpha, comp_mode):
     """Zero ``alpha`` and ``comp_mode`` for channels REDSEA must not touch.
 
@@ -284,9 +336,8 @@ def apply_no_spillover_mask(params, cols, alpha, comp_mode):
     stays byte-identical to the pre-v10 behaviour.
 
     Setting both terms to 0 makes ``corrected_sum = data + 0*edge - 0*(F @ edge) = data`` for that
-    channel — a pure passthrough. The column is still WRITTEN, so the parquet schema is unchanged
-    (``load_validation_sample`` reads every ``QUPATH_MARKERS`` entry and ``reconcile_existing_donor``
-    compares Arrow schemas for equality).
+    channel — a pure passthrough. The column is still written, so every donor
+    retains the registry-defined schema.
     """
     if not getattr(params, "exclude_no_spillover", True):
         return alpha, comp_mode, 0
@@ -301,57 +352,104 @@ def apply_no_spillover_mask(params, cols, alpha, comp_mode):
     return alpha_vec, comp_vec, n_skipped
 
 
-def build_gate(params, cols):
-    """Config for the receptivity (directional) gate, or None when disabled. `channels` is a bool[C]
-    mask of the aggressor channels to gate (default the keratins + Vimentin); other channels always
-    subtract fully (w=1).  `params` is a :class:`RedseaParams` (or any object exposing the gate_*
-    attributes)."""
-    if not getattr(params, "gate_brightness", False):
-        return None
-    want = (params.gate_channels.split(",") if getattr(params, "gate_channels", None)
-            else DEFAULT_GATE_CHANNELS)
-    want = {c.strip() for c in want if c.strip()}
-    chan = np.array([c in want for c in cols], dtype=bool)
-    missing = want - set(cols)
-    if missing:
-        log(f"  [gate] WARNING: gate channels not in panel — ignored: {sorted(missing)}")
-    log(f"  [gate] receptivity gate ON: kappa={params.gate_kappa} "
-        f"channels={[c for c in cols if c in want]}")
-    return {"channels": chan, "kappa": float(params.gate_kappa)}
+COMPARTMENTS: tuple[str, ...] = ("Nucleus", "Cytoplasm", "Membrane", "Cell")
 
 
-def receptivity_weight(data, edge, sizes, bandcount, gate):
-    """Per-cell/per-channel weight w[i,c] in [0,1] scaling the spillover subtraction, from each cell's
-    OWN spillover signature — no global reference (self-calibrating per cell).
-
-    A spillover VICTIM has its signal concentrated at the shared boundary: the 1-px band is much brighter
-    than the interior (neighbour keratin bleeding in). A real SOURCE is uniform: band ~= interior. So the
-    fractional excess of band-over-interior density is the receptivity:
-        band_density  = edge / bandcount                        (mean channel in the boundary band)
-        int_density   = (data - edge) / (sizes - bandcount)     (mean channel in the interior)
-        excess        = clip((band_density - int_density) / band_density, 0, 1)     # 0 uniform .. 1 rim-only
-        w             = clip(kappa * excess, 0, 1)
-    Victims (band >> interior) -> w->1 -> subtract the neighbour spillover; real acinar/vessel/fibroblast
-    cells (uniform bright) -> w->0 -> PROTECTED. `kappa` scales aggressiveness (higher cleans more). Cells
-    with no band (isolated) already have F-row 0, so their subtraction is 0 regardless. Non-gated channels
-    get w=1 (unchanged full subtraction)."""
-    if bandcount is None:
-        raise ValueError("receptivity gate needs per-cell bandcount — regenerate intermediates with the "
-                         "current code (--save-intermediates) or run with --keep-mask so it recomputes")
-    bc = np.maximum(bandcount, 1.0)[:, None]
-    ia = np.maximum(sizes - bandcount, 1.0)[:, None]
-    band_density = edge / bc
-    int_density = np.clip((data - edge) / ia, 0, None)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        excess = np.where(band_density > 0, (band_density - int_density) / band_density, 0.0)
-    excess = np.clip(excess, 0.0, 1.0)
-    w = np.clip(gate["kappa"] * excess, 0.0, 1.0)
-    return np.where(gate["channels"][None, :], w, 1.0)
+def contact_operator(M, norm_form="donor"):
+    """F from the contact matrix, plus the has-neighbours mask. See :func:`compensate` for the forms."""
+    if norm_form not in ("donor", "recipient"):
+        raise ValueError(f"norm_form must be 'donor' or 'recipient', got {norm_form!r}")
+    rowsum = np.asarray(M.sum(1)).ravel()
+    inv = np.zeros_like(rowsum)
+    nz = rowsum > 0
+    inv[nz] = 1.0 / rowsum[nz]
+    F = (M @ sp.diags(inv)) if norm_form == "donor" else (sp.diags(inv) @ M)
+    return F, nz
 
 
-def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None, backend=None,
-               norm_form="donor"):
-    """REDSEA compensation. corrected_sum = data + comp_mode*edge - (alpha [* w]) * (F @ edge), clamp>=0.
+def incoming_spillover(edge, M, alpha, norm_form="donor"):
+    """``alpha * (F @ edge)`` -- signal received from neighbours, [N,C].
+
+    This is the whole of REDSEA's subtraction term, and it is received at cell i's BOUNDARY BAND:
+    ``F @ edge`` redistributes each neighbour's rim sum across the neighbours it touches, and cells
+    touch only along their rims. That locality is what makes the compartment decomposition in
+    :func:`compensate_compartments` a derivation rather than a modelling choice.
+
+    Returns (sub[N,C], has_neighbours[N])."""
+    F, nz = contact_operator(M, norm_form)
+    return np.asarray(alpha, dtype=np.float64) * (F @ edge), nz
+
+
+def compensate_compartments(data, edge, nuc, nuc_edge, sizes, bandcount, nuccount, nucbandcount,
+                            M, comp_mode, alpha, norm_form="donor"):
+    """Compartment-resolved REDSEA: the same operator as :func:`compensate`, resolved onto
+    Nucleus / Cytoplasm / Membrane / Cell instead of collapsed to the whole cell.
+
+    Every term REDSEA adds or removes is a BOUNDARY-BAND quantity -- the ``+comp_mode*edge``
+    reinforcement is the cell's own rim sum, and the ``-alpha*(F@edge)`` subtraction is spillover
+    received at that rim (see :func:`incoming_spillover`). So the correction apportions across
+    compartments by each compartment's share of the band, and nothing has to be assumed about how
+    signal distributes inside the cell::
+
+        S_N    = nuc   + comp_mode*nuc_edge  - S_in*(nucbandcount /bandcount)
+        S_Y    = cyto  + comp_mode*cyto_edge - S_in*(cytobandcount/bandcount)
+        S_B    = edge  + comp_mode*edge      - S_in            # membrane == the whole band
+        S_Cell = data  + comp_mode*edge      - S_in
+
+    with ``cyto = data - nuc`` and ``cyto_edge = edge - nuc_edge``. Nucleus and Cytoplasm partition
+    the cell (QuPath's own convention -- verified on this cohort: ``Cell`` is reproduced from
+    ``Nucleus``/``Cytoplasm`` and their areas at r=0.999993-0.999997, median relative error <=0.01%
+    over 332,770 cells of donor 6539), so::
+
+        S_N + S_Y == S_Cell        exactly, pre-clip
+
+    i.e. the decomposition is mass-conserving and reproduces the whole-cell value already written to
+    the canonical whole-cell output by construction. NOTE the Membrane band
+    overlaps both Nucleus and Cytoplasm; it is not a fourth partition member,
+    matching QuPath's overlapping membrane convention.
+
+    Post-clip the identity holds except where the >=0 clamp binds on a compartment but not on the
+    whole cell; the ``Cell`` entry is clipped on its own sum, so it stays byte-identical to
+    :func:`compensate`.
+
+    Undefined compartments come back NaN, never 0: Cytoplasm where the nucleus fills the cell
+    (~9% of cells here, matching QuPath's own Cytoplasm NaN rate) and Nucleus where a fragment
+    carried no nucleusGeometry.
+
+    Returns (means: dict[str, ndarray[N,C]], counts: dict[str, ndarray[N]], n_isolated)."""
+    sub, nz = incoming_spillover(edge, M, alpha, norm_form=norm_form)
+    cyto = data - nuc
+    cyto_edge = edge - nuc_edge
+    cytocount = sizes - nuccount
+    cytobandcount = bandcount - nucbandcount
+
+    # Band shares. A cell with no band pixels has no contacts either, so its `sub` row is 0 and the
+    # share it is multiplied by is irrelevant -- 0 keeps it finite.
+    safe_band = np.where(bandcount > 0, bandcount, 1.0)[:, None]
+    nuc_share = np.where(bandcount[:, None] > 0, nucbandcount[:, None] / safe_band, 0.0)
+    cyto_share = np.where(bandcount[:, None] > 0, cytobandcount[:, None] / safe_band, 0.0)
+
+    sums = {
+        "Nucleus": nuc + comp_mode * nuc_edge - sub * nuc_share,
+        "Cytoplasm": cyto + comp_mode * cyto_edge - sub * cyto_share,
+        "Membrane": edge + comp_mode * edge - sub,
+        "Cell": data + comp_mode * edge - sub,
+    }
+    counts = {"Nucleus": nuccount, "Cytoplasm": cytocount,
+              "Membrane": bandcount, "Cell": sizes}
+    means = {}
+    for name in COMPARTMENTS:
+        s = np.clip(sums[name], 0, None)
+        c = counts[name]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            m = s / np.where(c > 0, c, np.nan)[:, None]
+        m[c <= 0, :] = np.nan
+        means[name] = m
+    return means, counts, int((~nz).sum())
+
+
+def compensate(data, edge, sizes, M, comp_mode, alpha, backend=None, norm_form="donor"):
+    """REDSEA compensation. corrected_sum = data + comp_mode*edge - alpha*(F @ edge), clamp>=0.
       comp_mode=1 : subtract + reinforce (redseapy default, and ours since 2026-07-25)
       comp_mode=0 : subtract only (remove incoming neighbour spillover; no reinforce)
 
@@ -379,21 +477,13 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None
                     ``alpha[c] = 0`` and ``comp_mode[c] = 0`` makes channel c a pure passthrough
                     (corrected == raw), which is how markers with no lateral spillover are excluded
                     (see ``marker_taxonomy.NO_SPILLOVER``).
-    ``gate``      : None (w=1) or a receptivity-gate config from :func:`build_gate` (needs ``bandcount``)
-                    that protects bright-interior cells channel-wise.
     ``backend`` (optional): a :class:`phenocycler.gpu.Backend`; when on GPU the sparse ``F @ edge``
-                matmul runs on the device. The GPU fast path is taken ONLY for a scalar-alpha, ungated
-                call; gated / per-channel-alpha calls fall through to the CPU branch (correct, since
-                data/edge/sizes/M are already NumPy there).
-
-    A scalar-``alpha``, ungated, ``norm_form="recipient"`` call on CPU is BYTE-IDENTICAL to the original
-    single-alpha REDSEA — it executes the exact same expression.
+                matmul runs on the device.
     Returns (corrected_mean[N,C], clamp_frac[C], n_isolated)."""
     if norm_form not in ("donor", "recipient"):
         raise ValueError(f"norm_form must be 'donor' or 'recipient', got {norm_form!r}")
 
-    if (backend is not None and backend.on_gpu
-            and gate is None and np.ndim(alpha) == 0):  # pragma: no cover - GPU only
+    if backend is not None and backend.on_gpu:  # pragma: no cover - GPU only
         xp = backend.xp
         d = xp.asarray(data)
         e = xp.asarray(edge)
@@ -420,15 +510,9 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None
     # donor form: divide column j by neighbour j's total contact perimeter B[j] (published, conserving).
     # recipient form: divide row i by i's own total contact perimeter B[i] (rows sum to 1; legacy).
     F = (M @ sp.diags(inv)) if norm_form == "donor" else (sp.diags(inv) @ M)
-    if gate is None and np.ndim(alpha) == 0:
-        # DEFAULT path — identical expression to the original single-alpha REDSEA (bit-for-bit).
-        corrected_sum = data + comp_mode * edge - alpha * (F @ edge)
-    else:
-        # opt-in "keratin lever": per-channel alpha vector and/or the receptivity gate.
-        sub = np.asarray(alpha, dtype=np.float64) * (F @ edge)   # scalar or (C,) broadcasts over cols
-        if gate is not None:
-            sub = sub * receptivity_weight(data, edge, sizes, bandcount, gate)
-        corrected_sum = data + comp_mode * edge - sub
+    corrected_sum = data + comp_mode * edge - np.asarray(
+        alpha, dtype=np.float64
+    ) * (F @ edge)
     np.clip(corrected_sum, 0, None, out=corrected_sum)
     with np.errstate(invalid="ignore", divide="ignore"):
         corrected = corrected_sum / sizes[:, None]
@@ -438,37 +522,40 @@ def compensate(data, edge, sizes, M, comp_mode, alpha, bandcount=None, gate=None
 
 
 # --------------------------------------------------------------------------- intermediates / io
-def save_intermediates(cfg: PipelineConfig, donor, oids, cols, data, edge, sizes, M, bandcount=None):
+def save_intermediates(cfg: PipelineConfig, donor, oids, cols, data, edge, sizes, M, bandcount=None,
+                       nuc=None, nuc_edge=None, nuccount=None, nucbandcount=None):
     cfg.inter_dir.mkdir(parents=True, exist_ok=True)
     p = cfg.inter_dir / f"{donor}.npz"
     M = M.tocsr()
-    # bandcount is persisted ONLY when the receptivity gate is on (it is None otherwise), so a
-    # default run writes exactly the same .npz keys as before.
-    extra = {} if bandcount is None else {"bandcount": np.asarray(bandcount, dtype=np.float32)}
+    # The compartment decomposition needs band counts to turn corrected sums
+    # into membrane means.
+    extra = {}
+    for name, arr in (("bandcount", bandcount), ("nuccount", nuccount),
+                      ("nucbandcount", nucbandcount)):
+        if arr is not None:
+            extra[name] = np.asarray(arr, dtype=np.float32)
+    for name, arr in (("nuc", nuc), ("nuc_edge", nuc_edge)):
+        if arr is not None:
+            extra[name] = np.asarray(arr, dtype=np.float32)
     np.savez_compressed(p, oids=np.array(oids, dtype=object), cols=np.array(cols),
                         data=data.astype(np.float32), edge=edge.astype(np.float32),
                         sizes=sizes, m_data=M.data, m_indices=M.indices, m_indptr=M.indptr,
                         m_shape=np.array(M.shape), **extra)
-    log(f"[{donor}] saved intermediates -> {p}" + ("" if bandcount is None else " (+bandcount)"))
+    log(f"[{donor}] saved intermediates -> {p}"
+        + (f" (+{', '.join(sorted(extra))})" if extra else ""))
 
 
 def load_intermediates(cfg: PipelineConfig, donor):
-    """Returns (oids, cols, data, edge, sizes, M, bandcount). `bandcount` is None for .npz files
-    written without the gate (the default), in which case a gated re-run recomputes it from the mask."""
+    """Returns (oids, cols, data, edge, sizes, M, bandcount, nuc, nuc_edge, nuccount, nucbandcount).
+
+    Missing compartment arrays are reported by the caller as an incompatible
+    cache; the current workflow never reconstructs or guesses them."""
     z = np.load(cfg.inter_dir / f"{donor}.npz", allow_pickle=True)
     M = sp.csr_matrix((z["m_data"], z["m_indices"], z["m_indptr"]), shape=tuple(z["m_shape"]))
-    bandcount = z["bandcount"].astype(np.float64) if "bandcount" in z.files else None
+    get = lambda k: z[k].astype(np.float64) if k in z.files else None
     return (list(z["oids"]), list(z["cols"]), z["data"].astype(np.float64),
-            z["edge"].astype(np.float64), z["sizes"].astype(np.float64), M, bandcount)
-
-
-def bandcount_from_mask(mask, n, edge_radius):
-    """Recompute per-cell boundary-band pixel counts from a persisted mask (for old intermediates that
-    predate bandcount). Mirrors the band construction in process_donor."""
-    inner = find_boundaries(mask, mode="inner", connectivity=2, background=0)
-    band = binary_dilation(inner, diamond(edge_radius)) & (mask > 0)
-    return np.bincount(mask.ravel()[np.flatnonzero(band.ravel())], minlength=n + 1)[1:].astype(np.float64)
-
+            z["edge"].astype(np.float64), z["sizes"].astype(np.float64), M,
+            get("bandcount"), get("nuc"), get("nuc_edge"), get("nuccount"), get("nucbandcount"))
 
 def canonical_cell_mask(cfg: PipelineConfig, donor: str, oids) -> np.ndarray:
     """Return the GeoJSON rows that belong to the canonical raw-cell table.
@@ -515,150 +602,167 @@ def canonical_cell_mask(cfg: PipelineConfig, donor: str, oids) -> np.ndarray:
     return np.asarray(keep, dtype=bool)
 
 
-def write_corrected(cfg: PipelineConfig, donor, oids, cols, corrected, sizes):
+def apply_spillover_context_eligibility(
+    cell_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+    geometry_object_ids,
+    geometry_qc: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Remove explicitly ineligible polygons from REDSEA physical context.
+
+    GeoJSON-only fragments absent from canonical cells remain available as
+    boundary context. For canonical cells, the immutable geometry-QC decision
+    is authoritative and is applied before boundary/contact construction.
+    """
+
+    required = {"object_id", "spillover_context_eligible"}
+    missing = sorted(required.difference(geometry_qc.columns))
+    if missing:
+        raise ValueError(f"geometry QC is missing columns: {missing}")
+    qc = geometry_qc.loc[
+        :, ["object_id", "spillover_context_eligible"]
+    ].copy()
+    if qc["object_id"].isna().any():
+        raise ValueError("geometry QC object_id contains null")
+    qc["object_id"] = qc["object_id"].astype(str)
+    if qc["object_id"].duplicated().any():
+        raise ValueError("geometry QC object_id contains duplicates")
+    flags = qc["spillover_context_eligible"]
+    if flags.isna().any() or not flags.isin([True, False, 0, 1]).all():
+        raise ValueError(
+            "spillover_context_eligible must contain explicit booleans"
+        )
+
+    label_by_id = {
+        str(object_id): index
+        for index, object_id in enumerate(geometry_object_ids, start=1)
+    }
+    if len(label_by_id) != len(geometry_object_ids):
+        raise ValueError("GeoJSON geometry object IDs are not unique")
+    missing_geometry = sorted(set(qc["object_id"]).difference(label_by_id))
+    if missing_geometry:
+        raise ValueError(
+            f"{len(missing_geometry):,} geometry-QC cells are absent from "
+            f"the REDSEA raster (examples={missing_geometry[:5]})"
+        )
+    excluded_labels = np.asarray(
+        [
+            label_by_id[object_id]
+            for object_id, eligible in zip(qc["object_id"], flags.astype(bool))
+            if not eligible
+        ],
+        dtype=np.int64,
+    )
+    if len(excluded_labels) == 0:
+        return cell_mask, nucleus_mask, 0
+
+    keep_label = np.ones(len(geometry_object_ids) + 1, dtype=bool)
+    keep_label[excluded_labels] = False
+    filtered_cell = np.where(keep_label[cell_mask], cell_mask, 0)
+    filtered_nucleus = np.where(
+        keep_label[nucleus_mask], nucleus_mask, 0
+    )
+    return filtered_cell, filtered_nucleus, len(excluded_labels)
+
+
+def write_corrected_compartments(cfg: PipelineConfig, donor, oids, cols, means, counts):
+    """Write the compartment-resolved REDSEA means for one donor.
+
+    Schema: ``object_id, donor_id, {cell,band,nucleus,cytoplasm}_area_px`` then
+    ``{Nucleus,Cytoplasm,Membrane,Cell}__<marker>`` for every channel.  This is
+    the sole REDSEA dataset; a second whole-cell copy is intentionally not
+    written because ``Cell__<marker>`` already is that value."""
     keep = canonical_cell_mask(cfg, str(donor), oids)
     object_ids = np.asarray(oids, dtype=object)[keep]
-    corrected = np.asarray(corrected)[keep]
-    sizes = np.asarray(sizes)[keep]
+    from .marker_registry import load_registry
 
-    out = pd.DataFrame({"object_id": object_ids, "donor_id": donor, "cell_area_px": sizes})
-    for k, c in enumerate(cols):
-        out[c] = corrected[:, k]
-    out_dir = cfg.cells_redsea_dir / f"donor_id={donor}"
+    registry = load_registry(cfg.marker_registry)
+    unknown = sorted(set(cols).difference(registry.by_name))
+    if unknown:
+        raise ValueError(
+            f"donor {donor}: qptiff channels absent from marker registry: {unknown}"
+        )
+    channel_index = {marker: index for index, marker in enumerate(cols)}
+
+    output_columns = {
+        "object_id": object_ids,
+        "donor_id": np.full(len(object_ids), str(donor), dtype=object),
+    }
+    for name, key in (("cell", "Cell"), ("band", "Membrane"),
+                      ("nucleus", "Nucleus"), ("cytoplasm", "Cytoplasm")):
+        output_columns[f"{name}_area_px"] = np.asarray(counts[key])[keep]
+    for compartment in COMPARTMENTS:
+        block = np.asarray(means[compartment])[keep]
+        for spec in registry.markers:
+            index = channel_index.get(spec.name)
+            output_columns[f"{compartment}__{spec.name}"] = (
+                block[:, index]
+                if index is not None
+                else np.full(len(object_ids), np.nan)
+            )
+    out = pd.DataFrame(output_columns)
+
+    out_dir = cfg.redsea_dir / f"donor_id={donor}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_dir / "data_0.parquet", index=False)
-    log(f"[{donor}] wrote {out_dir/'data_0.parquet'} ({len(out):,} rows)")
-
-
-def reconcile_existing_donor(donor: str, cfg: PipelineConfig) -> str:
-    """Atomically restrict an existing REDSEA parquet to canonical raw object IDs."""
-    import duckdb
-    import pyarrow.parquet as pq
-
-    raw_files = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))
-    redsea_files = sorted(
-        glob.glob(str(cfg.cells_redsea_dir / f"donor_id={donor}" / "*.parquet"))
-    )
-    if len(raw_files) != 1 or len(redsea_files) != 1:
-        raise ValueError(
-            f"donor {donor}: expected one raw and one REDSEA parquet; found "
-            f"{len(raw_files)} raw and {len(redsea_files)} REDSEA"
-        )
-
-    raw_path = Path(raw_files[0])
-    redsea_path = Path(redsea_files[0])
-    temp_path = redsea_path.with_name(f".{redsea_path.stem}.reconciled.parquet")
-    temp_path.unlink(missing_ok=True)
-    original_schema = pq.ParquetFile(redsea_path).schema_arrow
-
-    def sql_path(path: Path) -> str:
-        return str(path).replace("'", "''")
-
-    con = duckdb.connect()
-    try:
-        raw_q = sql_path(raw_path)
-        redsea_q = sql_path(redsea_path)
-        temp_q = sql_path(temp_path)
-        stats = con.execute(
-            f"""
-            WITH raw AS (
-              SELECT CAST(object_id AS VARCHAR) AS object_id
-              FROM read_parquet('{raw_q}', hive_partitioning=false)
-            ), redsea AS (
-              SELECT CAST(object_id AS VARCHAR) AS object_id
-              FROM read_parquet('{redsea_q}', hive_partitioning=false)
-            )
-            SELECT
-              (SELECT count(*) FROM raw),
-              (SELECT count(DISTINCT object_id) FROM raw),
-              (SELECT count(*) FROM raw WHERE object_id IS NULL),
-              (SELECT count(*) FROM redsea),
-              (SELECT count(DISTINCT object_id) FROM redsea),
-              (SELECT count(*) FROM redsea WHERE object_id IS NULL),
-              (SELECT count(*) FROM raw ANTI JOIN redsea USING (object_id))
-            """
-        ).fetchone()
-        raw_n, raw_unique, raw_null, redsea_n, redsea_unique, redsea_null, raw_missing = stats
-        if raw_null or redsea_null or raw_unique != raw_n or redsea_unique != redsea_n:
-            raise ValueError(
-                f"donor {donor}: object_id must be non-null and unique "
-                f"(raw {raw_unique:,}/{raw_n:,}, REDSEA {redsea_unique:,}/{redsea_n:,})"
-            )
-        if raw_missing:
-            raise ValueError(
-                f"donor {donor}: {raw_missing:,} canonical raw cells are missing from REDSEA"
-            )
-        if raw_n == redsea_n:
-            log(f"[{donor}] existing REDSEA keys already match {raw_n:,} canonical cells")
-            return donor
-
-        con.execute("SET preserve_insertion_order=true")
-        con.execute(
-            f"""
-            COPY (
-              SELECT redsea.*
-              FROM read_parquet('{redsea_q}', hive_partitioning=false) AS redsea
-              SEMI JOIN (
-                SELECT CAST(object_id AS VARCHAR) AS object_id
-                FROM read_parquet('{raw_q}', hive_partitioning=false)
-              ) AS raw
-              ON CAST(redsea.object_id AS VARCHAR) = raw.object_id
-            ) TO '{temp_q}' (FORMAT PARQUET, COMPRESSION ZSTD)
-            """
-        )
-        reconciled_n, reconciled_unique = con.execute(
-            f"""
-            SELECT count(*), count(DISTINCT CAST(object_id AS VARCHAR))
-            FROM read_parquet('{temp_q}', hive_partitioning=false)
-            """
-        ).fetchone()
-        if reconciled_n != raw_n or reconciled_unique != raw_n:
-            raise ValueError(
-                f"donor {donor}: reconciled REDSEA has {reconciled_n:,} rows / "
-                f"{reconciled_unique:,} IDs; expected {raw_n:,}"
-            )
-        if not pq.ParquetFile(temp_path).schema_arrow.equals(original_schema):
-            raise ValueError(f"donor {donor}: reconciliation changed the REDSEA schema")
-        os.replace(temp_path, redsea_path)
-        log(
-            f"[{donor}] reconciled existing REDSEA: {redsea_n:,} -> {raw_n:,} "
-            f"canonical rows"
-        )
-        return donor
-    finally:
-        con.close()
-        temp_path.unlink(missing_ok=True)
-
-
-def reconcile_existing(cfg: PipelineConfig, donors: list[str], *, n_jobs: int = 1) -> list:
-    """Reconcile retained REDSEA outputs in parallel, one atomic file replacement per donor."""
-    from .cohort import ensure_eligible_donors
-
-    donors = list(
-        ensure_eligible_donors(donors, context="REDSEA reconciliation")
-    )
-    fn = functools.partial(reconcile_existing_donor, cfg=cfg)
-    return map_donors(fn, donors, n_jobs=n_jobs, ordered=True, on_error="raise")
+    log(f"[{donor}] wrote {out_dir/'data_0.parquet'} "
+        f"({len(out):,} rows x {len(out.columns)} cols)")
 
 
 # --------------------------------------------------------------------------- per donor
 def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
     t_all = time.time()
     backend = get_backend(params.use_gpu, params.gpu_device)
-    img, geojson, qptiff = resolve_paths(cfg, donor)
+    (
+        image,
+        cell_geojson,
+        nucleus_geojson,
+        combined_geometry,
+        qptiff,
+    ) = resolve_paths(cfg, donor)
     level = int(round(np.log2(params.downsample)))
     if 2 ** level != int(params.downsample):
         raise SystemExit(f"[err] --downsample must be a power of 2 (got {params.downsample})")
-    log(f"[{donor}] image={img}")
+    log(f"[{donor}] image={image.image_id}")
 
     tf, pages, ch_names, (H, W), px_um = qptiff_channels(qptiff, level)
-    cols = [SANITIZE(c) for c in ch_names]
-    gate = build_gate(params, cols)          # None unless --gate-brightness (default: off)
+    cols = validated_channel_markers(image, ch_names)
     log(f"[{donor}] level={level} dims={H}x{W} channels={len(cols)} px_um={px_um} "
         f"gpu={backend.on_gpu}")
 
-    # 1) rasterize instance mask
-    mask, oids = rasterize_mask(geojson, (H, W), params.downsample)
+    # 1) Rasterize the mandatory cell and nucleus geometries.
+    if combined_geometry:
+        mask, oids, nuc_mask = rasterize_mask(
+            cell_geojson, (H, W), params.downsample, with_nucleus=True
+        )
+    else:
+        mask, oids = rasterize_mask(
+            cell_geojson, (H, W), params.downsample
+        )
+        raw_nucleus_mask, nucleus_ids = rasterize_mask(
+            nucleus_geojson, (H, W), params.downsample
+        )
+        nuc_mask = relabel_nucleus_mask(
+            raw_nucleus_mask,
+            nucleus_ids,
+            mask,
+            oids,
+        )
+    from .expression import read_single_partition
+
+    mask, nuc_mask, n_context_excluded = (
+        apply_spillover_context_eligibility(
+            mask,
+            nuc_mask,
+            oids,
+            read_single_partition(cfg.geometry_qc_dir, str(donor)),
+        )
+    )
+    if n_context_excluded:
+        log(
+            f"[{donor}] excluded {n_context_excluded:,} geometry-QC labels "
+            "from spillover context"
+        )
     n = len(oids)
     sizes = np.bincount(mask.ravel(), minlength=n + 1)[1:].astype(np.float64)  # cell area in px
     n_empty = int((sizes == 0).sum())
@@ -671,23 +775,50 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
     band_idx = np.flatnonzero(band.ravel())
     mask_flat = mask.ravel()
     mask_band = mask_flat[band_idx]
-    # per-cell band-pixel count — only the receptivity gate needs it, so compute it only then
-    bandcount = None
-    if gate is not None:
-        bandcount = np.bincount(mask_band, minlength=n + 1)[1:].astype(np.float64)
+    # The compartment decomposition divides the corrected band sum by this
+    # count to obtain a membrane mean.
+    bandcount = np.bincount(
+        mask_band, minlength=n + 1
+    )[1:].astype(np.float64)
     log(f"[{donor}] boundary band: {band_idx.size:,} px "
         f"({100*band_idx.size/mask.size:.1f}% of image), {time.time()-t0:.0f}s")
     del inner, band
 
-    # 3) per-channel whole-cell sums + boundary sums (streamed one channel at a time)
+    # 2b) nucleus pixel bookkeeping. nuc_mask is already intersected with `mask`, so a band pixel is
+    # nuclear iff its nucleus label is nonzero; cytoplasm counts follow by subtraction.
+    nuc_flat = nuc_mask.ravel()
+    nuc_mask_band = nuc_flat[band_idx]
+    nuccount = np.bincount(
+        nuc_flat, minlength=n + 1
+    )[1:].astype(np.float64)
+    nucbandcount = np.bincount(
+        nuc_mask_band, minlength=n + 1
+    )[1:].astype(np.float64)
+    n_nonuc = int(((sizes > 0) & (nuccount <= 0)).sum())
+    n_full = int(((sizes > 0) & (nuccount >= sizes)).sum())
+    log(
+        f"[{donor}] nucleus: {int(nuccount.sum()):,} px | "
+        f"{n_nonuc:,} cells with no nucleus | {n_full:,} "
+        f"({100*n_full/max(int((sizes>0).sum()),1):.2f}%) whose nucleus "
+        "fills the cell (Cytoplasm -> NaN)"
+    )
+    del nuc_mask
+
+    # 3) per-channel whole-cell sums + boundary sums (streamed one channel at a time), plus the
+    #    matching nucleus and nucleus-band sums when compartments are wanted. The channel READ
+    #    dominates the loop, so the two extra bincounts cost far less than a second qptiff pass.
     nch = len(cols)
     data = np.zeros((n, nch), dtype=np.float64)
     edge = np.zeros((n, nch), dtype=np.float64)
+    nuc = np.zeros((n, nch), dtype=np.float64)
+    nuc_edge = np.zeros((n, nch), dtype=np.float64)
     t0 = time.time()
     if backend.on_gpu:  # pragma: no cover - GPU only
         mask_flat_g = backend.asarray(mask_flat)
         mask_band_g = backend.asarray(mask_band)
         band_idx_g = backend.asarray(band_idx)
+        nuc_flat_g = backend.asarray(nuc_flat)
+        nuc_mask_band_g = backend.asarray(nuc_mask_band)
     for k in range(nch):
         ch = read_channel(pages, k).ravel()
         if backend.on_gpu:  # pragma: no cover - GPU only
@@ -695,9 +826,24 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
             data[:, k] = backend.asnumpy(backend.bincount(mask_flat_g, weights=chg, minlength=n + 1))[1:]
             edge[:, k] = backend.asnumpy(
                 backend.bincount(mask_band_g, weights=chg[band_idx_g], minlength=n + 1))[1:]
+            nuc[:, k] = backend.asnumpy(
+                backend.bincount(nuc_flat_g, weights=chg, minlength=n + 1))[1:]
+            nuc_edge[:, k] = backend.asnumpy(
+                backend.bincount(
+                    nuc_mask_band_g,
+                    weights=chg[band_idx_g],
+                    minlength=n + 1,
+                )
+            )[1:]
         else:
             data[:, k] = np.bincount(mask_flat, weights=ch, minlength=n + 1)[1:]
             edge[:, k] = np.bincount(mask_band, weights=ch[band_idx], minlength=n + 1)[1:]
+            nuc[:, k] = np.bincount(
+                nuc_flat, weights=ch, minlength=n + 1
+            )[1:]
+            nuc_edge[:, k] = np.bincount(
+                nuc_mask_band, weights=ch[band_idx], minlength=n + 1
+            )[1:]
         del ch
         if (k + 1) % 10 == 0 or k == nch - 1:
             log(f"[{donor}] channels {k+1}/{nch} ({time.time()-t0:.0f}s)")
@@ -709,29 +855,62 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
     log(f"[{donor}] contact matrix (gap_bridge={params.gap_bridge}): {M.nnz:,} contacts, "
         f"{time.time()-t0:.0f}s")
     if params.save_intermediates:
-        save_intermediates(cfg, donor, oids, cols, data, edge, sizes, M, bandcount=bandcount)
+        save_intermediates(cfg, donor, oids, cols, data, edge, sizes, M, bandcount=bandcount,
+                           nuc=nuc, nuc_edge=nuc_edge, nuccount=nuccount,
+                           nucbandcount=nucbandcount)
 
-    # 5) compensate (scalar alpha + no gate by default; optional per-channel vector + brightness gate)
-    alpha = parse_alpha_per_channel(params.alpha_per_channel, cols, params.alpha)
-    alpha = params.alpha if alpha is None else alpha
+    # 5) Apply the fixed scalar correction, with registry passthrough channels.
+    alpha = params.alpha
     comp_mode = params.comp_mode
     alpha, comp_mode, n_skipped = apply_no_spillover_mask(params, cols, alpha, comp_mode)
     corrected, clamp_frac, n_isolated = compensate(
         data, edge, sizes, M, comp_mode, alpha,
-        bandcount=bandcount, gate=gate, backend=backend, norm_form=params.norm_form)
+        backend=backend, norm_form=params.norm_form)
     log(f"[{donor}] compensate(mode={params.comp_mode}, norm={params.norm_form}, "
-        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}, "
+        f"alpha={'vector' if np.ndim(alpha) else alpha}, "
         f"uncorrected_channels={n_skipped}): {n_isolated} isolated cells")
 
-    # alignment sanity vs the existing parquet (correlation of UNcorrected mean)
-    uncorr = np.where(sizes[:, None] > 0, data / np.where(sizes[:, None] == 0, 1, sizes[:, None]), np.nan)
-    try:
-        alignment_check(cfg, donor, oids, cols, uncorr, sizes, px_um)
-    except Exception as e:  # non-fatal sanity check
-        log(f"[{donor}] alignment check skipped: {e}")
+    # 5b) the same operator resolved onto Nucleus/Cytoplasm/Membrane/Cell. Its `Cell` output must
+    #     reproduce `compensate` above -- that equality is what makes the two datasets one result.
+    means, counts, _ = compensate_compartments(
+        data,
+        edge,
+        nuc,
+        nuc_edge,
+        sizes,
+        bandcount,
+        nuccount,
+        nucbandcount,
+        M,
+        comp_mode,
+        alpha,
+        norm_form=params.norm_form,
+    )
+    both = np.isfinite(means["Cell"]) & np.isfinite(corrected)
+    if not np.array_equal(
+        np.isfinite(means["Cell"]), np.isfinite(corrected)
+    ) or not np.allclose(
+        means["Cell"][both], corrected[both], rtol=1e-9, atol=0.0
+    ):
+        delta = float(
+            np.max(
+                np.abs(means["Cell"][both] - corrected[both]),
+                initial=0.0,
+            )
+        )
+        raise ValueError(
+            f"donor {donor}: compartment Cell does not reproduce the "
+            f"whole-cell REDSEA value (max abs delta={delta})"
+        )
+    log(f"[{donor}] compartments: Cell reproduces whole-cell correction")
 
-    # 6) write corrected parquet (one row per object_id)
-    write_corrected(cfg, donor, oids, cols, corrected, sizes)
+    # Alignment is an input contract, not a best-effort diagnostic. A key/channel mismatch here
+    # invalidates every corrected value, so fail the donor before any output is written.
+    uncorr = np.where(sizes[:, None] > 0, data / np.where(sizes[:, None] == 0, 1, sizes[:, None]), np.nan)
+    alignment_check(cfg, donor, oids, cols, uncorr, sizes, px_um)
+
+    # 6) write the sole corrected dataset (one row per object_id).
+    write_corrected_compartments(cfg, donor, oids, cols, means, counts)
 
     if params.keep_mask:
         cfg.mask_dir.mkdir(parents=True, exist_ok=True)
@@ -745,15 +924,28 @@ def process_donor(donor: str, cfg: PipelineConfig, params: RedseaParams):
 
 
 def alignment_check(cfg, donor, oids, cols, uncorr_mean, sizes, px_um):
-    """Correlate my UNcorrected full-res mean against the existing QuPath parquet means."""
+    """Validate rerasterized means and object keys against the QuPath measurements.
+
+    REDSEA used to print this comparison and continue even when it could not be performed. Production
+    now requires complete object-key coverage plus a strong positive relationship for every available
+    probe channel. The broad ratio bound catches channel/unit mismatches while allowing the small
+    raster-boundary differences expected between QuPath and this rasterizer.
+    """
     f = sorted(glob.glob(str(cfg.cells_dir / f"donor_id={donor}" / "*.parquet")))[0]
     probe = [c for c in ["DAPI", "INS", "Pan_Cytokeratin", "CD3e", "Vimentin", "CD31"] if c in cols]
+    if len(probe) < 2:
+        raise ValueError(f"donor {donor}: fewer than two alignment probe channels are available")
     ref = pd.read_parquet(f, columns=["object_id", "cell_area"] + probe)
     mine = pd.DataFrame({"object_id": oids, "_area_px": sizes})
     for c in probe:
         mine[c + "_mine"] = uncorr_mean[:, cols.index(c)]
     j = ref.merge(mine, on="object_id", how="inner")
+    if len(j) != len(ref):
+        raise ValueError(
+            f"donor {donor}: REDSEA/QuPath key alignment matched {len(j):,}/{len(ref):,} cells"
+        )
     log(f"[{donor}] alignment vs parquet ({len(j):,}/{len(ref):,} matched on object_id):")
+    failures = []
     for c in probe:
         a = j[c].to_numpy(np.float64)
         b = j[c + "_mine"].to_numpy(np.float64)
@@ -761,38 +953,65 @@ def alignment_check(cfg, donor, oids, cols, uncorr_mean, sizes, px_um):
         r = np.corrcoef(a[ok], b[ok])[0, 1] if ok.sum() > 10 else np.nan
         ratio = np.nanmedian(b[ok] / np.where(a[ok] == 0, np.nan, a[ok]))
         log(f"    {c:16s} pearson_r={r:.3f}  median(mine/parquet)={ratio:.3f}")
+        if ok.sum() <= 10 or not np.isfinite(r) or r < 0.80:
+            failures.append(f"{c}: r={r:.3f}")
+        if not np.isfinite(ratio) or not 0.25 <= ratio <= 4.0:
+            failures.append(f"{c}: median ratio={ratio:.3f}")
+    if failures:
+        raise ValueError(
+            f"donor {donor}: REDSEA alignment contract failed ({'; '.join(failures)})"
+        )
 
 
 def recompensate_from_intermediates(donor: str, cfg: PipelineConfig, params: RedseaParams):
-    """Reload cached intermediates and just (re)compensate + write (fast alpha sweeps)."""
+    """Reload a complete current cache and apply the configured operator."""
     backend = get_backend(params.use_gpu, params.gpu_device)
-    oids, cols, data, edge, sizes, M, bandcount = load_intermediates(cfg, donor)
+    (oids, cols, data, edge, sizes, M, bandcount,
+     nuc, nuc_edge, nuccount, nucbandcount) = load_intermediates(cfg, donor)
     mask = None
     if params.gap_bridge > 0 and (cfg.mask_dir / f"{donor}.tif").exists():
         mask = tifffile.imread(cfg.mask_dir / f"{donor}.tif")
         M = contact_matrix_gapbridge(mask, len(oids), params.gap_bridge)
         log(f"[{donor}] recomputed gap-bridged contacts: {M.nnz:,}")
-    alpha = parse_alpha_per_channel(params.alpha_per_channel, cols, params.alpha)
-    alpha = params.alpha if alpha is None else alpha
-    gate = build_gate(params, cols)
-    if gate is not None and bandcount is None:   # old .npz predates bandcount -> recompute from mask
-        if mask is None and (cfg.mask_dir / f"{donor}.tif").exists():
-            mask = tifffile.imread(cfg.mask_dir / f"{donor}.tif")
-        if mask is None:
-            raise SystemExit("gate needs bandcount but intermediates predate it and no mask exists — "
-                             "regenerate with --save-intermediates --keep-mask")
-        bandcount = bandcount_from_mask(mask, len(oids), params.edge_radius)
-        log(f"[{donor}] recomputed bandcount from mask")
     del mask
+    alpha = params.alpha
     comp_mode = params.comp_mode
     alpha, comp_mode, n_skipped = apply_no_spillover_mask(params, cols, alpha, comp_mode)
     corrected, clamp_frac, n_iso = compensate(
         data, edge, sizes, M, comp_mode, alpha,
-        bandcount=bandcount, gate=gate, backend=backend, norm_form=params.norm_form)
+        backend=backend, norm_form=params.norm_form)
     log(f"[{donor}] recompensate(mode={params.comp_mode}, norm={params.norm_form}, "
-        f"alpha={'vector' if np.ndim(alpha) else alpha}, gate={'on' if gate else 'off'}, "
+        f"alpha={'vector' if np.ndim(alpha) else alpha}, "
         f"uncorrected_channels={n_skipped}): {n_iso} isolated")
-    write_corrected(cfg, donor, oids, cols, corrected, sizes)
+    cached = (nuc, nuc_edge, nuccount, nucbandcount, bandcount)
+    if any(array is None for array in cached):
+        missing = [
+            name
+            for name, array in zip(
+                ("nuc", "nuc_edge", "nuccount", "nucbandcount", "bandcount"),
+                cached,
+            )
+            if array is None
+        ]
+        raise ValueError(
+            f"donor {donor}: intermediates predate canonical compartment "
+            f"output (missing {missing}); rerun the full REDSEA pass"
+        )
+    means, counts, _ = compensate_compartments(
+        data,
+        edge,
+        nuc,
+        nuc_edge,
+        sizes,
+        bandcount,
+        nuccount,
+        nucbandcount,
+        M,
+        comp_mode,
+        alpha,
+        norm_form=params.norm_form,
+    )
+    write_corrected_compartments(cfg, donor, oids, cols, means, counts)
     return donor
 
 
@@ -804,110 +1023,35 @@ def run_redsea(cfg: PipelineConfig, donors: list[str], params: RedseaParams,
 
     donors = list(ensure_eligible_donors(donors, context="REDSEA analysis"))
     worker = recompensate_from_intermediates if from_intermediates else process_donor
-    fn = functools.partial(_safe_worker, worker=worker, cfg=cfg, params=params)
-    return map_donors(fn, donors, n_jobs=n_jobs, ordered=True, on_error="log")
-
-
-def _safe_worker(donor, worker, cfg, params):
-    """Top-level wrapper so SystemExit (a skipped donor) doesn't kill the pool."""
-    try:
-        return worker(donor, cfg, params)
-    except SystemExit as e:
-        log(f"[{donor}] SKIP: {e}")
-        return None
+    fn = functools.partial(worker, cfg=cfg, params=params)
+    results = map_donors(fn, donors, n_jobs=n_jobs, ordered=True, on_error="raise")
+    if results != donors:
+        raise RuntimeError(
+            f"REDSEA returned an incomplete donor set: expected {donors}, got {results}"
+        )
+    return results
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=None)
-    ap.add_argument("--donor", default=None)
-    ap.add_argument("--all", action="store_true")
-    ap.add_argument("--jobs", type=int, default=None, help="per-donor process pool size")
-    ap.add_argument("--gpu", action="store_true", help="use the CuPy backend (n_jobs=1 recommended)")
-    ap.add_argument("--downsample", type=float, default=None, help="power of 2; 1=full res")
-    ap.add_argument("--edge-radius", type=int, default=None,
-                    help="boundary band dilation radius (px); 0 = the 1-px cell rim")
-    ap.add_argument("--comp-mode", type=int, default=None, choices=[0, 1],
-                    help="1=subtract+reinforce (default, Bai et al.); 0=subtract only (pre-v10)")
-    ap.add_argument("--norm-form", default=None, choices=["donor", "recipient"],
-                    help="contact normalisation: donor=contact[i,j]/B[j] (published, mass-conserving, "
-                         "default); recipient=contact[i,j]/B[i] (pre-v10, rows sum to 1)")
-    ap.add_argument("--no-exclude-no-spillover", action="store_true",
-                    help="correct EVERY channel including nuclear/ECM (pre-v10 behaviour); by default "
-                         "marker_taxonomy.NO_SPILLOVER channels pass through uncorrected")
-    ap.add_argument("--alpha", type=float, default=None, help="spillover subtraction strength")
-    ap.add_argument("--alpha-per-channel", default=None,
-                    help="per-channel subtraction strengths, e.g. "
-                         "'Pan_Cytokeratin=2,Ker8_18=2,Keratin_5=1.5,Vimentin=1.5'. Channels not listed "
-                         "use --alpha; default None -> the scalar --alpha for every channel (bit-identical).")
-    ap.add_argument("--gate-brightness", action="store_true",
-                    help="enable the receptivity (brightness) gate: protect cells bright in their OWN "
-                         "interior (real acinar keratin / vessel-fibroblast Vimentin) and fully clean dim "
-                         "victims. Off by default (w=1 -> bit-identical output).")
-    ap.add_argument("--gate-channels", default=None,
-                    help="comma-separated channels to brightness-gate (default: the keratins + Vimentin).")
-    ap.add_argument("--gate-kappa", type=float, default=1.0,
-                    help="receptivity-gate aggressiveness; higher -> clean more cells (w saturates faster).")
-    ap.add_argument("--gap-bridge", type=int, default=None,
-                    help="bridge background gaps <= N px in the contact graph (0 disables)")
-    ap.add_argument("--keep-mask", action="store_true", help="persist the int32 instance mask")
-    ap.add_argument("--save-intermediates", action="store_true",
-                    help="dump data/edge/sizes/contact for fast --from-intermediates re-runs")
-    ap.add_argument("--from-intermediates", action="store_true",
-                    help="skip raster+channels; reload saved intermediates and just (re)compensate")
-    ap.add_argument("--reconcile-existing", action="store_true",
-                    help="atomically filter retained REDSEA parquets to canonical data/cells object IDs; "
-                         "does not recompute REDSEA")
-    a = ap.parse_args(argv)
+    """Run only the manifest-controlled REDSEA stage.
 
-    cfg = load_config(a.config)
-    if a.jobs is not None:
-        cfg.n_jobs = a.jobs
-    if a.gpu:
-        cfg.use_gpu = True
+    Scientific parameters come from the content-addressed pipeline config; the
+    numerical module no longer exposes an independent experimental CLI.
+    """
 
-    over = {}
-    for k, src in [("downsample", a.downsample), ("edge_radius", a.edge_radius),
-                   ("comp_mode", a.comp_mode), ("alpha", a.alpha), ("gap_bridge", a.gap_bridge),
-                   ("norm_form", a.norm_form)]:
-        if src is not None:
-            over[k] = src
-    if a.no_exclude_no_spillover:
-        over["exclude_no_spillover"] = False
-    params = RedseaParams.from_config(cfg, keep_mask=a.keep_mask,
-                                      save_intermediates=a.save_intermediates,
-                                      alpha_per_channel=a.alpha_per_channel,
-                                      gate_brightness=a.gate_brightness,
-                                      gate_channels=a.gate_channels,
-                                      gate_kappa=a.gate_kappa, **over)
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--jobs", type=int)
+    args = parser.parse_args(argv)
+    command = ["run"]
+    if args.config is not None:
+        command.extend(["--config", str(args.config)])
+    if args.jobs is not None:
+        command.extend(["--jobs", str(args.jobs)])
+    command.extend(["--only", "redsea", "--no-export"])
+    from .pipeline import main as pipeline_main
 
-    if a.all:
-        donors = cfg.discover_donors()
-    elif a.donor:
-        from .cohort import ensure_eligible_donors
-
-        donors = list(
-            ensure_eligible_donors([a.donor], context="REDSEA analysis")
-        )
-    else:
-        raise SystemExit("specify --donor <id> or --all")
-
-    # GPU + a local process pool would contend on one device during REDSEA
-    # computation. Existing-file reconciliation is CPU/I/O-only and remains parallel.
-    n_jobs = cfg.n_jobs
-    if not a.reconcile_existing and params.use_gpu and n_jobs != 1:
-        log("[warn] --gpu with --jobs>1 would contend on one device; forcing jobs=1 "
-            "(use a SLURM array for GPU cohort parallelism)")
-        n_jobs = 1
-
-    if a.reconcile_existing:
-        if a.from_intermediates:
-            raise SystemExit("--reconcile-existing cannot be combined with --from-intermediates")
-        reconcile_existing(cfg, donors, n_jobs=n_jobs)
-    else:
-        run_redsea(cfg, donors, params, from_intermediates=a.from_intermediates, n_jobs=n_jobs)
-    return 0
+    return pipeline_main(command)
 
 
 if __name__ == "__main__":

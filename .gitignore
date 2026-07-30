@@ -206,27 +206,14 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Phenocycler Analysis specific
-data/raw/
-data/processed/
-data/exports/
-figures/
-logs/
+# Phenocycler Analysis inputs and generated content-addressed runs.  The cohort
+# manifest may contain protected source paths, so the complete local data root
+# stays out of version control.
+/data/
+/figures/
+/logs/
 *.h5ad
 *.qptiff
 *.tif
 *.tiff
-
-# --- phenocycler pipeline outputs (hive-partitioned data/, ~tens of GB) ---
-data/cells/
-data/cells_redsea/
-data/restore_redsea/
-data/restore_gated_redsea/
-data/redsea_scratch/
-data/phenotype/
-data/*.csv
-data/*.h5ad
-data/*.pkl
-data/*.png
-data/*.npz
 .pytest_cache/
