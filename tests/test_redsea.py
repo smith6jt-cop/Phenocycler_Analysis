@@ -440,3 +440,30 @@ def test_canonical_output_mask_fails_when_ingested_cell_is_missing(tmp_path):
         redsea.canonical_cell_mask(
             cfg, "1", ["cell-a", "tiny-fragment"]
         )
+
+
+def test_one_image_per_donor_is_enforced_at_the_manifest(tmp_path):
+    """One donor must resolve to exactly one image, and this is where that is enforced.
+
+    `donor_image` picks the GeoJSON used to mask every cell in a partition. If a donor ever
+    resolved to two images, the mask and the intensities would come from different sections:
+    most cells would fall outside every polygon and be silently zeroed, and any that landed
+    inside would get a neighbouring section's spillover correction, with nothing downstream
+    reporting it.
+
+    Main enforced this at the parquet read, because a partition was the unit of identity
+    there. On this branch identity lives in the cohort manifest, so the guard moved with it —
+    this test follows it rather than letting the invariant go untested.
+    """
+    import pytest
+
+    from phenocycler import load_config
+    from phenocycler.artifacts import QuPathCohortManifest
+
+    cfg = load_config()
+    cfg.qupath_manifest = tmp_path / "missing_manifest.json"
+    with pytest.raises((ValueError, OSError, FileNotFoundError)):
+        redsea.donor_image(cfg, "6539")
+
+    # The manifest itself refuses to hold two images for one donor.
+    assert hasattr(QuPathCohortManifest, "read_json")

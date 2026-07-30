@@ -297,6 +297,32 @@ decisions separate. Run `status` first: the importer validates every CSV row
 but intentionally leaves QuPath detections outside the canonical ingest
 universe (for example, fragments below the structural area floor) unchanged.
 
+## PhenoCycler ↔ Xenium integration
+
+`phenocycler/integration/` integrates this repository's PhenoCycler output with 10x Xenium
+spatial transcriptomics, in two modes — `sequential` (serial sections from one block, where
+the cells are *not* the same cells, so pairing is at structure / niche / donor level) and
+`same_slide` (one physical section imaged twice). It is an optional extra with its own
+environment:
+
+```bash
+conda env create -f environment-integration.yml
+conda activate phenocycler_integration && pip install -e '.[integration]'
+python -m phenocycler.integration.manifest --report
+```
+
+Design and data caveats: **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
+Running the whole thing on HiPerGator: **[docs/HIPERGATOR.md](docs/HIPERGATOR.md)**.
+
+**Status after the migration.** The integration layer's Xenium half is unaffected. Its
+PhenoCycler half still reads the retired RESTORE + broad-lineage layout (`phenotype/broad/`,
+`restore_gated_redsea/`) and has **not** yet been repointed at this workflow's `assignments/`
+and `marker_evidence/` outputs, so `export_pheno` and the vocabulary crosswalk are stale
+against the new compartments. The config surface those 22 modules read is preserved (see the
+quarantined block in `phenocycler/config.py`) so the package imports and the suite collects,
+but treat the PhenoCycler side of the integration as pending that rewire. Nothing in the
+eight-stage core pipeline reads any of it.
+
 ## Migration note
 
 The former RESTORE and ordered-residual lineage path is retired. Its thresholds,

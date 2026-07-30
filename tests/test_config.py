@@ -4,6 +4,7 @@ import pytest
 
 from phenocycler import load_config
 from phenocycler.cohort import DONOR_EXCLUSIONS, ensure_eligible_donors
+from phenocycler.config import EXTRA_MARKERS, HORMONE_MARKERS, LINEAGES
 
 
 def test_defaults_expose_only_the_current_stage_roots():
@@ -18,8 +19,6 @@ def test_defaults_expose_only_the_current_stage_roots():
     for legacy in (
         "cells_redsea_dir",
         "restore_dir",
-        "restore_gated_dir",
-        "broad_dir",
         "restore_pair_reviews_csv",
     ):
         assert not hasattr(cfg, legacy)
@@ -79,3 +78,29 @@ def test_stale_redsea_modes_are_rejected():
         load_config(redsea_norm_form="recipient")
     with pytest.raises(TypeError, match="unknown"):
         load_config(redsea_emit_compartments=False)
+
+
+# --------------------------------------------------------------------------- #
+# Integration-layer surface
+# --------------------------------------------------------------------------- #
+
+def test_integration_surface_survives_for_the_integration_layer():
+    """`phenocycler/integration/` is 22 modules of shipped code whose only coupling to the
+    core is this config surface. It arrived after this branch diverged, so nothing on the
+    core side would notice if a rebase dropped it — the failure would be an AttributeError
+    at stage-run time, not at import.
+    """
+    cfg = load_config()
+    for attr in ("integration_mode", "cells_pheno_dir", "cells_xen_dir", "manifest_csv",
+                 "panel_explorer", "tissue_list", "islet_eps_um", "qc_tissue_dice_min",
+                 "crossmodal_min_anchors", "hormone_min_norm", "cd99_bright"):
+        assert hasattr(cfg, attr), f"integration layer needs cfg.{attr}"
+    assert cfg.resolve_rois()                      # tissue -> ROI expansion works
+    assert set(LINEAGES) >= {"Immune", "Endocrine"}   # vocab.py builds its crosswalk from this
+    assert HORMONE_MARKERS and EXTRA_MARKERS
+
+
+def test_integration_mode_is_validated():
+    assert load_config(integration_mode="same_slide").integration_mode == "same_slide"
+    with pytest.raises(ValueError, match="sequential"):
+        load_config(integration_mode="bogus")

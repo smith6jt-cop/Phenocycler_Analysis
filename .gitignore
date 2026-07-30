@@ -209,7 +209,18 @@ __marimo__/
 # Phenocycler Analysis inputs and generated content-addressed runs.  The cohort
 # manifest may contain protected source paths, so the complete local data root
 # stays out of version control.
-/data/
+#
+# Descend-then-negate rather than a blanket `/data/`: git does not look inside an
+# excluded directory, so a bare `/data/` makes every `!` below unreachable and would
+# silently drop the three tracked integration inputs. Those are the reproducibility
+# record of which donors were paired and how the two label vocabularies were
+# reconciled, so they stay in version control.
+/data/*
+!/data/integration/
+/data/integration/*
+!/data/integration/xenium_paths.csv
+!/data/integration/donor_overrides.csv
+!/data/integration/vocab_crosswalk.csv
 /figures/
 /logs/
 *.h5ad
@@ -217,3 +228,6 @@ __marimo__/
 *.tif
 *.tiff
 .pytest_cache/
+
+# setuptools-scm generated (version comes from git tags, never committed)
+phenocycler/_version.py

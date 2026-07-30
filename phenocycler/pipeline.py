@@ -784,6 +784,16 @@ def main(argv=None) -> int:
     if getattr(args, "jobs", None) is not None:
         overrides["n_jobs"] = args.jobs
     cfg = load_config(args.config, **overrides)
+    if args.command == "status" and not Path(cfg.qupath_manifest).exists():
+        # `status` is the first thing anyone runs, including on a checkout with no data at
+        # all, so answering "there is no cohort manifest yet, here is how to make one" beats
+        # a FileNotFoundError traceback out of the artifact reader. Every other subcommand
+        # still hard-fails, because they cannot do anything useful without the manifest.
+        print(f"no cohort manifest at {cfg.qupath_manifest}")
+        print("  phenocycler manifest template --out data/qupath_manifest_spec.json")
+        print("  phenocycler manifest create --spec data/qupath_manifest_spec.json "
+              "--out data/qupath_manifest.json")
+        return 0
     context = resolve_run_context(cfg)
     if args.command == "status":
         return status(context)

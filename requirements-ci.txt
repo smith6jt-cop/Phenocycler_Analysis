@@ -1,0 +1,4 @@
+# Lint-only dependency set for CI. The scientific stack is installed by the test jobs via
+# `pip install -e '.[test]'` / `.[integration,test]`; ruff needs nothing from it, so keeping
+# this file tiny is what makes the lint job fast enough to be worth reading.
+ruff>=0.6

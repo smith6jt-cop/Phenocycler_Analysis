@@ -1,0 +1,144 @@
+name: Release
+
+# Cutting a release is exactly one action: push an annotated tag.
+#
+#     git tag -a v0.4.0 -m "Xenium integration + pLN cohort"
+#     git push origin v0.4.0
+#
+# setuptools-scm reads that tag, so the built artifacts carry `0.4.0` with no file to edit
+# and nothing to keep in sync. Between tags the version is `0.4.1.devN+g<sha>`, which means
+# any analysis output can be traced back to the exact tree that produced it — the reason this
+# repo derives the version rather than declaring it.
+#
+# Tags are validated against PEP 440 before anything is published: a malformed tag would
+# otherwise produce a release whose version does not match its own name.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build a release for, e.g. v0.4.0"
+        required: true
+
+permissions:
+  contents: write        # needed to create the GitHub release
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0          # setuptools-scm needs the full tag history
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Resolve and check the version
+        id: version
+        run: |
+          python -m pip install setuptools-scm
+          VERSION=$(python -m setuptools_scm)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "built version: $VERSION"
+
+          # A tagged build must produce a clean release version. A dev/local suffix here
+          # means the tag was not on HEAD, or the tree was dirty — either way the artifact
+          # would not match the release it is about to be attached to.
+          case "$VERSION" in
+            *dev*|*+*)
+              echo "::error::tagged build produced a non-release version '$VERSION' — the tag is not on HEAD or the tree is dirty"
+              exit 1 ;;
+          esac
+
+      - name: Artifacts match the tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          if [ "${TAG#v}" != "$VERSION" ]; then
+            echo "::error::tag '$TAG' and built version '$VERSION' disagree"
+            exit 1
+          fi
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    name: Test the built artifact
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install the wheel (not the source tree) and run the suite against it
+        run: |
+          python -m pip install --upgrade pip
+          pip install dist/*.whl
+          pip install pytest
+          python -c "import phenocycler; print('installed version:', phenocycler.__version__)"
+          # Run from a directory without the source tree, so the import under test is the
+          # installed wheel rather than the checkout sitting next to it.
+          mkdir -p /tmp/wheeltest && cd /tmp/wheeltest
+          python -c "
+          from phenocycler import load_config
+          from phenocycler.pipeline import STAGES
+          print(f'{len(STAGES)} core stages resolve from the installed wheel')
+          "
+
+  release:
+    name: Publish GitHub release
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: phenocycler-analysis ${{ needs.build.outputs.version }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            Built from tag `${{ github.event.inputs.tag || github.ref_name }}`
+            (version `${{ needs.build.outputs.version }}`, derived by setuptools-scm).
+
+            ```bash
+            pip install phenocycler_analysis-${{ needs.build.outputs.version }}-py3-none-any.whl
+            pip install 'phenocycler-analysis[integration] @ .'   # for the Xenium integration layer
+            ```
+
+            See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the PhenoCycler ↔ Xenium layer.

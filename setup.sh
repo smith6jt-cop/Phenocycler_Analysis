@@ -6,6 +6,13 @@ REPOSITORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPOSITORY_DIR}"
 ENVIRONMENT_NAME="phenocycler-analysis"
 
+# XeniumPanelExplorer supplies panel_roles.csv + identity_core/*, which
+# phenocycler/integration/vocab.py loads to build the PhenoCycler <-> Xenium
+# crosswalk. It hard-fails with a VocabError naming this command when absent,
+# and CI asserts the file exists, so initialise it before building the env.
+echo "[setup] fetching vendored submodules"
+git submodule update --init --recursive
+
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda is required. Install Miniconda or Miniforge first." >&2
   exit 1
