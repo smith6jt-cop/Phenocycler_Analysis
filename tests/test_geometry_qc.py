@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -221,7 +222,10 @@ def test_duplicate_columns_have_one_parquet_schema_with_or_without_groups(
     clean_schema = pq.ParquetFile(clean_path).schema_arrow
     duplicate_schema = pq.ParquetFile(duplicate_path).schema_arrow
     assert clean_schema.equals(duplicate_schema, check_metadata=True)
-    assert str(clean_schema.field("duplicate_group").type) == "string"
+    duplicate_group_type = clean_schema.field("duplicate_group").type
+    assert pa.types.is_string(duplicate_group_type) or pa.types.is_large_string(
+        duplicate_group_type
+    )
     assert str(clean_schema.field("duplicate_survivor").type) == "bool"
 
 
