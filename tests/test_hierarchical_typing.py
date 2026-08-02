@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from phenocycler import hierarchical_typing as ht
-
 
 REGISTRY = {
     "marker_roles": {
@@ -100,11 +100,17 @@ def _broad_negatives(**overrides):
     return markers
 
 
-def test_evidence_sources_normalize_to_one_probability_contract():
+def test_evidence_sources_normalize_to_state_safe_support_contract():
     raw = pd.DataFrame(
         [
             {"donor": "D", "object": "direct", "marker": "M", "evidence_probability": 0.8},
             {"donor": "D", "object": "tail", "marker": "M", "tail_probability": 0.01},
+            {
+                "donor": "D",
+                "object": "one-minus-tail",
+                "marker": "M",
+                "expression_probability": 0.99,
+            },
             {"donor": "D", "object": "ratio", "marker": "M", "log2_ratio": 2.0},
             {"donor": "D", "object": "state", "marker": "M", "state": "positive"},
             {
@@ -124,14 +130,37 @@ def test_evidence_sources_normalize_to_one_probability_contract():
         ]
     )
     out = ht.prepare_cell_marker_evidence(raw).set_index("object_id")
+    assert ht.FEATURE_SCHEMA_VERSION == "state-safe-threshold-support-v1"
     assert out.loc["direct", "evidence_probability"] == pytest.approx(0.8)
-    assert out.loc["tail", "evidence_probability"] == pytest.approx(0.99)
-    assert out.loc["ratio", "evidence_probability"] == pytest.approx(0.8)
+    # An empirical background-tail p-value is audit-only, never a 1-p
+    # expression posterior. With no state/threshold coordinate it fails closed.
+    assert out.loc["tail", "evidence_probability"] == 0.0
+    assert not out.loc["tail", "model_valid"]
+    assert not out.loc["tail", "logit_eligible"]
+    assert out.loc["tail", "evidence_source"] == "tail_probability_audit_only"
+    assert out.loc["one-minus-tail", "evidence_probability"] == 0.0
+    assert not out.loc["one-minus-tail", "model_valid"]
+    assert (
+        out.loc["one-minus-tail", "evidence_source"]
+        == "expression_probability_audit_only"
+    )
+    # Centered logistic support is zero at/below threshold and bounded above.
+    assert out.loc["ratio", "evidence_probability"] == pytest.approx(0.6)
     assert out.loc["state", "evidence_probability"] == 1.0
+    assert out.loc["state", "logit_eligible"]
     assert np.isnan(out.loc["missing", "evidence_probability"])
     assert not out.loc["missing", "evidence_available"]
-    assert out.loc["uncertain", "evidence_probability"] == pytest.approx(0.7)
+    assert out.loc["uncertain", "evidence_probability"] == 0.0
+    assert out.loc["uncertain", "evidence_available"]
     assert not out.loc["uncertain", "model_valid"]
+    assert not out.loc["uncertain", "logit_eligible"]
+
+    explicit_tail_score = ht.prepare_cell_marker_evidence(
+        raw.loc[raw["object"] == "tail"],
+        tail_probability_is_pvalue=False,
+    ).iloc[0]
+    assert explicit_tail_score["evidence_probability"] == pytest.approx(0.01)
+    assert explicit_tail_score["model_valid"]
 
 
 def test_categorical_calibration_states_accept_missing_values():
@@ -183,7 +212,7 @@ def test_wide_production_evidence_matches_long_assignment_without_expansion():
         rows = long[long["marker"] == marker].set_index(["donor_id", "object_id"])
         key = pd.MultiIndex.from_frame(production[["donor_id", "object_id"]])
         if "evidence_probability" in rows:
-            production[f"{marker}__expression_probability"] = rows[
+            production[f"{marker}__evidence_probability"] = rows[
                 "evidence_probability"
             ].reindex(key).to_numpy()
         production[f"{marker}__state"] = rows["state"].reindex(key).fillna("").to_numpy()
@@ -195,6 +224,50 @@ def test_wide_production_evidence_matches_long_assignment_without_expansion():
         observed["assignment_status"].to_dict()
         == expected["assignment_status"].to_dict()
     )
+
+
+def test_public_feature_matrix_is_state_safe_and_long_wide_equivalent():
+    long = pd.DataFrame(
+        {
+            "donor_id": ["D"] * 4,
+            "object_id": ["positive", "negative", "indeterminate", "pilot"],
+            "marker": ["M"] * 4,
+            "state": ["positive", "negative", "indeterminate", ""],
+            "log2_threshold_ratio": [2.0, -0.5, 2.0, np.nan],
+            # High 1-p values are deliberately contradictory for the negative
+            # and invalid rows. The threshold/state contract must win.
+            "expression_probability": [0.999, 0.999, 0.999, 0.8],
+            "evidence_probability": [np.nan, np.nan, np.nan, 0.8],
+            "empirical_tail_probability": [0.001, 0.001, 0.001, np.nan],
+            "model_valid": [True, True, False, True],
+        }
+    )
+    wide = long[["donor_id", "object_id"]].copy()
+    for column in (
+        "state",
+        "log2_threshold_ratio",
+        "expression_probability",
+        "evidence_probability",
+        "empirical_tail_probability",
+        "model_valid",
+    ):
+        wide[f"M__{column}"] = long[column].to_numpy()
+
+    long_result = ht.evidence_feature_matrix(long, ["M"])
+    wide_result = ht.evidence_feature_matrix(wide, ["M"])
+    pd.testing.assert_frame_equal(long_result[0], wide_result[0])
+    np.testing.assert_allclose(long_result[1], wide_result[1])
+    np.testing.assert_array_equal(long_result[2], wide_result[2])
+    np.testing.assert_array_equal(long_result[3], wide_result[3])
+    np.testing.assert_allclose(long_result[1][:, 0], [0.6, 0.0, 0.0, 0.8])
+    np.testing.assert_array_equal(long_result[3][:, 0], [True, True, False, True])
+
+    numeric_pilot = _evidence({"pilot": {"A": 0.2, "B": 0.8}})
+    _keys, ordered, _state, valid = ht.evidence_feature_matrix(
+        numeric_pilot, ["B", "A"]
+    )
+    np.testing.assert_allclose(ordered, [[0.8, 0.2]])
+    assert valid.all()
 
 
 def test_registry_enforces_identity_only_broad_and_sst_subtype_only():
@@ -433,6 +506,49 @@ def test_negative_calibration_state_cannot_become_anchor_from_rank_probability()
     assert out["broad_authoritative_markers"] == ""
 
 
+@pytest.mark.parametrize(
+    "markers",
+    [
+        _broad_negatives(
+            CD68=(0.999, "negative"),
+            Pan_Cytokeratin="unavailable",
+        ),
+        _broad_negatives(CD68=(0.999, "indeterminate")),
+    ],
+    ids=["negative-high-1-minus-p", "indeterminate-high-score"],
+)
+def test_negative_or_indeterminate_high_scores_cannot_create_inferred_calls(markers):
+    out = ht.assign_broad_types(
+        _evidence({"challenged": markers}),
+        REGISTRY,
+        stability=1.0,
+    ).iloc[0]
+
+    assert out["broad_assignment_status"] == ht.UNAVAILABLE
+    assert out["broad_label"] == ht.UNAVAILABLE_LABEL
+    assert out["broad_reason"] == "required_models_unavailable"
+    assert out["broad_best_probability"] == pytest.approx(1 / 3)
+    assert out["broad_margin"] == pytest.approx(0.0)
+
+
+def test_explicit_invalid_wide_evidence_is_zero_before_logits():
+    frame = pd.DataFrame({"donor_id": ["D"], "object_id": ["invalid-high"]})
+    for marker in ("CD3e", "CD68", "E_cadherin", "Pan_Cytokeratin", "Vimentin"):
+        frame[f"{marker}__state"] = "negative"
+        frame[f"{marker}__log2_threshold_ratio"] = -1.0
+        frame[f"{marker}__expression_probability"] = 0.999
+        frame[f"{marker}__model_valid"] = True
+    frame["CD68__state"] = "indeterminate"
+    frame["CD68__log2_threshold_ratio"] = 4.0
+    frame["CD68__model_valid"] = False
+
+    out = ht.assign_broad_types(frame, REGISTRY, stability=1.0).iloc[0]
+
+    assert out["broad_assignment_status"] == ht.UNAVAILABLE
+    assert out["broad_reason"] == "required_models_unavailable"
+    assert out["broad_best_probability"] == pytest.approx(1 / 3)
+
+
 def test_inference_uses_exact_probability_margin_and_stability_thresholds():
     evidence = _evidence(
         {
@@ -452,6 +568,120 @@ def test_inference_uses_exact_probability_margin_and_stability_thresholds():
     assert out.loc["stable", "broad_assignment_status"] == ht.INFERRED
     assert out.loc["stable", "broad_best_probability"] >= 0.80
     assert out.loc["stable", "broad_margin"] >= 0.25
+    assert out.loc["unstable", "broad_probability_pass"]
+    assert out.loc["unstable", "broad_margin_pass"]
+    assert not out.loc["unstable", "broad_stability_pass"]
+    assert out.loc["unstable", "broad_valid_evidence_pass"]
+    assert out.loc["unstable", "broad_threshold_eligible"]
+    assert (
+        out.loc["unstable", "broad_inference_failure_reasons"]
+        == "stability_below_threshold"
+    )
+    assert out.loc["stable", "broad_probability_pass"]
+    assert out.loc["stable", "broad_margin_pass"]
+    assert out.loc["stable", "broad_stability_pass"]
+    assert out.loc["stable", "broad_valid_evidence_pass"]
+    assert out.loc["stable", "broad_threshold_eligible"]
+    assert out.loc["stable", "broad_inference_failure_reasons"] == ""
+
+
+def test_exact_model_tie_cannot_infer_when_frozen_thresholds_are_zero():
+    registry = {
+        "broad": {
+            "A": {"support": ["M"], "required": ["M"]},
+            "B": {"support": ["M"], "required": ["M"]},
+        }
+    }
+    thresholds = ht.AssignmentThresholds(
+        inferred_probability=0.0,
+        inferred_margin=0.0,
+        inferred_stability=0.0,
+        anchor_probability=1.0,
+    )
+
+    out = ht.assign_broad_types(
+        _evidence({"tie": {"M": 0.8}}),
+        registry,
+        stability=0.0,
+        thresholds=thresholds,
+    ).iloc[0]
+
+    assert out["broad_best_candidate"] == "A"
+    assert out["broad_best_probability"] == pytest.approx(0.5)
+    assert out["broad_margin"] == 0.0
+    assert not out["broad_unique_winner_pass"]
+    assert out["broad_threshold_eligible"]
+    assert out["broad_assignment_status"] == ht.AMBIGUOUS
+    assert out["broad_reason"] == "nonunique_model_winner"
+    assert (
+        out["broad_inference_failure_reasons"]
+        == "best_candidate_not_unique"
+    )
+
+
+def test_probability_prediction_fails_closed_on_nonfinite_logits():
+    registry = ht.TypingRegistry.from_mapping(
+        {
+            "broad": {
+                "A": {"support": ["A_marker"], "required": ["A_marker"]},
+                "B": {"support": ["B_marker"], "required": ["B_marker"]},
+            }
+        }
+    )
+    model = ht.classifier_from_registry(registry)
+    model.coefficients[0, 0] = np.inf
+
+    with pytest.raises(FloatingPointError, match="non-finite logits"):
+        model.predict_proba(
+            _evidence(
+                {"bad": {"A_marker": 0.8, "B_marker": 0.2}}
+            )
+        )
+
+
+def test_inference_requires_positive_support_for_the_winning_class():
+    registry = {
+        "broad": {
+            "A": {"support": ["A_marker"], "required": ["A_marker"]},
+            "B": {
+                "support": ["B_marker"],
+                "exclusions": {"X": 8.0},
+                "required": ["B_marker", "X"],
+            },
+            "C": {
+                "support": ["C_marker"],
+                "exclusions": {"X": 8.0},
+                "required": ["C_marker", "X"],
+            },
+        }
+    }
+    evidence = _evidence(
+        {
+            "exclusion-only": {
+                "A_marker": "negative",
+                "B_marker": "negative",
+                "C_marker": "negative",
+                # This strongly suppresses B and C, making A the posterior
+                # winner without supplying any positive A evidence.
+                "X": 0.90,
+            }
+        }
+    )
+
+    out = ht.assign_broad_types(evidence, registry, stability=1.0).iloc[0]
+
+    assert out["broad_best_candidate"] == "A"
+    assert out["broad_probability_pass"]
+    assert out["broad_margin_pass"]
+    assert out["broad_stability_pass"]
+    assert not out["broad_valid_evidence_pass"]
+    assert out["broad_threshold_eligible"]
+    assert out["broad_assignment_status"] == ht.AMBIGUOUS
+    assert out["broad_reason"] == "valid_positive_support_required"
+    assert (
+        out["broad_inference_failure_reasons"]
+        == "no_valid_positive_support"
+    )
 
 
 def test_other_requires_every_required_model_valid_and_negative():

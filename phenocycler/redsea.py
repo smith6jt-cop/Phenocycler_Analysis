@@ -39,6 +39,7 @@ from skimage.segmentation import find_boundaries
 from skimage.morphology import binary_dilation, diamond
 
 from . import marker_taxonomy
+from .artifacts import geometry_present, iter_qupath_geojson_features
 from .config import PipelineConfig, load_config
 from .gpu import get_backend
 from .parallel import map_donors
@@ -208,7 +209,14 @@ def _draw_geometry(target, geom, label, shape, s):
     return n_holes
 
 
-def rasterize_mask(geojson: Path, shape, downsample: float, with_nucleus: bool = False):
+def rasterize_mask(
+    geojson: Path,
+    shape,
+    downsample: float,
+    with_nucleus: bool = False,
+    *,
+    return_nucleus_presence: bool = False,
+):
     """Rasterize per-cell polygons into an int32 instance mask. label = feature_index+1.
     Returns (mask, object_ids[list]) where object_ids[label-1] is the cell's UUID.
 
@@ -220,35 +228,42 @@ def rasterize_mask(geojson: Path, shape, downsample: float, with_nucleus: bool =
     decomposition in :func:`compensate_compartments` needs ``nuc <= data`` and
     ``nuccount <= sizes`` to hold exactly, and cell polygons drawn later can otherwise overwrite an
     earlier cell's pixels while its nucleus raster still claims them. Cells whose nucleusGeometry is
-    absent (segmentation fragments; every CANONICAL cell has one) get an empty nucleus and therefore
-    a NaN Nucleus mean, never a silent zero."""
+    absent (rejected InstanSeg fragments) get an empty nucleus and therefore a
+    NaN Nucleus mean, never a silent zero.  ``return_nucleus_presence`` adds a
+    fourth return value aligned to ``object_ids`` for geometry QC."""
+    if return_nucleus_presence and not with_nucleus:
+        raise ValueError("return_nucleus_presence requires with_nucleus=True")
     log(f"  [raster] loading {geojson.name} ...")
-    feats = json.load(open(geojson))["features"]
-    n = len(feats)
     mask = np.zeros(shape, dtype=np.int32)
     nuc_mask = np.zeros(shape, dtype=np.int32) if with_nucleus else None
-    oids = [None] * n
+    oids = []
+    nucleus_presence = []
     s = 1.0 / downsample
     n_holes = 0
     n_nuc = 0
     t0 = time.time()
-    for i, ft in enumerate(feats):
-        oids[i] = ft.get("id")
+    for i, ft in enumerate(iter_qupath_geojson_features(geojson)):
+        oids.append(ft.get("id"))
         label = i + 1
         n_holes += _draw_geometry(mask, ft["geometry"], label, shape, s)
         if with_nucleus:
             ng = ft.get("nucleusGeometry")
-            if ng is not None:
+            present = geometry_present(ng)
+            nucleus_presence.append(present)
+            if present:
                 n_nuc += 1
                 _draw_geometry(nuc_mask, ng, label, shape, s)
         if (i + 1) % 100000 == 0:
-            log(f"  [raster] {i+1:,}/{n:,} ({(time.time()-t0):.0f}s)")
+            log(f"  [raster] {i+1:,} features ({(time.time()-t0):.0f}s)")
+    n = len(oids)
     log(f"  [raster] {n:,} cells, {n_holes} holes carved, {time.time()-t0:.0f}s")
     if not with_nucleus:
         return mask, oids
     # Keep only nucleus pixels the cell raster still agrees with (see docstring).
     np.putmask(nuc_mask, nuc_mask != mask, 0)
     log(f"  [raster] nuclei: {n_nuc:,}/{n:,} features carried a nucleusGeometry")
+    if return_nucleus_presence:
+        return mask, oids, nuc_mask, nucleus_presence
     return mask, oids, nuc_mask
 
 
@@ -700,10 +715,15 @@ def write_corrected_compartments(cfg: PipelineConfig, donor, oids, cols, means, 
             )
     out = pd.DataFrame(output_columns)
 
-    out_dir = cfg.redsea_dir / f"donor_id={donor}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(out_dir / "data_0.parquet", index=False)
-    log(f"[{donor}] wrote {out_dir/'data_0.parquet'} "
+    from .expression import write_donor_partition
+
+    output_path = write_donor_partition(
+        out,
+        cfg.redsea_dir,
+        donor_id=str(donor),
+        filename="data_0.parquet",
+    )
+    log(f"[{donor}] wrote {output_path} "
         f"({len(out):,} rows x {len(out.columns)} cols)")
 
 

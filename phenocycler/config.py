@@ -13,10 +13,8 @@ import os
 from configparser import ConfigParser
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Optional
 
 from .cohort import filter_eligible_donors
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INI = _REPO_ROOT / "config.ini"
@@ -69,6 +67,11 @@ class PipelineConfig:
     qupath_manifest: Path = _REPO_ROOT / "data" / "qupath_manifest.json"
     marker_registry: Path = _PACKAGE_DIR / "marker_registry.json"
     typing_rules: Path = _PACKAGE_DIR / "typing_rules.json"
+    # Optional, immutable probabilistic rescue model.  Keeping this unset is
+    # the production rules-only default. Production requires its separately
+    # configured immutable promotion manifest.
+    typing_model_bundle: Path | None = None
+    typing_model_promotion_manifest: Path | None = None
 
     # Ingest retains tiny fragments only above this structural floor. Geometry
     # QC is a later immutable flag and never deletes rows.
@@ -83,6 +86,10 @@ class PipelineConfig:
     cell_qc_no_cytoplasm_nc_ratio: float = 0.999
     cell_qc_duplicate_radius_um: float = 1.0
     cell_qc_duplicate_area_tol: float = 0.15
+    cell_qc_duplicate_policy: str = "fatal"
+    # InstanSeg fragments without a nucleus remain auditable source objects but
+    # cannot enter analysis, model estimation, or physical spillover context.
+    cell_qc_missing_geometry_policy: str = "exclude"
 
     # REDSEA. Compartment output and fail-fast alignment are mandatory in code.
     redsea_downsample: float = 1.0
@@ -98,6 +105,9 @@ class PipelineConfig:
     duckdb_threads: int = 8
     use_gpu: bool = False
     gpu_device: int = 0
+    pipeline_geometry_workers: int = 1
+    pipeline_redsea_workers: int = 1
+    pipeline_downstream_workers: int = 2
 
     # ---------------------------------------------------------------------- #
     # Integration-layer surface (phenocycler/integration/).
@@ -145,7 +155,7 @@ class PipelineConfig:
     qc_tissue_dice_min: float = 0.80
     qc_islet_rmse_max_um: float = 150.0
 
-    _config_path: Optional[Path] = field(default=None, repr=False, compare=False)
+    _config_path: Path | None = field(default=None, repr=False, compare=False)
 
     @property
     def runs_dir(self) -> Path:
@@ -207,7 +217,7 @@ class PipelineConfig:
     def inter_dir(self) -> Path:
         return self.redsea_scratch / "intermediates"
 
-    def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
+    def discover_donors(self, from_dir: Path | None = None) -> list[str]:
         """Unique, eligible **donor ids** behind the discovered sections.
 
         Distinct from :meth:`discover_sections` on purpose. Stages that process images want
@@ -380,7 +390,7 @@ class PipelineConfig:
                     out.append(r)
         return out
 
-    def discover_sections(self, from_dir: Optional[Path] = None) -> list[str]:
+    def discover_sections(self, from_dir: Path | None = None) -> list[str]:
         """Section keys by globbing ``<dir>/donor_id=*`` (defaults to cells_dir).
 
         This is the pipeline's **work unit**: one key is one image, one GeoJSON, one
@@ -390,7 +400,7 @@ class PipelineConfig:
         base = Path(from_dir) if from_dir is not None else self.cells_dir
         return sorted(p.name.split("=", 1)[1] for p in base.glob("donor_id=*"))
 
-    def discover_section_objects(self, from_dir: Optional[Path] = None) -> list:
+    def discover_section_objects(self, from_dir: Path | None = None) -> list:
         """:class:`phenocycler.sections.Section` for every discovered partition."""
         from .sections import parse
 
@@ -402,6 +412,10 @@ _INI_SCHEMA = {
         "qupath_manifest": ("qupath_manifest", Path),
         "marker_registry": ("marker_registry", Path),
         "typing_rules": ("typing_rules", Path),
+    },
+    "typing": {
+        "model_bundle": ("typing_model_bundle", Path),
+        "promotion_manifest": ("typing_model_promotion_manifest", Path),
     },
     "cells": {
         "min_cell_area": ("cells_min_cell_area", float),
@@ -418,6 +432,8 @@ _INI_SCHEMA = {
         "no_cytoplasm_nc_ratio": ("cell_qc_no_cytoplasm_nc_ratio", float),
         "duplicate_radius_um": ("cell_qc_duplicate_radius_um", float),
         "duplicate_area_tol": ("cell_qc_duplicate_area_tol", float),
+        "duplicate_policy": ("cell_qc_duplicate_policy", str),
+        "missing_geometry_policy": ("cell_qc_missing_geometry_policy", str),
     },
     "redsea": {
         "downsample": ("redsea_downsample", float),
@@ -433,6 +449,9 @@ _INI_SCHEMA = {
         "duckdb_threads": ("duckdb_threads", int),
         "use_gpu": ("use_gpu", _boolean),
         "gpu_device": ("gpu_device", int),
+        "geometry_workers": ("pipeline_geometry_workers", int),
+        "redsea_workers": ("pipeline_redsea_workers", int),
+        "downstream_workers": ("pipeline_downstream_workers", int),
     },
     "metadata": {
         "donor_col": ("metadata_donor_col", str),
@@ -492,7 +511,7 @@ _ENV_OVERRIDES = {
 
 
 def load_config(
-    config_path: Optional[os.PathLike | str] = None,
+    config_path: os.PathLike | str | None = None,
     **overrides,
 ) -> PipelineConfig:
     """Load config.ini, environment variables and explicit overrides."""
@@ -540,6 +559,24 @@ def load_config(
             path = (base / path).resolve()
         setattr(cfg, name, path)
 
+    for name in (
+        "typing_model_bundle",
+        "typing_model_promotion_manifest",
+    ):
+        value = getattr(cfg, name)
+        if value is None:
+            continue
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = (base / path).resolve()
+        setattr(cfg, name, path)
+    if (cfg.typing_model_bundle is None) != (
+        cfg.typing_model_promotion_manifest is None
+    ):
+        raise ValueError(
+            "[typing] model_bundle and promotion_manifest must be configured together"
+        )
+
     for name in ("images_dir", "donor_metadata", "xenium_paths_csv",
                  "donor_overrides_csv", "panel_explorer"):
         path = Path(getattr(cfg, name)).expanduser()
@@ -554,6 +591,28 @@ def load_config(
 
     if cfg.redsea_norm_form != "donor":
         raise ValueError("production REDSEA requires mass-conserving norm_form='donor'")
+    if cfg.cell_qc_missing_geometry_policy not in {"fatal", "exclude"}:
+        raise ValueError(
+            "geometry_qc missing_geometry_policy must be 'fatal' or 'exclude'"
+        )
+    if cfg.cell_qc_duplicate_policy not in {"fatal", "deterministic_keep"}:
+        raise ValueError(
+            "geometry_qc duplicate_policy must be 'fatal' or "
+            "'deterministic_keep'"
+        )
+    worker_limits = {
+        "geometry_workers": cfg.pipeline_geometry_workers,
+        "redsea_workers": cfg.pipeline_redsea_workers,
+        "downstream_workers": cfg.pipeline_downstream_workers,
+    }
+    invalid_workers = [
+        name for name, value in worker_limits.items() if value < 1
+    ]
+    if invalid_workers:
+        raise ValueError(
+            "pipeline worker limits must be >= 1: "
+            f"{sorted(invalid_workers)}"
+        )
     return cfg
 
 

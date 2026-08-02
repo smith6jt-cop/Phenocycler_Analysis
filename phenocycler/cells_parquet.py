@@ -179,6 +179,31 @@ def donor_case_expression(image_to_donor: Mapping[str, str]) -> str:
     )
 
 
+def contracted_image_source(
+    csv_paths: Sequence[Path], image_to_donor: Mapping[str, str]
+) -> str:
+    """Read shared exports but expose only exact manifest-contracted images."""
+
+    contracted_images = sorted(map(str, image_to_donor))
+    if not contracted_images:
+        raise ContractError("image_to_donor cannot be empty")
+    raw_parts = []
+    for index, path in enumerate(csv_paths):
+        escaped = str(path).replace("'", "''")
+        raw_parts.append(
+            f"SELECT * FROM read_csv('{escaped}', header=true, all_varchar=true, "
+            f"ignore_errors=true, store_rejects=true, "
+            f"rejects_table='phenocycler_ingest_rejects_{index}', "
+            f"rejects_scan='phenocycler_ingest_reject_scans_{index}', rejects_limit=0)"
+        )
+    combined = "(" + " UNION ALL BY NAME ".join(raw_parts) + ")"
+    allowed = ", ".join(_sql_string(image) for image in contracted_images)
+    return (
+        f'(SELECT * FROM {combined} AS all_qupath_exports '
+        f'WHERE "Image" IN ({allowed})) AS qupath_exports'
+    )
+
+
 def build_sql(
     csv_paths: Sequence[Path],
     out_dir: Path,
@@ -213,20 +238,11 @@ def build_sql(
     for orig, output_column in nucleus_mm.items():
         selects.append(f'TRY_CAST("{orig}" AS DOUBLE) AS "{output_column}"')
     sel = ",\n  ".join(selects)
-    # A LIST of exports, aligned by column NAME. Batch-only markers are intentionally NULL in files
-    # that did not acquire them; the availability report makes those nulls explicit downstream.
-    # DuckDB cannot combine `store_rejects` with read_csv's `union_by_name` option. Read each export
-    # with its own reject tables, then UNION ALL BY NAME at the relational layer instead.
-    raw_parts = []
-    for index, path in enumerate(csv_paths):
-        escaped = str(path).replace("'", "''")
-        raw_parts.append(
-            f"SELECT * FROM read_csv('{escaped}', header=true, all_varchar=true, "
-            f"ignore_errors=true, store_rejects=true, "
-            f"rejects_table='phenocycler_ingest_rejects_{index}', "
-            f"rejects_scan='phenocycler_ingest_reject_scans_{index}', rejects_limit=0)"
-        )
-    src = "(" + " UNION ALL BY NAME ".join(raw_parts) + ") AS qupath_exports"
+    # Align batched exports by column NAME, then apply the cohort manifest's exact
+    # image allow-list. A shared QuPath export may contain deliberately excluded
+    # or otherwise out-of-cohort images; those rows must not reach donor mapping.
+    # The CSV reader still scans the batched files because CSV has no image index.
+    src = contracted_image_source(csv_paths, image_to_donor)
     inner = f"SELECT\n  {sel}\nFROM {src}"
     if min_cell_area and min_cell_area > 0:
         # Drop degenerate sub-cell segmentation objects (QuPath emits NaN
@@ -246,8 +262,8 @@ def build_cells_parquet(cfg: PipelineConfig, *, limit: Optional[int] = None,
                         memory_limit: Optional[str] = None) -> Path:
     """Run the DuckDB CSV -> partitioned-parquet build. Returns the cells dir.
 
-    Reads every measurement export declared by ``cfg.qupath_manifest`` in one
-    pass, preserving the panel union."""
+    Scans each unique measurement export declared by ``cfg.qupath_manifest``
+    once, preserving the panel union while writing only contracted images."""
     import duckdb
 
     cohort = QuPathCohortManifest.read_json(cfg.qupath_manifest)

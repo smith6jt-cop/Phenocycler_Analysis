@@ -23,7 +23,42 @@ def test_manifest_template_names_every_required_contract_field():
         "channel_map",
     } <= set(row)
     assert "measurement_csv" in spec["defaults"]
+    assert len(spec["defaults"]["measurement_csv"]) == 2
+    assert row["measurement_csv_index"] == 0
     assert "segmentation_version" in spec["defaults"]
+
+
+def test_measurement_csv_list_selects_the_declared_source(tmp_path):
+    row = {
+        "measurement_csv": ["batch1.csv", "batch2.csv"],
+        "measurement_csv_index": 1,
+    }
+    assert qupath_manifest._measurement_path(tmp_path, row) == (
+        tmp_path / "batch2.csv"
+    ).resolve()
+
+
+def test_measurement_csv_list_requires_a_valid_index(tmp_path):
+    with pytest.raises(ValueError, match="require an integer"):
+        qupath_manifest._measurement_path(
+            tmp_path, {"measurement_csv": ["batch1.csv", "batch2.csv"]}
+        )
+    with pytest.raises(ValueError, match="outside 0..1"):
+        qupath_manifest._measurement_path(
+            tmp_path,
+            {
+                "measurement_csv": ["batch1.csv", "batch2.csv"],
+                "measurement_csv_index": 2,
+            },
+        )
+    with pytest.raises(ValueError, match="only valid"):
+        qupath_manifest._measurement_path(
+            tmp_path,
+            {
+                "measurement_csv": "batch1.csv",
+                "measurement_csv_index": 0,
+            },
+        )
 
 
 def test_explicit_channel_map_must_match_qptiff_names_and_indices(

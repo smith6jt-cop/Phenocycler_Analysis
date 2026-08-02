@@ -1,0 +1,199 @@
+{
+  "spec_version": 1,
+  "cohort_name": "panc-phenocycler",
+  "expected_donors": [
+    "115",
+    "6374",
+    "6380",
+    "6436",
+    "6442",
+    "6450",
+    "6461",
+    "6476",
+    "6482",
+    "6493",
+    "6505",
+    "6521",
+    "6523",
+    "6534",
+    "6539",
+    "6551",
+    "6566",
+    "6591",
+    "6593",
+    "6623"
+  ],
+  "defaults": {
+    "measurement_csv": [
+      "/home/smith6jt/IO60panc2nd/results/Cellmeasurements.csv",
+      "/home/smith6jt/IO60panc2nd/results/CellmeasurementsBatch2.csv"
+    ],
+    "segmentation_version": "qupath-0.7.0__instanseg-fluorescence_nuclei_and_cells-0.1.1",
+    "nucleus_geojson": null,
+    "pixel_size_um_x": 0.5077663810243286,
+    "pixel_size_um_y": 0.5077663810243286,
+    "channel_map": null
+  },
+  "images": [
+    {
+      "donor_id": "115",
+      "image_id": "HDL115pancLN_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/HDL115pancLN_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__HDL115pancLN_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6374",
+      "image_id": "6374_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6374_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6374_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6380",
+      "image_id": "6380_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6380_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6380_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6436",
+      "image_id": "6436_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6436_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6436_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6442",
+      "image_id": "6442_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6442_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6442_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6450",
+      "image_id": "6450panc_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6450panc_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6450panc_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-b-catenin1-59ch"
+    },
+    {
+      "donor_id": "6461",
+      "image_id": "6461_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6461_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6461_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6476",
+      "image_id": "6476_Scan2.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6476_Scan2.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6476_Scan2.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6482",
+      "image_id": "6482_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6482_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6482_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6493",
+      "image_id": "6493_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6493_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6493_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6505",
+      "image_id": "6505panc_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6505panc_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6505panc_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-b-catenin1-59ch"
+    },
+    {
+      "donor_id": "6521",
+      "image_id": "6521_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6521_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6521_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6523",
+      "image_id": "6523panc_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6523panc_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6523panc_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-neither-58ch"
+    },
+    {
+      "donor_id": "6534",
+      "image_id": "6534pacn_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6534pacn_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6534pacn_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-b-catenin1-59ch"
+    },
+    {
+      "donor_id": "6539",
+      "image_id": "6539_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6539_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6539_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6551",
+      "image_id": "6551_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6551_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6551_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6566",
+      "image_id": "6566panc_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6566panc_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6566panc_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-neither-58ch"
+    },
+    {
+      "donor_id": "6591",
+      "image_id": "6591panc_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6591panc_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6591panc_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-neither-58ch"
+    },
+    {
+      "donor_id": "6593",
+      "image_id": "6593_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 0,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6593_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6593_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-cd38-59ch"
+    },
+    {
+      "donor_id": "6623",
+      "image_id": "6623panc_Scan1.er.qptiff - resolution #1",
+      "measurement_csv_index": 1,
+      "qptiff": "/home/smith6jt/IO60panc2nd/Images/6623panc_Scan1.er.qptiff",
+      "cell_geojson": "/home/smith6jt/IO60panc2nd/Islet-Explorer-Senior/data/redsea_scratch/geojson/cells__6623panc_Scan1.er.qptiff_-_resolution__1.geojson",
+      "panel_id": "panel-b-catenin1-59ch"
+    }
+  ]
+}

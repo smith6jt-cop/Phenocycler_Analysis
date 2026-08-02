@@ -19,6 +19,8 @@ duplicated long-form identity rows merely to pivot them back again.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -265,7 +267,19 @@ def write_donor_partition(
     if path.exists():
         raise FileExistsError(f"immutable donor artifact already exists: {path}")
     partition.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(path, index=False)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{filename}.",
+        suffix=".tmp",
+        dir=partition,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        frame.to_parquet(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return path
 
 

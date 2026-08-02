@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from phenocycler.artifacts import GeometryContractError
@@ -84,7 +86,7 @@ def test_missing_required_columns_and_geometry_are_fatal_by_default():
         evaluate_geometry_metrics(missing_cell, donor_id="1", config=_config())
 
 
-def test_explicit_exclude_policy_keeps_missing_nucleus_out_of_analysis_not_context():
+def test_explicit_exclude_policy_rejects_missing_nucleus_from_every_qc_role():
     metrics = _metrics(
         nucleus_geometry_present=[False, True, True, True, True, True],
         nucleus_area_px=[float("nan"), 30, 30, 30, 30, 30],
@@ -98,8 +100,27 @@ def test_explicit_exclude_policy_keeps_missing_nucleus_out_of_analysis_not_conte
     first = result.loc[result.object_id == "c0"].iloc[0]
     assert not first.analysis_eligible
     assert not first.estimation_eligible
-    assert first.spillover_context_eligible
+    assert not first.spillover_context_eligible
     assert first.analysis_reason == "missing_nucleus_geometry"
+    assert first.spillover_context_reason == "missing_nucleus_geometry"
+
+
+def test_empty_nucleus_raster_is_rejected_from_every_qc_role():
+    metrics = _metrics(
+        nucleus_geometry_present=[True, True, True, True, True, True],
+        nucleus_area_px=[0, 30, 30, 30, 30, 30],
+    )
+    first = evaluate_geometry_metrics(
+        metrics,
+        donor_id="1",
+        config=_config(missing_geometry_policy="exclude"),
+    ).to_frame().loc[0]
+
+    assert not first.analysis_eligible
+    assert not first.estimation_eligible
+    assert not first.spillover_context_eligible
+    assert first.analysis_reason == "nucleus_raster_empty"
+    assert first.spillover_context_reason == "nucleus_raster_empty"
 
 
 def test_duplicate_policy_is_fatal_by_default():
@@ -147,6 +168,65 @@ def test_duplicate_tie_break_is_lexicographic():
 
     assert output.loc["a", "duplicate_survivor"]
     assert not output.loc["z", "duplicate_survivor"]
+
+
+def test_duplicate_recovery_prefers_the_nucleus_bearing_copy():
+    metrics = _metrics(
+        centroid_x_um=[0.0, 0.5, 10.0, 20.0, 30.0, 40.0],
+        cell_area_um2=[60.0, 59.8, 60.0, 60.0, 60.0, 60.0],
+        # The nucleus-less duplicate owns more raster pixels, so viability
+        # must outrank raster ownership when choosing the survivor.
+        cell_area_px=[70.0, 59.8, 60.0, 60.0, 60.0, 60.0],
+        nucleus_geometry_present=[False, True, True, True, True, True],
+        nucleus_area_px=[0.0, 30.0, 30.0, 30.0, 30.0, 30.0],
+    )
+    output = evaluate_geometry_metrics(
+        metrics,
+        donor_id="1",
+        config=_config(
+            missing_geometry_policy="exclude",
+            duplicate_policy="deterministic_keep",
+        ),
+    ).to_frame().set_index("object_id")
+
+    assert output.loc["c1", "duplicate_survivor"]
+    assert output.loc["c1", "analysis_eligible"]
+    assert not output.loc["c0", "duplicate_survivor"]
+    assert not output.loc["c0", "analysis_eligible"]
+    assert not output.loc["c0", "spillover_context_eligible"]
+    assert "missing_nucleus_geometry" in output.loc["c0", "analysis_reasons"]
+    assert "duplicate_detection" in output.loc["c0", "analysis_reasons"]
+
+
+def test_duplicate_columns_have_one_parquet_schema_with_or_without_groups(
+    tmp_path,
+):
+    clean = evaluate_geometry_metrics(
+        _metrics(),
+        donor_id="1",
+        config=_config(duplicate_policy="deterministic_keep"),
+    ).to_frame()
+    duplicated = evaluate_geometry_metrics(
+        _metrics(
+            centroid_x_um=[0.0, 0.5, 10.0, 20.0, 30.0, 40.0],
+            cell_area_um2=[60.0, 59.8, 60.0, 60.0, 60.0, 60.0],
+        ),
+        donor_id="2",
+        config=_config(duplicate_policy="deterministic_keep"),
+    ).to_frame()
+    clean_path = tmp_path / "clean.parquet"
+    duplicate_path = tmp_path / "duplicate.parquet"
+    clean.to_parquet(clean_path, index=False)
+    duplicated.to_parquet(duplicate_path, index=False)
+
+    clean_schema = pq.ParquetFile(clean_path).schema_arrow
+    duplicate_schema = pq.ParquetFile(duplicate_path).schema_arrow
+    assert clean_schema.equals(duplicate_schema, check_metadata=True)
+    duplicate_group_type = clean_schema.field("duplicate_group").type
+    assert pa.types.is_string(duplicate_group_type) or pa.types.is_large_string(
+        duplicate_group_type
+    )
+    assert str(clean_schema.field("duplicate_survivor").type) == "bool"
 
 
 def test_analysis_estimation_and_spillover_context_are_not_conflated():

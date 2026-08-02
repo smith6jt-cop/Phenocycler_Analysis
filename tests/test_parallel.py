@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from phenocycler.parallel import map_donors, resolve_jobs
 
 
@@ -37,6 +39,70 @@ def test_map_donors_error_logged_as_none():
 
 
 def test_map_donors_error_raises():
-    import pytest
     with pytest.raises(ValueError):
         map_donors(_boom, ["3"], n_jobs=1, on_error="raise")
+
+
+def test_parallel_interrupt_terminates_submitted_workers(monkeypatch):
+    from phenocycler import parallel
+
+    class Future:
+        cancelled = False
+
+        def result(self):
+            raise KeyboardInterrupt
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Process:
+        alive = True
+        terminated = False
+        killed = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+
+        def join(self, timeout):
+            pass
+
+        def kill(self):
+            self.killed = True
+            self.alive = False
+
+    class Executor:
+        def __init__(self):
+            self.process = Process()
+            self._processes = {1: self.process}
+            self.futures = []
+            self.shutdown_call = None
+
+        def submit(self, function, donor):
+            future = Future()
+            self.futures.append(future)
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_call = (wait, cancel_futures)
+
+    executor = Executor()
+    monkeypatch.setattr(
+        parallel,
+        "ProcessPoolExecutor",
+        lambda max_workers: executor,
+    )
+    monkeypatch.setattr(
+        parallel,
+        "as_completed",
+        lambda futures: tuple(futures),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        map_donors(_square, ["1", "2"], n_jobs=2)
+    assert all(future.cancelled for future in executor.futures)
+    assert executor.process.terminated
+    assert executor.process.killed
+    assert executor.shutdown_call == (False, True)

@@ -192,7 +192,7 @@ class GeometryQCResult:
                 record.spillover_context_reasons
             )
             rows.append(row)
-        return pd.DataFrame(rows)
+        return normalize_geometry_output(pd.DataFrame(rows))
 
     def verify_identity(self) -> None:
         payload = {
@@ -205,6 +205,26 @@ class GeometryQCResult:
         }
         if sha256_json(payload) != self.content_id:
             raise ContractError("geometry-QC result content_id is invalid")
+
+
+def normalize_geometry_output(frame: pd.DataFrame) -> pd.DataFrame:
+    """Give optional duplicate fields stable Parquet types across donors.
+
+    A donor without duplicate groups otherwise leaves both columns entirely
+    null, which Arrow infers as the ``null`` type. Donors with duplicates infer
+    ``string`` and ``bool`` instead, violating the cohort-wide schema contract.
+    """
+
+    required = {"duplicate_group", "duplicate_survivor"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ContractError(
+            f"geometry output is missing duplicate columns: {missing}"
+        )
+    output = frame.copy()
+    output["duplicate_group"] = output["duplicate_group"].astype("string")
+    output["duplicate_survivor"] = output["duplicate_survivor"].astype("boolean")
+    return output
 
 
 def _as_bool(series: pd.Series, column: str) -> np.ndarray:
@@ -292,6 +312,7 @@ def _duplicate_assignments(
     groups: Sequence[Sequence[int]],
     object_ids: np.ndarray,
     cell_area_px: np.ndarray,
+    survivor_eligible: np.ndarray,
 ) -> tuple[dict[int, str], set[int], set[int]]:
     group_by_index: dict[int, str] = {}
     survivors: set[int] = set()
@@ -300,11 +321,15 @@ def _duplicate_assignments(
         identifiers = sorted(str(object_ids[index]) for index in group)
         group_id = sha256_json(identifiers)[:16]
 
-        def survivor_key(index: int) -> tuple[float, str]:
+        def survivor_key(index: int) -> tuple[int, float, str]:
             pixels = cell_area_px[index]
-            # A duplicate that won the raster mask retains the most pixels.
+            # Prefer a detection that can actually represent a QC-viable cell.
+            # This matters when duplicated islet detections contain one copy
+            # without a usable nucleus. Among viable copies, the detection
+            # that won the most pixels in the final raster survives.
+            eligibility_rank = 0 if survivor_eligible[index] else 1
             raster_rank = -pixels if np.isfinite(pixels) else math.inf
-            return raster_rank, str(object_ids[index])
+            return eligibility_rank, raster_rank, str(object_ids[index])
 
         survivor = min(group, key=survivor_key)
         survivors.add(survivor)
@@ -395,8 +420,29 @@ def evaluate_geometry_metrics(
     valid_raster_area = np.isfinite(cell_area_px) & (cell_area_px > 0)
     valid_solidity = np.isfinite(solidity) & (solidity >= 0) & (solidity <= 1)
     valid_nucleus_raster = np.isfinite(nucleus_area_px) & (nucleus_area_px > 0)
+    expected_area_um2 = cell_area_px * config.pixel_area_um2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        raster_ratio = expected_area_um2 / cell_area_um2
+        nucleus_cell_ratio = nucleus_area_px / cell_area_px
+    valid_raster_scale = (
+        np.isfinite(raster_ratio)
+        & (raster_ratio >= config.min_raster_area_ratio)
+        & (raster_ratio <= config.max_raster_area_ratio)
+    )
 
     duplicate_candidates = cell_present & valid_reported_area & valid_raster_area
+    duplicate_survivor_eligible = (
+        cell_present
+        & (~missing_nucleus)
+        & valid_nucleus_raster
+        & valid_centroid
+        & valid_reported_area
+        & (cell_area_um2 >= config.min_cell_area_um2)
+        & valid_raster_area
+        & valid_raster_scale
+        & valid_solidity
+        & (solidity >= config.min_cell_solidity)
+    )
     groups = _connected_duplicate_groups(
         object_ids,
         x,
@@ -416,7 +462,10 @@ def evaluate_geometry_metrics(
             f"(examples={examples})"
         )
     duplicate_groups, duplicate_survivors, duplicate_losers = _duplicate_assignments(
-        groups, object_ids, cell_area_px
+        groups,
+        object_ids,
+        cell_area_px,
+        duplicate_survivor_eligible,
     )
 
     provisional = (
@@ -436,11 +485,6 @@ def evaluate_geometry_metrics(
         )
     median_area = float(np.median(cell_area_um2[provisional]))
     max_area = config.max_cell_area_median_multiple * median_area
-
-    expected_area_um2 = cell_area_px * config.pixel_area_um2
-    with np.errstate(invalid="ignore", divide="ignore"):
-        raster_ratio = expected_area_um2 / cell_area_um2
-        nucleus_cell_ratio = nucleus_area_px / cell_area_px
 
     flags: dict[str, np.ndarray] = {
         "missing_cell_geometry": missing_cell,
@@ -487,6 +531,10 @@ def evaluate_geometry_metrics(
         spillover_reasons = []
         if not cell_present[index]:
             spillover_reasons.append("missing_cell_geometry")
+        if missing_nucleus[index]:
+            spillover_reasons.append("missing_nucleus_geometry")
+        elif config.require_nucleus_geometry and not valid_nucleus_raster[index]:
+            spillover_reasons.append("nucleus_raster_empty")
         if not valid_raster_area[index]:
             spillover_reasons.append("raster_empty")
         if index in duplicate_losers:
@@ -559,4 +607,5 @@ __all__ = [
     "GeometryQCConfig",
     "GeometryQCResult",
     "evaluate_geometry_metrics",
+    "normalize_geometry_output",
 ]

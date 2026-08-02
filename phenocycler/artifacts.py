@@ -29,7 +29,7 @@ import subprocess
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 MANIFEST_VERSION = 1
@@ -520,12 +520,147 @@ class GeoJSONSummary:
         )
 
 
-def _geometry_present(geometry: Any) -> bool:
+def geometry_present(geometry: Any) -> bool:
     if not isinstance(geometry, Mapping) or not geometry.get("type"):
         return False
     if geometry.get("type") == "GeometryCollection":
         return bool(geometry.get("geometries"))
     return bool(geometry.get("coordinates"))
+
+
+class _JSONStream:
+    """Incrementally decode JSON values without retaining the complete file."""
+
+    def __init__(self, path: Path, *, chunk_size: int = 1024 * 1024):
+        self.path = path
+        self.handle = path.open(encoding="utf-8")
+        self.chunk_size = chunk_size
+        self.buffer = ""
+        self.position = 0
+        self.eof = False
+        self.decoder = json.JSONDecoder()
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def _read_more(self) -> bool:
+        if self.eof:
+            return False
+        if self.position:
+            self.buffer = self.buffer[self.position :]
+            self.position = 0
+        chunk = self.handle.read(self.chunk_size)
+        if not chunk:
+            self.eof = True
+            return False
+        self.buffer += chunk
+        return True
+
+    def _skip_whitespace(self) -> None:
+        while True:
+            while (
+                self.position < len(self.buffer)
+                and self.buffer[self.position].isspace()
+            ):
+                self.position += 1
+            if self.position < len(self.buffer) or not self._read_more():
+                return
+
+    def peek(self) -> str:
+        self._skip_whitespace()
+        if self.position >= len(self.buffer):
+            raise json.JSONDecodeError(
+                "unexpected end of JSON", self.buffer, self.position
+            )
+        return self.buffer[self.position]
+
+    def expect(self, token: str) -> None:
+        if self.peek() != token:
+            raise json.JSONDecodeError(
+                f"expected {token!r}", self.buffer, self.position
+            )
+        self.position += 1
+
+    def decode(self) -> Any:
+        self._skip_whitespace()
+        while True:
+            try:
+                value, end = self.decoder.raw_decode(self.buffer, self.position)
+            except json.JSONDecodeError:
+                if not self._read_more():
+                    raise
+            else:
+                self.position = end
+                return value
+
+    def require_end(self) -> None:
+        self._skip_whitespace()
+        if self.position < len(self.buffer) or self._read_more():
+            self._skip_whitespace()
+            if self.position < len(self.buffer):
+                raise json.JSONDecodeError(
+                    "extra data", self.buffer, self.position
+                )
+
+
+def iter_qupath_geojson_features(path: Path | str) -> Iterator[Mapping[str, Any]]:
+    """Stream one QuPath FeatureCollection feature at a time.
+
+    Cell exports in this cohort are several gigabytes each.  Using
+    :func:`json.load` expands the full coordinate payload in memory even though
+    manifest inspection and rasterization need only one feature at a time.
+    """
+
+    path = Path(path)
+    if not path.is_file():
+        raise GeometryContractError(f"GeoJSON is missing: {path}")
+    stream = _JSONStream(path)
+    top_level_type: Any = None
+    found_features = False
+    try:
+        stream.expect("{")
+        first_member = True
+        while stream.peek() != "}":
+            if not first_member:
+                stream.expect(",")
+            key = stream.decode()
+            if not isinstance(key, str):
+                raise GeometryContractError(
+                    f"{path}: top-level GeoJSON key is not a string"
+                )
+            stream.expect(":")
+            if key == "type":
+                top_level_type = stream.decode()
+            elif key == "features":
+                if found_features:
+                    raise GeometryContractError(
+                        f"{path}: duplicate top-level features member"
+                    )
+                found_features = True
+                stream.expect("[")
+                first_feature = True
+                while stream.peek() != "]":
+                    if not first_feature:
+                        stream.expect(",")
+                    feature = stream.decode()
+                    if not isinstance(feature, Mapping):
+                        raise GeometryContractError(
+                            f"{path}: feature is not an object"
+                        )
+                    yield feature
+                    first_feature = False
+                stream.expect("]")
+            else:
+                stream.decode()
+            first_member = False
+        stream.expect("}")
+        stream.require_end()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GeometryContractError(f"cannot read GeoJSON {path}: {exc}") from exc
+    finally:
+        stream.close()
+    if top_level_type != "FeatureCollection" or not found_features:
+        raise GeometryContractError(f"{path}: expected a GeoJSON FeatureCollection")
 
 
 def inspect_qupath_geojson(
@@ -536,30 +671,16 @@ def inspect_qupath_geojson(
 ) -> tuple[GeoJSONSummary, tuple[str, ...]]:
     """Validate a QuPath FeatureCollection and return its exact object universe."""
     path = Path(path)
-    if not path.is_file():
-        raise GeometryContractError(f"GeoJSON is missing: {path}")
-    try:
-        with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise GeometryContractError(f"cannot read GeoJSON {path}: {exc}") from exc
-    if payload.get("type") != "FeatureCollection" or not isinstance(
-        payload.get("features"), list
-    ):
-        raise GeometryContractError(f"{path}: expected a GeoJSON FeatureCollection")
-
     object_ids: list[str] = []
     primary_count = 0
     nucleus_count = 0
-    for index, feature in enumerate(payload["features"]):
-        if not isinstance(feature, Mapping):
-            raise GeometryContractError(f"{path}: feature {index} is not an object")
+    for index, feature in enumerate(iter_qupath_geojson_features(path)):
         object_id = feature.get("id")
         if object_id is None or not str(object_id):
             raise GeometryContractError(f"{path}: feature {index} has no object id")
         object_ids.append(str(object_id))
-        primary = _geometry_present(feature.get("geometry"))
-        nucleus = _geometry_present(feature.get("nucleusGeometry"))
+        primary = geometry_present(feature.get("geometry"))
+        nucleus = geometry_present(feature.get("nucleusGeometry"))
         primary_count += int(primary)
         nucleus_count += int(nucleus)
         if require_primary_geometry and not primary:
@@ -679,8 +800,11 @@ class QuPathImageManifest:
             cell_summary, cell_ids = inspect_qupath_geojson(
                 cell_path,
                 require_primary_geometry=True,
-                require_nucleus_geometry=True,
             )
+            if cell_summary.nucleus_geometry_count == 0:
+                raise GeometryContractError(
+                    f"{cell_path}: no feature has a usable nucleusGeometry"
+                )
             nucleus_summary = GeoJSONSummary(
                 feature_count=cell_summary.feature_count,
                 primary_geometry_count=cell_summary.nucleus_geometry_count,
@@ -776,8 +900,12 @@ class QuPathImageManifest:
             cell_summary, _ = inspect_qupath_geojson(
                 self.cell_geojson.path,
                 require_primary_geometry=True,
-                require_nucleus_geometry=True,
             )
+            if cell_summary.nucleus_geometry_count == 0:
+                raise GeometryContractError(
+                    f"{self.cell_geojson.path}: no feature has a usable "
+                    "nucleusGeometry"
+                )
             if cell_summary != self.cell_geometry:
                 raise StaleArtifactError("combined cell/nucleus geometry summary changed")
         else:
@@ -1866,9 +1994,11 @@ __all__ = [
     "canonical_json",
     "dataframe_content_sha256",
     "fingerprint_path",
+    "geometry_present",
     "hash_identifiers",
     "image_id_to_donor_id",
     "inspect_qupath_geojson",
+    "iter_qupath_geojson_features",
     "sha256_file",
     "sha256_sampled_file",
     "sha256_json",

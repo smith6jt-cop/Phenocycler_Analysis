@@ -26,8 +26,12 @@ def test_defaults_expose_only_the_current_stage_roots():
 
 def test_fixed_scientific_defaults():
     cfg = load_config()
+    assert cfg.typing_model_bundle is None
+    assert cfg.typing_model_promotion_manifest is None
     assert cfg.cells_min_cell_area == 5.0
     assert cfg.cell_qc_min_cell_area == 20.0
+    assert cfg.cell_qc_missing_geometry_policy == "exclude"
+    assert cfg.cell_qc_duplicate_policy == "deterministic_keep"
     assert cfg.redsea_comp_mode == 1
     assert cfg.redsea_norm_form == "donor"
     assert cfg.redsea_alpha == 1.0
@@ -39,6 +43,23 @@ def test_keyword_and_unknown_overrides():
         load_config(not_a_field=1)
 
 
+def test_pipeline_worker_limits_are_loaded_and_validated(tmp_path):
+    ini = tmp_path / "config.ini"
+    ini.write_text(
+        "[compute]\n"
+        "geometry_workers = 2\n"
+        "redsea_workers = 1\n"
+        "downstream_workers = 6\n"
+    )
+    cfg = load_config(ini)
+    assert cfg.pipeline_geometry_workers == 2
+    assert cfg.pipeline_redsea_workers == 1
+    assert cfg.pipeline_downstream_workers == 6
+
+    with pytest.raises(ValueError, match="worker limits"):
+        load_config(ini, pipeline_geometry_workers=0)
+
+
 def test_relative_paths_resolve_against_config_file(tmp_path):
     ini = tmp_path / "config.ini"
     ini.write_text(
@@ -47,12 +68,29 @@ def test_relative_paths_resolve_against_config_file(tmp_path):
         "qupath_manifest = inputs/qupath.json\n"
         "marker_registry = policy/markers.json\n"
         "typing_rules = policy/types.json\n"
+        "[typing]\n"
+        "model_bundle = models/typing-v1.json\n"
+        "promotion_manifest = models/typing-v1-promotion.json\n"
     )
     cfg = load_config(ini)
     assert cfg.data_dir == (tmp_path / "output").resolve()
     assert cfg.qupath_manifest == (tmp_path / "inputs/qupath.json").resolve()
     assert cfg.marker_registry == (tmp_path / "policy/markers.json").resolve()
     assert cfg.typing_rules == (tmp_path / "policy/types.json").resolve()
+    assert cfg.typing_model_bundle == (
+        tmp_path / "models/typing-v1.json"
+    ).resolve()
+    assert cfg.typing_model_promotion_manifest == (
+        tmp_path / "models/typing-v1-promotion.json"
+    ).resolve()
+
+
+def test_typing_bundle_and_promotion_must_be_configured_together(tmp_path):
+    ini = tmp_path / "config.ini"
+    ini.write_text("[typing]\nmodel_bundle = model.json\n")
+
+    with pytest.raises(ValueError, match="configured together"):
+        load_config(ini)
 
 
 def test_environment_overrides(monkeypatch, tmp_path):
@@ -104,3 +142,13 @@ def test_integration_mode_is_validated():
     assert load_config(integration_mode="same_slide").integration_mode == "same_slide"
     with pytest.raises(ValueError, match="sequential"):
         load_config(integration_mode="bogus")
+
+
+def test_invalid_missing_geometry_policy_is_rejected():
+    with pytest.raises(ValueError, match="missing_geometry_policy"):
+        load_config(cell_qc_missing_geometry_policy="accept")
+
+
+def test_invalid_duplicate_policy_is_rejected():
+    with pytest.raises(ValueError, match="duplicate_policy"):
+        load_config(cell_qc_duplicate_policy="accept_all")
