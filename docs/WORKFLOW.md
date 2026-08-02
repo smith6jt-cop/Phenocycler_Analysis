@@ -29,7 +29,7 @@ not manufacture completeness by converting missing evidence to negative or
 
 ## Authorities and boundaries
 
-Four versioned inputs govern a run:
+Four versioned inputs always govern a run:
 
 1. The QuPath cohort manifest owns raw-data identity, donor membership, image
    mapping, geometry, panel, channel, pixel calibration, and segmentation
@@ -41,6 +41,15 @@ Four versioned inputs govern a run:
    subtype anchors, support markers, exclusions, and parent relationships.
 4. The configuration owns fixed geometry, REDSEA, calibration, and compute
    parameters.
+
+Probabilistic production typing adds one inseparable authorization pair: an
+immutable threshold-frozen model bundle and its separately signed promotion
+manifest. Both paths must be configured together; the manifest must authorize
+that exact bundle, donor split, registries, calibration source, validation and
+locked-test reports, replay code, and numerical runtime. Leaving both paths
+blank is the rules-only default. See
+[`PROBABILISTIC_RESCUE.md`](PROBABILISTIC_RESCUE.md) for the fitting and release
+contract.
 
 The command-line pipeline and its stage APIs are the production writers.
 Notebooks may read and visualize immutable artifacts, help review audits, and
@@ -395,13 +404,28 @@ Mesenchymal
 Each class has curated anchors, support markers, and exclusions. The additive
 multinomial model has no intercept, so absence of positive evidence does not
 create a class through a donor-specific prevalence prior. Coefficient signs
-are constrained by the biological roles. The standard pipeline constructs a
-transparent, unfitted classifier from the fixed rule weights; it does not fit
-weights to the donor being classified.
+are constrained by the biological roles.
 
-Typing probabilities are softmax class scores derived from the calibrated
-marker evidence. They are not empirical marker tail probabilities, p-values,
-or an additional family-wise error guarantee.
+The production default is `typing_mode=rules_only`: the type stage constructs
+a transparent, unfitted classifier from fixed registry weights and never fits
+the donor being classified. This lane accepts authoritative anchors, resolved
+`Other`, and explicit uncertainty states, but it cannot issue a non-anchor
+`inferred` call because it has no promoted donor-bootstrap stability model.
+
+The optional `typing_mode=probabilistic_bundle` lane is enabled only when
+`[typing] model_bundle` and `promotion_manifest` are both configured. Its
+bundle was fitted outside production on development/calibration donors, owns
+frozen probability/margin/stability gates, and supplies whole-development-
+donor bootstrap stability. The public production API rejects an unsigned or
+unpromoted bundle. Candidate evaluation uses the visibly distinct
+`typing_mode=probabilistic_candidate` lane and cannot authorize production.
+The ordinary type stage never fits or retunes a model.
+
+Rules-only softmax values are explicitly uncalibrated scores. Promoted-bundle
+values are donor/class-balanced, held-out-temperature-scaled probabilities,
+not expected population prevalence. Empirical marker tail probabilities and
+p-values remain audit quantities and are never substituted for model support.
+Every output row stamps its score semantics and model provenance.
 
 ### Broad decision
 
@@ -417,14 +441,15 @@ For each cell:
   negative;
 - missing or invalid required models without positive evidence produce
   `unavailable`;
-- a non-anchor inference requires probability at least 0.80, margin at least
-  0.25, and independently supplied grouped-donor stability at least 0.90;
+- a non-anchor inference is available only through a promoted bundle and
+  requires valid positive support, a unique winner, and all frozen
+  probability, margin, and donor-bootstrap stability gates;
 - otherwise the result remains `ambiguous`.
 
-The standard pipeline does not invent stability from the cells it is
-classifying, so its production wrapper does not issue a non-anchor `inferred`
-call without a separately validated stability input. The schema reserves
-`inferred` for that versioned extension.
+The type stage does not invent stability from the cells it is classifying.
+Without the exact verified bundle/promotion pair, non-anchor cells remain
+`ambiguous` or `unavailable`; with it, `inferred` is emitted only after every
+frozen gate passes. A reviewed label never overwrites a production cell.
 
 The output retains the best broad candidate and ranked probabilities even when
 acceptance fails. This makes ambiguity useful for review and future rules
@@ -456,8 +481,10 @@ Two rules are locked in validation:
   E-cadherin.
 
 The full output preserves both broad and subtype status, reason, confidence,
-margin, stability, anchor/conflict evidence, alternatives, registry
-fingerprint, and typing-rules fingerprint.
+margin, stability, per-gate pass/failure fields, anchor/conflict evidence,
+alternatives, score semantics, typing mode, model provenance, registry
+fingerprint, and typing-rules fingerprint. The run and type-stage manifests
+separately bind the verified promotion artifact.
 
 ## Stage 8: keep process state orthogonal
 
@@ -627,9 +654,13 @@ receipt validates. A receipt records its donor, method, scientific
 configuration, relevant code hash, upstream receipt or manifest identifiers,
 output schema, row count, UUID-universe hash, file fingerprints, and any
 donor-local audit sidecar. Writes use a temporary file and atomic rename; the
-receipt is published last. Cohort stage manifests remain the archival and
-notebook contract. They are sealed from the complete receipt set and
-fingerprint every receipt.
+receipt is published last. Cohort stage manifests remain the archival
+completion contract. They are sealed from the complete receipt set and
+fingerprint every receipt. During an active queue, the calibration review
+notebook may instead read a completed donor only after validating that donor's
+receipt tree; it uses donor-local audit sidecars until the sealed cohort audit
+is available. This read path does not authorize notebook-side stage execution
+or make a partial cohort complete.
 
 The queue has three dedicated process pools and enforces both a total task
 limit and group limits:

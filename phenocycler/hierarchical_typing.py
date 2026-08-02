@@ -13,12 +13,16 @@ This module is the single auditable implementation of identity assignment:
 * stability is estimated by resampling whole donors, never individual cells;
 * subtypes are evaluated only after a parent broad type has been accepted.
 
-The canonical input is one row per ``donor_id``/``object_id``/``marker``.  A row
-may carry, in precedence order, ``evidence_probability``, ``tail_probability``
-(an upper-tail null p-value by default), ``log2_ratio``, or a categorical
-``state``.  The output retains a best candidate for every cell with usable
-identity evidence even when the authoritative assignment is ``Ambiguous``,
-``Other``, or ``Unavailable``.
+The canonical input is one row per ``donor_id``/``object_id``/``marker``.
+Production evidence uses a categorical state plus ``log2_threshold_ratio``.
+Typing converts that signed threshold coordinate to bounded nonnegative
+support and masks invalid/indeterminate evidence before computing logits.
+Empirical background-tail p-values and their ``1 - p`` summaries remain audit
+quantities, not expression posteriors.  Explicit ``evidence_probability``
+without a calibrated state/threshold coordinate remains supported for small
+numeric-only pilots.  The output retains a best candidate for every cell with
+usable identity evidence even when the authoritative assignment is
+``Ambiguous``, ``Other``, or ``Unavailable``.
 
 Registry schema
 ---------------
@@ -58,24 +62,24 @@ exactly zero.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from collections.abc import Mapping, Sequence
-from typing import Any
-from pathlib import Path
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import expit, logsumexp
 
-
 DONOR_COLUMN = "donor_id"
 OBJECT_COLUMN = "object_id"
 MARKER_COLUMN = "marker"
 KEY_COLUMNS = (DONOR_COLUMN, OBJECT_COLUMN)
 DEFAULT_TYPING_RULES_PATH = Path(__file__).with_name("typing_rules.json")
+FEATURE_SCHEMA_VERSION = "state-safe-threshold-support-v1"
 
 # Export-facing spelling.  ``anchor`` means an authoritative curated anchor,
 # not merely the classifier's largest coefficient.
@@ -524,22 +528,185 @@ def _canonical_states(series: pd.Series) -> pd.Series:
     return state
 
 
+def _threshold_relative_support(values: pd.Series) -> pd.Series:
+    """Map a signed log2 threshold coordinate to bounded positive support.
+
+    The centered logistic transform
+
+    ``max(0, 2 * sigmoid(log(2) * ratio) - 1)``
+
+    is zero at and below the donor-local threshold, remains monotone above the
+    threshold, and approaches one without allowing extreme intensities to
+    dominate an additive logit.  It intentionally is not called an expression
+    posterior.
+    """
+
+    numeric = pd.to_numeric(values, errors="coerce").astype(float)
+    if np.isinf(numeric.to_numpy()).any():
+        raise ValueError("log2 threshold-relative evidence must be finite")
+    support = pd.Series(np.nan, index=numeric.index, dtype=float)
+    finite = numeric.notna()
+    transformed = 2.0 * expit(np.log(2.0) * numeric.loc[finite]) - 1.0
+    support.loc[finite] = np.maximum(transformed, 0.0)
+    return support
+
+
+def _state_safe_marker_support(
+    frame: pd.DataFrame,
+    state: pd.Series,
+    *,
+    ratio_columns: Sequence[str],
+    score_columns: Sequence[str],
+    tail_columns: Sequence[str],
+    audit_only_columns: Sequence[str],
+    explicit_valid_column: str | None,
+    tail_probability_is_pvalue: bool,
+    context: str,
+) -> pd.DataFrame:
+    """Resolve one marker to a state-safe feature and audit diagnostics."""
+
+    all_columns = tuple(
+        dict.fromkeys(
+            (*ratio_columns, *score_columns, *tail_columns, *audit_only_columns)
+        )
+    )
+    numeric: dict[str, pd.Series] = {}
+    for column in all_columns:
+        if column not in frame:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").astype(float)
+        if np.isinf(values.to_numpy()).any():
+            raise ValueError(f"{context}: {column} must be finite where present")
+        numeric[column] = values
+
+    probability_like = [
+        column
+        for column in (*score_columns, *tail_columns, *audit_only_columns)
+        if column in numeric
+    ]
+    for column in probability_like:
+        values = numeric[column]
+        outside = values.notna() & ((values < 0.0) | (values > 1.0))
+        if outside.any():
+            bad = values.loc[outside].head(5).tolist()
+            raise ValueError(
+                f"{context}: {column} values must lie in [0, 1]; examples: {bad}"
+            )
+
+    ratio = pd.Series(np.nan, index=frame.index, dtype=float)
+    source = pd.Series("", index=frame.index, dtype=object)
+    for column in ratio_columns:
+        if column not in numeric:
+            continue
+        candidate = numeric[column]
+        take = ratio.isna() & candidate.notna()
+        ratio.loc[take] = candidate.loc[take]
+        source.loc[take] = column
+
+    raw_support = _threshold_relative_support(ratio)
+    no_ratio = ratio.isna()
+    positive_fallback = no_ratio & state.eq("positive")
+    negative_fallback = no_ratio & state.eq("negative")
+    raw_support.loc[positive_fallback] = 1.0
+    raw_support.loc[negative_fallback] = 0.0
+    source.loc[(source == "") & (positive_fallback | negative_fallback)] = "state"
+
+    # ``evidence_probability`` remains an explicit pilot interface only when a
+    # calibrated threshold coordinate and categorical decision are both absent.
+    # A tail p-value can enter this path solely when the caller explicitly says
+    # it is already a score (``tail_probability_is_pvalue=False``).
+    usable_scores = list(score_columns)
+    if not tail_probability_is_pvalue:
+        usable_scores.extend(tail_columns)
+    for column in usable_scores:
+        if column not in numeric:
+            continue
+        candidate = numeric[column]
+        take = raw_support.isna() & state.eq("") & candidate.notna()
+        raw_support.loc[take] = candidate.loc[take]
+        source.loc[take] = column
+
+    # Keep an explicit audit trail when a background-tail p-value is the only
+    # numeric quantity.  It is deliberately not converted to ``1 - p``.
+    if tail_probability_is_pvalue:
+        for column in tail_columns:
+            if column not in numeric:
+                continue
+            take = (source == "") & numeric[column].notna()
+            source.loc[take] = f"{column}_audit_only"
+    for column in audit_only_columns:
+        if column not in numeric:
+            continue
+        take = (source == "") & numeric[column].notna()
+        source.loc[take] = f"{column}_audit_only"
+
+    # If a state blocks a numeric pilot score, retain the source for diagnosis
+    # even though the value cannot enter a logit.
+    for column in score_columns:
+        if column not in numeric:
+            continue
+        take = (source == "") & numeric[column].notna()
+        source.loc[take] = column
+    source.loc[(source == "") & state.ne("")] = "state"
+
+    numeric_available = pd.Series(False, index=frame.index, dtype=bool)
+    for values in numeric.values():
+        numeric_available |= values.notna()
+    available = state.ne("unavailable") & (state.ne("") | numeric_available)
+
+    model_valid = raw_support.notna() & ~state.isin(
+        {"indeterminate", "unavailable"}
+    )
+    if explicit_valid_column is not None and explicit_valid_column in frame:
+        explicit = frame[explicit_valid_column]
+        if explicit.isna().any() or not explicit.isin([True, False, 0, 1]).all():
+            raise ValueError(
+                f"{context}: {explicit_valid_column} must contain explicit booleans"
+            )
+        model_valid &= explicit.astype(bool)
+
+    # A categorical negative is authoritative for feature construction even if
+    # a malformed pilot row also carries a large numeric score. Invalid and
+    # indeterminate-but-measurable evidence is represented as zero; unavailable
+    # or wholly absent evidence remains NaN for the assignment-state contract.
+    support = raw_support.copy()
+    support.loc[state.eq("negative")] = 0.0
+    support.loc[available & ~model_valid] = 0.0
+    support.loc[~available] = np.nan
+    logit_eligible = model_valid & support.notna()
+
+    return pd.DataFrame(
+        {
+            "typing_support": support,
+            "evidence_probability": support,
+            "evidence_available": available,
+            "model_valid": model_valid,
+            "logit_eligible": logit_eligible,
+            "evidence_source": source,
+        },
+        index=frame.index,
+    )
+
+
 def prepare_cell_marker_evidence(
     evidence: pd.DataFrame,
     *,
     tail_probability_is_pvalue: bool = True,
 ) -> pd.DataFrame:
-    """Normalize heterogeneous long-form evidence to one probability and validity contract.
+    """Normalize long-form evidence to state-safe typing support.
 
-    Numeric source precedence is ``evidence_probability`` then
-    ``tail_probability`` then ``log2_ratio``.  With the default interpretation,
-    ``tail_probability`` is the upper-tail null p-value and is converted to
-    ``1 - p``.  ``log2_ratio`` is mapped to ``ratio / (1 + ratio)`` so a ratio of
-    one is neutral (0.5) and a four-fold excess is 0.8.
+    Production precedence is ``log2_threshold_ratio`` (or its pilot alias
+    ``log2_ratio``), then categorical positive/negative fallback.  An explicit
+    numeric ``evidence_probability`` is used only when neither calibrated
+    source is present, preserving numeric-only pilots. ``expression_probability``
+    (the calibration artifact's ``1 - p`` field) and default upper-tail
+    p-values are validated and retained as audit sources but never used as
+    expression posteriors.
 
-    ``unavailable`` always removes the numeric value.  ``indeterminate`` retains
-    a numeric value for candidate ranking but cannot establish an authoritative
-    anchor or satisfy the strict ``Other`` contract.
+    Invalid and indeterminate evidence is zero in ``typing_support`` and
+    ``evidence_probability`` so it cannot affect a logit.  Unavailable or absent
+    evidence remains NaN. ``logit_eligible`` makes this pass/fail distinction
+    explicit for diagnostics.
     """
     if not isinstance(evidence, pd.DataFrame):
         raise TypeError("evidence must be a pandas DataFrame")
@@ -554,56 +721,26 @@ def prepare_cell_marker_evidence(
         sample = d.loc[duplicate, [*KEY_COLUMNS, MARKER_COLUMN]].head(5).to_dict("records")
         raise ValueError(f"duplicate donor/object/marker evidence rows; examples: {sample}")
 
-    probability = pd.Series(np.nan, index=d.index, dtype=float)
-
-    def use_numeric(column: str, transform=None) -> None:
-        nonlocal probability
-        if column not in d:
-            return
-        values = pd.to_numeric(d[column], errors="coerce").astype(float)
-        if transform is not None:
-            values = transform(values)
-        fill = probability.isna() & values.notna()
-        probability.loc[fill] = values.loc[fill]
-
-    use_numeric("evidence_probability")
-    use_numeric(
-        "tail_probability",
-        (lambda x: 1.0 - x) if tail_probability_is_pvalue else (lambda x: x),
-    )
-    use_numeric("log2_ratio", lambda x: expit(np.log(2.0) * x))
-
     state = _canonical_states(d["state"]) if "state" in d else pd.Series("", index=d.index)
-    probability.loc[probability.isna() & (state == "positive")] = 1.0
-    probability.loc[probability.isna() & (state == "negative")] = 0.0
-
-    finite = probability.notna()
-    outside = finite & ((probability < 0.0) | (probability > 1.0))
-    if outside.any():
-        bad = probability.loc[outside].head(5).tolist()
-        raise ValueError(f"evidence probabilities must lie in [0, 1]; examples: {bad}")
-    probability.loc[state == "unavailable"] = np.nan
-
-    # Numeric evidence with no categorical state is a valid model result.
-    model_valid = probability.notna() & ~state.isin({"indeterminate", "unavailable"})
-    available = probability.notna()
-    source = pd.Series("", index=d.index, dtype=object)
-    for column in ("evidence_probability", "tail_probability", "log2_ratio"):
-        if column in d:
-            values = pd.to_numeric(d[column], errors="coerce")
-            source[(source == "") & values.notna()] = column
-    source[(source == "") & state.isin({"positive", "negative"})] = "state"
+    contract = _state_safe_marker_support(
+        d,
+        state,
+        ratio_columns=("log2_threshold_ratio", "log2_ratio"),
+        score_columns=("evidence_probability",),
+        tail_columns=("empirical_tail_probability", "tail_probability"),
+        audit_only_columns=("expression_probability",),
+        explicit_valid_column="model_valid",
+        tail_probability_is_pvalue=tail_probability_is_pvalue,
+        context="cell-marker evidence",
+    )
 
     return pd.DataFrame(
         {
             DONOR_COLUMN: d[DONOR_COLUMN],
             OBJECT_COLUMN: d[OBJECT_COLUMN],
             MARKER_COLUMN: d[MARKER_COLUMN],
-            "evidence_probability": probability,
             "state": state,
-            "evidence_available": available,
-            "model_valid": model_valid,
-            "evidence_source": source,
+            **{column: contract[column] for column in contract.columns},
         }
     )
 
@@ -930,7 +1067,7 @@ def _evidence_matrices(
     prepared: pd.DataFrame,
     markers: Sequence[str],
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
-    """Return keys plus aligned probability/state/model-valid matrices."""
+    """Return keys plus aligned support/state/model-valid matrices."""
     markers = tuple(markers)
     keys = prepared.loc[:, list(KEY_COLUMNS)].drop_duplicates(ignore_index=True)
     key_index = pd.MultiIndex.from_frame(keys)
@@ -944,10 +1081,13 @@ def _evidence_matrices(
             return wide.astype("boolean").fillna(False).to_numpy(dtype=bool)
         return wide.to_numpy()
 
-    probability = pivot("evidence_probability", None).astype(float)
+    support_column = (
+        "typing_support" if "typing_support" in prepared else "evidence_probability"
+    )
+    support = pivot(support_column, None).astype(float)
     state = pivot("state", "")
     valid = pivot("model_valid", False)
-    return keys, probability, state, valid
+    return keys, support, state, valid
 
 
 def wide_evidence_matrices(
@@ -958,11 +1098,12 @@ def wide_evidence_matrices(
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
     """Read the production one-row-per-cell calibration schema directly.
 
-    Each marker may provide ``<marker>__expression_probability`` (preferred),
-    ``__evidence_probability``, ``__empirical_tail_probability`` (an upper-tail
-    null p-value), ``__log2_threshold_ratio`` or ``__state``.  This is the wide
-    equivalent of :func:`prepare_cell_marker_evidence`, but it avoids expanding
-    a million-cell donor into tens of millions of temporary rows.
+    Each marker may provide ``<marker>__log2_threshold_ratio`` (preferred),
+    ``__state``, explicit numeric-only ``__evidence_probability``, and
+    ``__expression_probability``/``__empirical_tail_probability`` for audit.
+    This is the wide equivalent of
+    :func:`prepare_cell_marker_evidence`, but it avoids expanding a
+    million-cell donor into tens of millions of temporary rows.
     """
 
     if not isinstance(evidence, pd.DataFrame):
@@ -982,7 +1123,7 @@ def wide_evidence_matrices(
     keys = d.loc[:, list(KEY_COLUMNS)].reset_index(drop=True)
     n = len(d)
     marker_tuple = tuple(markers)
-    probability = np.full((n, len(marker_tuple)), np.nan, dtype=float)
+    support = np.full((n, len(marker_tuple)), np.nan, dtype=float)
     state = np.full((n, len(marker_tuple)), "", dtype=object)
     valid = np.zeros((n, len(marker_tuple)), dtype=bool)
 
@@ -994,52 +1135,61 @@ def wide_evidence_matrices(
             if state_column in d
             else pd.Series("", index=d.index, dtype=object)
         )
-        values = pd.Series(np.nan, index=d.index, dtype=float)
-        sources = (
-            (prefix + "expression_probability", None),
-            (prefix + "evidence_probability", None),
-            (
-                prefix + "empirical_tail_probability",
-                (lambda x: 1.0 - x)
-                if tail_probability_is_pvalue
-                else (lambda x: x),
-            ),
-            (
-                prefix + "log2_threshold_ratio",
-                lambda x: expit(np.log(2.0) * x),
-            ),
+        contract = _state_safe_marker_support(
+            d,
+            marker_state,
+            ratio_columns=(prefix + "log2_threshold_ratio",),
+            score_columns=(prefix + "evidence_probability",),
+            tail_columns=(prefix + "empirical_tail_probability",),
+            audit_only_columns=(prefix + "expression_probability",),
+            explicit_valid_column=prefix + "model_valid",
+            tail_probability_is_pvalue=tail_probability_is_pvalue,
+            context=marker,
         )
-        for column, transform in sources:
-            if column not in d:
-                continue
-            candidate = pd.to_numeric(d[column], errors="coerce").astype(float)
-            if transform is not None:
-                candidate = transform(candidate)
-            take = values.isna() & candidate.notna()
-            values.loc[take] = candidate.loc[take]
-        values.loc[values.isna() & (marker_state == "positive")] = 1.0
-        values.loc[values.isna() & (marker_state == "negative")] = 0.0
-        outside = values.notna() & ((values < 0.0) | (values > 1.0))
-        if outside.any():
-            raise ValueError(
-                f"{marker}: evidence probabilities must lie in [0, 1]"
-            )
-        values.loc[marker_state == "unavailable"] = np.nan
-        inferred_valid = values.notna() & ~marker_state.isin(
-            {"indeterminate", "unavailable"}
-        )
-        explicit_valid_column = prefix + "model_valid"
-        if explicit_valid_column in d:
-            explicit = d[explicit_valid_column]
-            if explicit.isna().any() or not explicit.isin([True, False, 0, 1]).all():
-                raise ValueError(
-                    f"{explicit_valid_column} must contain explicit booleans"
-                )
-            inferred_valid &= explicit.astype(bool)
-        probability[:, index] = values.to_numpy(dtype=float)
+        support[:, index] = contract["typing_support"].to_numpy(dtype=float)
         state[:, index] = marker_state.to_numpy(dtype=object)
-        valid[:, index] = inferred_valid.to_numpy(dtype=bool)
-    return keys, probability, state, valid
+        valid[:, index] = contract["model_valid"].to_numpy(dtype=bool)
+    return keys, support, state, valid
+
+
+def evidence_feature_matrix(
+    evidence: pd.DataFrame,
+    markers: Sequence[str],
+    *,
+    tail_probability_is_pvalue: bool = True,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
+    """Return parsed keys and a finite state-safe feature matrix.
+
+    ``features`` is ready for repeated matrix multiplication by fitted or
+    bootstrap coefficient matrices: missing, invalid, indeterminate, and
+    unavailable entries are all zero. ``state`` and ``valid`` retain the
+    categorical decision and per-marker pass mask needed for authoritative
+    anchors and strict ``Other``/``Unavailable`` decisions. Long and production
+    wide evidence use the same transformer and preserve the requested marker
+    order.
+    """
+
+    if not isinstance(evidence, pd.DataFrame):
+        raise TypeError("evidence must be a pandas DataFrame")
+    marker_tuple = tuple(str(marker) for marker in markers)
+    if len(set(marker_tuple)) != len(marker_tuple) or any(not marker for marker in marker_tuple):
+        raise ValueError("markers must be unique non-empty names")
+    if MARKER_COLUMN in evidence:
+        prepared = prepare_cell_marker_evidence(
+            evidence,
+            tail_probability_is_pvalue=tail_probability_is_pvalue,
+        )
+        keys, support, state, valid = _evidence_matrices(prepared, marker_tuple)
+    else:
+        keys, support, state, valid = wide_evidence_matrices(
+            evidence,
+            marker_tuple,
+            tail_probability_is_pvalue=tail_probability_is_pvalue,
+        )
+    features = np.where(valid & np.isfinite(support), support, 0.0)
+    if not np.isfinite(features).all() or (features < 0.0).any() or (features > 1.0).any():
+        raise AssertionError("state-safe typing features must be finite and lie in [0, 1]")
+    return keys, features, state, valid
 
 
 def balanced_seed_weights(
@@ -1069,6 +1219,26 @@ def balanced_seed_weights(
     # Floating error only; normalization makes the public invariant exact enough
     # for downstream audit tables.
     return weights / weights.sum()
+
+
+def _finite_softmax(logits: np.ndarray, *, context: str) -> np.ndarray:
+    """Compute softmax probabilities and fail closed on numerical corruption."""
+
+    values = np.asarray(logits, dtype=float)
+    if values.ndim != 2 or values.shape[1] < 1:
+        raise ValueError(f"{context} logits must be a non-empty 2D class matrix")
+    if not np.isfinite(values).all():
+        raise FloatingPointError(f"{context} produced non-finite logits")
+    log_probability = values - logsumexp(values, axis=1, keepdims=True)
+    probability = np.exp(log_probability)
+    if (
+        not np.isfinite(probability).all()
+        or (probability < 0).any()
+        or (probability > 1).any()
+        or not np.allclose(probability.sum(axis=1), 1.0, atol=1e-12)
+    ):
+        raise FloatingPointError(f"{context} produced invalid posterior probabilities")
+    return probability
 
 
 @dataclass(frozen=True)
@@ -1105,14 +1275,13 @@ class AdditiveMultinomialModel:
         return pd.DataFrame(self.coefficients, index=self.classes, columns=self.markers)
 
     def predict_proba(self, evidence: pd.DataFrame) -> pd.DataFrame:
-        prepared = prepare_cell_marker_evidence(
+        keys, x, _state, _valid = evidence_feature_matrix(
             evidence,
+            self.markers,
             tail_probability_is_pvalue=self.tail_probability_is_pvalue,
         )
-        keys, probability, _state, _valid = _evidence_matrices(prepared, self.markers)
-        x = np.nan_to_num(probability, nan=0.0)
         logits = x @ np.asarray(self.coefficients, dtype=float).T
-        probs = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
+        probs = _finite_softmax(logits, context=f"{self.level} model")
         return pd.concat(
             [keys.reset_index(drop=True), pd.DataFrame(probs, columns=self.classes)],
             axis=1,
@@ -1213,15 +1382,15 @@ def fit_constrained_classifier(
         max_abs_weight=max_abs_weight,
         tail_probability_is_pvalue=tail_probability_is_pvalue,
     )
-    prepared = prepare_cell_marker_evidence(
+    keys, features, _state, _valid = evidence_feature_matrix(
         evidence,
+        initial.markers,
         tail_probability_is_pvalue=tail_probability_is_pvalue,
     )
-    keys, probability, _state, _valid = _evidence_matrices(prepared, initial.markers)
     feature_frame = pd.concat(
         [
             keys.reset_index(drop=True),
-            pd.DataFrame(np.nan_to_num(probability, nan=0.0), columns=initial.markers),
+            pd.DataFrame(features, columns=initial.markers),
         ],
         axis=1,
     )
@@ -1438,25 +1607,52 @@ def _assign_level(
             tail_probability_is_pvalue=model.tail_probability_is_pvalue,
         )
     marker_index = {marker: i for i, marker in enumerate(model.markers)}
-    x = np.nan_to_num(probability, nan=0.0)
+    x = np.where(valid & np.isfinite(probability), probability, 0.0)
+    valid_positive_support = np.zeros((len(keys), len(model.classes)), dtype=bool)
+    for ci, rule in enumerate(model.rules):
+        for marker in dict.fromkeys(rule.anchor_markers + rule.support_markers):
+            mi = marker_index[marker]
+            valid_positive_support[:, ci] |= valid[:, mi] & (
+                (state[:, mi] == "positive") | (x[:, mi] > 0.0)
+            )
     logits = x @ np.asarray(model.coefficients, dtype=float).T
-    posterior = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
+    posterior = _finite_softmax(logits, context=f"{prefix} assignment model")
     n = len(keys)
 
     evidence_exists = np.isfinite(probability).any(axis=1)
-    order = np.argsort(-posterior, axis=1, kind="stable")
+    order = np.argsort(-logits, axis=1, kind="stable")
     best_index = order[:, 0]
     best_probability = posterior[np.arange(n), best_index]
     if len(model.classes) > 1:
         second_probability = posterior[np.arange(n), order[:, 1]]
+        winner_logit_gap = (
+            logits[np.arange(n), best_index]
+            - logits[np.arange(n), order[:, 1]]
+        )
+        inference_unique_winner_pass = winner_logit_gap > 1e-12
     else:
         second_probability = np.zeros(n, dtype=float)
+        inference_unique_winner_pass = np.ones(n, dtype=bool)
     margin = best_probability - second_probability
     best_candidate = np.asarray(model.classes, dtype=object)[best_index]
     best_candidate = np.where(evidence_exists, best_candidate, "")
     best_probability = np.where(evidence_exists, best_probability, np.nan)
     margin = np.where(evidence_exists, margin, np.nan)
     aligned_stability = _align_stability(keys, stability, prefix=prefix)
+    inference_probability_pass = (
+        np.isfinite(best_probability)
+        & (best_probability >= thresholds.inferred_probability)
+    )
+    inference_margin_pass = np.isfinite(margin) & (
+        margin >= thresholds.inferred_margin
+    )
+    inference_stability_pass = np.isfinite(aligned_stability) & (
+        aligned_stability >= thresholds.inferred_stability
+    )
+    inference_valid_evidence_pass = (
+        evidence_exists
+        & valid_positive_support[np.arange(n), best_index]
+    )
 
     anchor_hits: list[list[str]] = [[] for _ in range(n)]
     anchor_classes: list[list[str]] = [[] for _ in range(n)]
@@ -1553,10 +1749,11 @@ def _assign_level(
             reason[row] = "all_required_models_valid_and_negative"
             continue
         if (
-            best_probability[row] >= thresholds.inferred_probability
-            and margin[row] >= thresholds.inferred_margin
-            and np.isfinite(aligned_stability[row])
-            and aligned_stability[row] >= thresholds.inferred_stability
+            inference_unique_winner_pass[row]
+            and inference_probability_pass[row]
+            and inference_margin_pass[row]
+            and inference_stability_pass[row]
+            and inference_valid_evidence_pass[row]
         ):
             label[row] = best_candidate[row]
             status[row] = INFERRED
@@ -1569,10 +1766,68 @@ def _assign_level(
             continue
         label[row] = AMBIGUOUS_LABEL
         status[row] = AMBIGUOUS
-        reason[row] = "posterior_margin_or_stability_failed"
+        reason[row] = (
+            "nonunique_model_winner"
+            if not inference_unique_winner_pass[row]
+            else (
+                "valid_positive_support_required"
+                if not inference_valid_evidence_pass[row]
+                else "posterior_margin_or_stability_failed"
+            )
+        )
 
     if np.any(evidence_exists & (best_candidate == "")):
         raise AssertionError("a best candidate is required wherever identity evidence exists")
+
+    # Recompute the public pass diagnostics after authoritative-anchor handling,
+    # which can intentionally replace the posterior's original best candidate.
+    class_index = {class_name: index for index, class_name in enumerate(model.classes)}
+    final_best_index = best_index.copy()
+    for row in np.flatnonzero(evidence_exists):
+        final_best_index[row] = class_index[str(best_candidate[row])]
+    probability_pass = np.isfinite(best_probability) & (
+        best_probability >= thresholds.inferred_probability
+    )
+    margin_pass = np.isfinite(margin) & (margin >= thresholds.inferred_margin)
+    stability_pass = np.isfinite(aligned_stability) & (
+        aligned_stability >= thresholds.inferred_stability
+    )
+    valid_evidence_pass = (
+        evidence_exists
+        & valid_positive_support[np.arange(n), final_best_index]
+    )
+    threshold_eligible = np.asarray(
+        [
+            evidence_exists[row]
+            and not list(dict.fromkeys(anchor_classes[row]))
+            and not all_required_negative[row]
+            and not (
+                not positive_evidence[row]
+                and not all_required_valid[row]
+            )
+            for row in range(n)
+        ],
+        dtype=bool,
+    )
+    inference_failure_reasons: list[str] = []
+    for row in range(n):
+        failures: list[str] = []
+        if not evidence_exists[row]:
+            failures.append("no_identity_evidence")
+        else:
+            if not inference_unique_winner_pass[row]:
+                failures.append("best_candidate_not_unique")
+            if not valid_evidence_pass[row]:
+                failures.append("no_valid_positive_support")
+            if not probability_pass[row]:
+                failures.append("probability_below_threshold")
+            if not margin_pass[row]:
+                failures.append("margin_below_threshold")
+            if not np.isfinite(aligned_stability[row]):
+                failures.append("stability_unavailable")
+            elif not stability_pass[row]:
+                failures.append("stability_below_threshold")
+        inference_failure_reasons.append("|".join(failures))
 
     out = keys.copy()
     out[f"{prefix}_label"] = label
@@ -1581,6 +1836,13 @@ def _assign_level(
     out[f"{prefix}_best_probability"] = best_probability
     out[f"{prefix}_margin"] = margin
     out[f"{prefix}_stability"] = aligned_stability
+    out[f"{prefix}_unique_winner_pass"] = inference_unique_winner_pass
+    out[f"{prefix}_probability_pass"] = probability_pass
+    out[f"{prefix}_margin_pass"] = margin_pass
+    out[f"{prefix}_stability_pass"] = stability_pass
+    out[f"{prefix}_valid_evidence_pass"] = valid_evidence_pass
+    out[f"{prefix}_threshold_eligible"] = threshold_eligible
+    out[f"{prefix}_inference_failure_reasons"] = inference_failure_reasons
     out[f"{prefix}_reason"] = reason
     out[f"{prefix}_all_required_valid"] = all_required_valid
     out[f"{prefix}_all_required_negative"] = all_required_negative
@@ -1679,6 +1941,13 @@ def assign_subtypes(
     out["subtype_best_probability"] = np.nan
     out["subtype_margin"] = np.nan
     out["subtype_stability"] = np.nan
+    out["subtype_unique_winner_pass"] = False
+    out["subtype_probability_pass"] = False
+    out["subtype_margin_pass"] = False
+    out["subtype_stability_pass"] = False
+    out["subtype_valid_evidence_pass"] = False
+    out["subtype_threshold_eligible"] = False
+    out["subtype_inference_failure_reasons"] = "parent_not_classified"
     out["subtype_reason"] = "parent_not_classified"
     out["ranked_subtype_probabilities"] = "[]"
     out["cell_type"] = out["broad_label"]
@@ -1713,6 +1982,9 @@ def assign_subtypes(
         if not rules:
             out.loc[parent_mask, "subtype_assignment_status"] = "not_applicable"
             out.loc[parent_mask, "subtype_reason"] = "terminal_parent"
+            out.loc[
+                parent_mask, "subtype_inference_failure_reasons"
+            ] = "not_applicable"
             out.loc[parent_mask, "cell_type"] = parent
             continue
 
@@ -1746,6 +2018,13 @@ def assign_subtypes(
                 "subtype_best_probability",
                 "subtype_margin",
                 "subtype_stability",
+                "subtype_unique_winner_pass",
+                "subtype_probability_pass",
+                "subtype_margin_pass",
+                "subtype_stability_pass",
+                "subtype_valid_evidence_pass",
+                "subtype_threshold_eligible",
+                "subtype_inference_failure_reasons",
                 "subtype_reason",
                 "ranked_subtype_probabilities",
             ]
@@ -1935,6 +2214,7 @@ __all__ = [
     "AssignmentThresholds",
     "ClassRule",
     "DEFAULT_TYPING_RULES_PATH",
+    "FEATURE_SCHEMA_VERSION",
     "IDENTITY_ROLE",
     "INFERRED",
     "OTHER",
@@ -1951,6 +2231,7 @@ __all__ = [
     "assign_subtypes",
     "balanced_seed_weights",
     "classifier_from_registry",
+    "evidence_feature_matrix",
     "fit_constrained_classifier",
     "grouped_donor_bootstrap_stability",
     "load_typing_rules",

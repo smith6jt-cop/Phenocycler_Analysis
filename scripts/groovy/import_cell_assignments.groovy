@@ -27,9 +27,14 @@
  *     --args "/path/to/data/runs/<run_id>/qupath_export,specific"
  *
  * The optional second argument is `specific` (default) or `broad`.
+ *
+ * Manifest JSON is parsed with QuPath's bundled Gson (`qupath.lib.io.GsonTools`)
+ * because QuPath does not ship `groovy-json`; do not "simplify" this back to
+ * `groovy.json.JsonSlurper`, which cannot be resolved inside QuPath.
  */
 
-import groovy.json.JsonSlurper
+import com.google.gson.JsonObject
+import qupath.lib.io.GsonTools
 import java.security.MessageDigest
 
 // ---- configuration ---------------------------------------------------------
@@ -162,25 +167,40 @@ if (!exportManifestFile.isFile()) {
 }
 def exportManifest
 try {
-    exportManifest = new JsonSlurper().parse(exportManifestFile)
+    exportManifestFile.withReader("UTF-8") { reader ->
+        exportManifest = GsonTools.getInstance().fromJson(reader, JsonObject)
+    }
 } catch (Exception error) {
     println "ERROR: cannot parse export manifest: ${error.getMessage()}"
     return
 }
-def fingerprintMatches = exportManifest.files.findAll { item ->
-    new File(item.path.toString()).getCanonicalFile() ==
-        csvFile.getCanonicalFile()
+if (
+    exportManifest == null ||
+    !exportManifest.has("files") ||
+    !exportManifest.get("files").isJsonArray()
+) {
+    println "ERROR: export manifest has no files array: ${exportManifestFile}"
+    return
+}
+def fingerprintMatches = exportManifest.getAsJsonArray("files").findAll { element ->
+    element.isJsonObject() &&
+        element.getAsJsonObject().has("path") &&
+        new File(element.getAsJsonObject().get("path").getAsString())
+            .getCanonicalFile() == csvFile.getCanonicalFile()
 }
 if (fingerprintMatches.size() != 1) {
     println "ERROR: export manifest does not identify ${csvFile.getCanonicalPath()} exactly once."
     return
 }
-def fingerprint = fingerprintMatches[0]
-if (fingerprint.hash_mode != "full") {
+def fingerprint = fingerprintMatches[0].getAsJsonObject()
+if (!fingerprint.has("hash_mode") || fingerprint.get("hash_mode").getAsString() != "full") {
     println "ERROR: assignment CSV fingerprint must use a full SHA-256 hash."
     return
 }
-if (csvFile.length() != (fingerprint.size_bytes as long)) {
+if (
+    !fingerprint.has("size_bytes") ||
+    csvFile.length() != fingerprint.get("size_bytes").getAsLong()
+) {
     println "ERROR: assignment CSV size differs from its immutable manifest."
     return
 }
@@ -195,7 +215,10 @@ csvFile.withInputStream { stream ->
 def actualSha256 = digest.digest().collect {
     String.format("%02x", it & 0xff)
 }.join()
-if (actualSha256 != fingerprint.sha256) {
+if (
+    !fingerprint.has("sha256") ||
+    actualSha256 != fingerprint.get("sha256").getAsString()
+) {
     println "ERROR: assignment CSV SHA-256 differs from its immutable manifest."
     return
 }
@@ -327,6 +350,48 @@ def uncertaintyColors = [
 ]
 def previousClassKey = "Phenocycler previous PathClass"
 def metadataPrefix = "Phenocycler "
+// Metadata keys are identical for every row, so derive them once instead of
+// re-concatenating nine key strings per detection.
+def levelKey = metadataPrefix + "assignment level"
+def statusKey = metadataPrefix + "assignment status"
+def broadStatusKey = metadataPrefix + "broad assignment status"
+def specificStatusKey = metadataPrefix + "specific assignment status"
+def broadTypeKey = metadataPrefix + "broad type"
+def specificTypeKey = metadataPrefix + "specific type"
+def bestBroadKey = metadataPrefix + "best broad candidate"
+def bestSpecificKey = metadataPrefix + "best specific candidate"
+def broadRankingKey = metadataPrefix + "ranked broad probabilities"
+def specificRankingKey = metadataPrefix + "ranked specific probabilities"
+
+// QuPath caches PathClass instances globally, so colour each class once rather
+// than re-setting the same colour on a shared object for every detection.
+def pathClassCache = [:]
+def resolvePathClass = { String name, color ->
+    def cached = pathClassCache[name]
+    if (cached != null) {
+        return cached
+    }
+    def resolved = getPathClass(name)
+    resolved.setColor(color[0], color[1], color[2])
+    pathClassCache[name] = resolved
+    return resolved
+}
+
+// Metadata values repeat across hundreds of thousands of rows. Canonicalise
+// them so the hierarchy retains one String per distinct value rather than one
+// per cell.
+def canonicalValues = [:]
+def canonical = { String value ->
+    if (value == null) {
+        return null
+    }
+    def cached = canonicalValues[value]
+    if (cached != null) {
+        return cached
+    }
+    canonicalValues[value] = value
+    return value
+}
 int applied = 0
 
 visitRows { fields, column, lineNumber ->
@@ -374,12 +439,11 @@ visitRows { fields, column, lineNumber ->
         color = broadColors[broad] ?: [120, 120, 120]
     }
 
-    def pathClass = getPathClass(className)
-    pathClass.setColor(color[0], color[1], color[2])
+    def pathClass = resolvePathClass(className, color)
     def object = detectionsById[id]
     def metadata = object.getMetadata()
     if (!metadata.containsKey(previousClassKey)) {
-        metadata[previousClassKey] = (
+        metadata[previousClassKey] = canonical(
             object.getPathClass() == null
                 ? "__UNCLASSIFIED__"
                 : object.getPathClass().toString()
@@ -387,17 +451,17 @@ visitRows { fields, column, lineNumber ->
     }
     object.setPathClass(pathClass)
     object.getMeasurementList().put("Phenocycler confidence", confidence)
-    metadata[metadataPrefix + "assignment level"] = assignmentLevel
-    metadata[metadataPrefix + "assignment status"] = combinedStatus
-    metadata[metadataPrefix + "broad assignment status"] = broadStatus
-    metadata[metadataPrefix + "specific assignment status"] = specificStatus
-    metadata[metadataPrefix + "broad type"] = broad
-    metadata[metadataPrefix + "specific type"] = specific
-    metadata[metadataPrefix + "best broad candidate"] = bestBroad
-    metadata[metadataPrefix + "best specific candidate"] = bestSpecific
+    metadata[levelKey] = assignmentLevel
+    metadata[statusKey] = canonical(combinedStatus)
+    metadata[broadStatusKey] = canonical(broadStatus)
+    metadata[specificStatusKey] = canonical(specificStatus)
+    metadata[broadTypeKey] = canonical(broad)
+    metadata[specificTypeKey] = canonical(specific)
+    metadata[bestBroadKey] = canonical(bestBroad)
+    metadata[bestSpecificKey] = canonical(bestSpecific)
     if (storeRankedProbabilities) {
-        metadata[metadataPrefix + "ranked broad probabilities"] = broadRanking
-        metadata[metadataPrefix + "ranked specific probabilities"] = specificRanking
+        metadata[broadRankingKey] = broadRanking
+        metadata[specificRankingKey] = specificRanking
     }
     applied++
 }

@@ -57,7 +57,14 @@ not introduce thresholds, donor exclusions, or typing rules of their own.
 
 The detailed scientific and operational contract is in
 [the workflow guide](docs/WORKFLOW.md). Input, output, and column contracts are
-in [the data guide](DATA_README.md).
+in [the data guide](DATA_README.md). The detached, image-reader-agnostic
+[error-aware refinement workflow](docs/REFINEMENT_WORKFLOW.md) defines plotted
+stage optimization, donor-held-out method comparison, and separate
+false-positive/false-negative review without overwriting production labels.
+The [probabilistic rescue guide](docs/PROBABILISTIC_RESCUE.md) documents the
+implemented state-safe fitting, bundle, and opt-in inference contracts. No real
+bundle is enabled or shipped until a new authorized donor-disjoint label set
+passes that process.
 
 ## Install
 
@@ -73,6 +80,10 @@ For development:
 python -m pip install -e '.[test]'
 pytest -q
 ```
+
+The reference `environment.yml` includes Jupyter and Matplotlib for the review
+notebooks. In another environment, install them with
+`python -m pip install -e '.[notebook]'` before opening a notebook.
 
 ## 1. Export the QuPath inputs
 
@@ -257,13 +268,36 @@ The notebooks follow the same four conceptual checkpoints:
 2. [`02_redsea_spillover.ipynb`](notebooks/02_redsea_spillover.ipynb)
    reviews REDSEA alignment, compartments, and authoritative expression.
 3. [`03_marker_calibration.ipynb`](notebooks/03_marker_calibration.ipynb)
-   reviews reference-control and donor-marker calibration audits.
+   reviews reference-control and donor-marker calibration audits, hard control
+   gates, bootstrap uncertainty, and selected-pair evidence disposition.
 4. [`04_hierarchical_cell_typing.ipynb`](notebooks/04_hierarchical_cell_typing.ipynb)
    reviews hierarchy, state, and the optional QuPath handoff.
 
-Their optional execution cells call `run_stage` or `export_qupath`, which apply
-the same manifest validation and immutability checks as the CLI. Notebook cells
-must not write stage files directly.
+[`05_error_aware_refinement.ipynb`](notebooks/05_error_aware_refinement.ipynb)
+is a read-only companion over an unpromoted validation
+`CandidateEvaluationManifest`. It uses projected queries to build a weighted
+probability sample and a separately capped full-validation-split challenge
+sample, then
+plots FP/FN, reliability, and the calibration-frozen coverage/error point only
+when complete detached adjudication and valid score semantics are available.
+It does not require QuPath and never edits a production assignment. The
+checked-in notebook reviews the broad target; each fitted subtype requires its
+own blinded sample, review ledger, and structured held-out report.
+
+[`06_probabilistic_validation_and_promotion.ipynb`](notebooks/06_probabilistic_validation_and_promotion.ipynb)
+is the guarded release interface. It gates the complete validation report
+before an explicit one-time locked-test acknowledgement, plots weighted
+coverage and FP/FN confidence bounds for every required target, replays the
+calibration and held-out source lineage, and signs the separate promotion
+manifest with protected external keys. Its checked-in flags keep every write
+and locked-test read disabled.
+
+Optional execution cells in the earlier stage notebooks call `run_stage` or
+`export_qupath`, which apply the same manifest validation and immutability
+checks as the CLI. The calibration notebook is deliberately read-only: while
+the donor queue is active, it validates completed donor receipt trees and
+reviews their donor-local audits and evidence without waiting for the cohort
+calibration manifest. Notebook cells must not write stage files directly.
 
 ## Marker evidence, not frequency gates
 

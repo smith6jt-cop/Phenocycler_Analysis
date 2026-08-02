@@ -33,7 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
 test = ["pytest"]
-notebook = ["jupyterlab", "ipykernel", "ipywidgets"]
+notebook = ["jupyterlab", "ipykernel", "ipywidgets", "matplotlib"]
 # PhenoCycler <-> Xenium integration (phenocycler/integration/). The core pipeline never
 # imports these; every integration module degrades to a clear ImportError naming the extra.
 # `maxfuse` is deliberately absent — its only release is 0.0.2 (2023) with unpinned deps, so

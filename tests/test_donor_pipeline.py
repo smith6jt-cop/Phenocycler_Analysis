@@ -28,6 +28,7 @@ from phenocycler.donor_pipeline import (
     _terminate_executor_workers,
     _validate_task_receipt,
     donor_receipt_path,
+    donor_stage_inputs,
     run_donor_queue,
     select_ready_task,
     snapshot_donor_partition,
@@ -35,7 +36,6 @@ from phenocycler.donor_pipeline import (
     task_resources,
 )
 from phenocycler.expression import write_donor_partition
-
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -325,6 +325,134 @@ def test_all_declared_donor_stages_have_resource_requests():
         task_resources(context, DonorTask(stage, "1")).group
         for stage in DONOR_STAGES
     } == {"geometry", "redsea", "downstream"}
+
+
+def test_donor_type_inputs_reuse_captured_bundle_artifact(monkeypatch, tmp_path):
+    from phenocycler import donor_pipeline, pipeline
+
+    captured_bundle = object()
+    captured_promotion = object()
+    generated = []
+    validated = []
+    monkeypatch.setattr(
+        donor_pipeline,
+        "_dependency_input",
+        lambda _context, stage, donor: (stage, donor),
+    )
+    monkeypatch.setattr(
+        donor_pipeline.InputArtifact,
+        "from_path",
+        lambda name, path: generated.append((name, path)) or (name, path),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_validate_typing_calibration_compatibility",
+        lambda context: validated.append(context),
+    )
+    promotion = SimpleNamespace(
+        input_artifact=captured_promotion,
+        validate_for_bundle=lambda bundle: validated.append(bundle),
+    )
+    bundle = SimpleNamespace(input_artifact=captured_bundle)
+    context = SimpleNamespace(
+        base_config=SimpleNamespace(
+            marker_registry=tmp_path / "markers.json",
+            typing_rules=tmp_path / "rules.json",
+        ),
+        typing_model_bundle=bundle,
+        typing_model_promotion_manifest=promotion,
+    )
+
+    inputs = donor_stage_inputs(context, "type", "1")
+    assert inputs[-2:] == (captured_bundle, captured_promotion)
+    assert validated == [context, bundle]
+    assert generated == [
+        ("marker_registry", tmp_path / "markers.json"),
+        ("typing_rules", tmp_path / "rules.json"),
+    ]
+
+
+def test_probabilistic_donor_typing_waits_for_sealed_calibration(tmp_path):
+    context = SimpleNamespace(
+        donors=("1",),
+        typing_model_bundle=object(),
+        stage_manifest_path=lambda stage: tmp_path / f"{stage}.json",
+        config=SimpleNamespace(use_gpu=False),
+    )
+    task = DonorTask("type", "1")
+    pending = {task}
+    completed = {DonorTask("calibrate", "1")}
+    resources = ResourceState()
+    limits = ResourceLimits(
+        total_cpu_slots=1,
+        gpu_slots=0,
+        geometry_workers=1,
+        redsea_workers=1,
+        downstream_workers=1,
+    )
+
+    assert (
+        select_ready_task(
+            pending,
+            completed,
+            context=context,
+            resources=resources,
+            limits=limits,
+        )
+        is None
+    )
+    context.stage_manifest_path("calibrate").write_text("{}\n")
+    assert select_ready_task(
+        pending,
+        completed,
+        context=context,
+        resources=resources,
+        limits=limits,
+    ) == task
+
+
+def test_donor_type_body_passes_configured_bundle(monkeypatch, tmp_path):
+    from phenocycler import donor_pipeline
+
+    evidence = pd.DataFrame({"donor_id": ["1"], "object_id": ["a"]})
+    assignments = evidence.assign(cell_type="Immune")
+    bundle = object()
+    promotion = object()
+    observed = {}
+    monkeypatch.setattr(
+        donor_pipeline,
+        "read_single_partition",
+        lambda *_args, **_kwargs: evidence,
+    )
+
+    def fake_type(frame, **kwargs):
+        observed.update(frame=frame, **kwargs)
+        return assignments
+
+    monkeypatch.setattr(donor_pipeline, "type_calibrated_cells", fake_type)
+    monkeypatch.setattr(
+        donor_pipeline,
+        "write_donor_partition",
+        lambda *_args, **_kwargs: tmp_path / "data.parquet",
+    )
+    context = SimpleNamespace(
+        config=SimpleNamespace(
+            marker_evidence_dir=tmp_path / "evidence",
+            assignments_dir=tmp_path / "assignments",
+        ),
+        cohort=SimpleNamespace(images=()),
+        registry="markers",
+        typing_registry="rules",
+        typing_model_bundle=bundle,
+        typing_model_promotion_manifest=promotion,
+    )
+
+    assert _run_donor_stage_body(context, "type", "1") == ()
+    assert observed["frame"] is evidence
+    assert observed["marker_registry"] == "markers"
+    assert observed["typing_registry"] == "rules"
+    assert observed["model_bundle"] is bundle
+    assert observed["model_promotion_manifest"] is promotion
 
 
 def test_state_donor_body_writes_output_and_donor_audit(tmp_path):

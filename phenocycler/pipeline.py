@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
 
 import pandas as pd
 
@@ -26,6 +27,8 @@ from .artifacts import (
 )
 from .calibration_stage import (
     METHOD_VERSION as CALIBRATION_STAGE_VERSION,
+)
+from .calibration_stage import (
     calibrate_expression,
 )
 from .cells_parquet import build_cells_parquet
@@ -33,6 +36,8 @@ from .cohort import ensure_eligible_donors
 from .config import PipelineConfig, load_config
 from .expression import (
     METHOD_VERSION as EXPRESSION_VERSION,
+)
+from .expression import (
     build_selected_expression,
     read_single_partition,
     write_donor_partition,
@@ -40,6 +45,8 @@ from .expression import (
 from .geometry_qc import GeometryQCConfig
 from .geometry_stage import (
     METHOD_VERSION as GEOMETRY_VERSION,
+)
+from .geometry_stage import (
     run_geometry_qc_for_image,
 )
 from .hierarchical_typing import TypingRegistry
@@ -49,17 +56,26 @@ from .qupath_export import export_assignment_frame
 from .redsea import RedseaParams, run_redsea
 from .reference_controls import (
     METHOD_VERSION as REFERENCE_VERSION,
+)
+from .reference_controls import (
     ReferenceControlConfig,
     build_reference_controls,
     reference_masks_from_wide,
     reference_masks_to_wide,
 )
 from .state_markers import annotate_proliferation
+from .typing_model_bundle import (
+    TypingModelBundle,
+    TypingModelPromotionManifest,
+    load_typing_model_bundle,
+    load_typing_model_promotion_manifest,
+)
 from .typing_stage import (
     METHOD_VERSION as TYPING_STAGE_VERSION,
+)
+from .typing_stage import (
     type_calibrated_cells,
 )
-
 
 INGEST_VERSION = "qupath-ingest-union-v2"
 REDSEA_VERSION = "redsea-compartment-only-v1"
@@ -144,6 +160,8 @@ STAGE_SOURCE_PATHS = {
     "type": (
         "phenocycler/donor_pipeline.py",
         "phenocycler/typing_stage.py",
+        "phenocycler/typing_model_bundle.py",
+        "phenocycler/refinement_contracts.py",
         "phenocycler/hierarchical_typing.py",
         "phenocycler/marker_registry.py",
         "phenocycler/typing_rules.json",
@@ -162,6 +180,8 @@ class RunContext:
     cohort: QuPathCohortManifest
     registry: MarkerRegistry
     typing_registry: TypingRegistry
+    typing_model_bundle: TypingModelBundle | None
+    typing_model_promotion_manifest: TypingModelPromotionManifest | None
     donors: tuple[str, ...]
     repository: Path
     code: CodeMetadata
@@ -179,11 +199,34 @@ class RunContext:
         return self.config.manifests_dir / f"{stage}.json"
 
 
-def _identity_config(cfg: PipelineConfig) -> dict:
+def _identity_config(
+    cfg: PipelineConfig,
+    *,
+    typing_model_bundle: TypingModelBundle | None = None,
+    typing_model_promotion_manifest: TypingModelPromotionManifest | None = None,
+) -> dict:
     """Configuration that changes scientific content, excluding output location."""
 
+    typing_model: dict[str, object] = {"mode": "rules_only"}
+    if typing_model_bundle is not None:
+        if typing_model_promotion_manifest is None:
+            raise ContractError(
+                "probabilistic typing run identity requires a promotion manifest"
+            )
+        typing_model = {
+            "mode": "probabilistic_bundle",
+            "content_id": typing_model_bundle.content_id,
+            "method_version": typing_model_bundle.method_version,
+            "feature_schema_version": typing_model_bundle.feature_schema_version,
+            "promotion_manifest_content_id": (
+                typing_model_promotion_manifest.content_id
+            ),
+        }
+    elif typing_model_promotion_manifest is not None:
+        raise ContractError("rules-only run cannot configure a promotion manifest")
     return {
         "run_schema_version": RUN_SCHEMA_VERSION,
+        "typing_model": typing_model,
         "cells_min_cell_area": cfg.cells_min_cell_area,
         "geometry_qc": {
             "min_cell_area_um2": cfg.cell_qc_min_cell_area,
@@ -231,12 +274,81 @@ def resolve_run_context(cfg: PipelineConfig) -> RunContext:
     typing_registry = TypingRegistry.from_marker_registry(
         registry, typing_rules=cfg.typing_rules
     )
+    typing_model_bundle = None
+    typing_model_promotion_manifest = None
+    if cfg.typing_model_bundle is not None:
+        if cfg.typing_model_promotion_manifest is None:
+            raise ContractError(
+                "configured typing model bundle requires a promotion manifest"
+            )
+        typing_model_bundle = load_typing_model_bundle(
+            cfg.typing_model_bundle,
+            marker_registry=registry,
+            typing_registry=typing_registry,
+        )
+        release_signing_key_file = os.environ.get(
+            "PHENOCYCLER_RELEASE_SIGNING_KEY_FILE", ""
+        )
+        if not release_signing_key_file:
+            raise ContractError(
+                "probabilistic production typing requires the external "
+                "PHENOCYCLER_RELEASE_SIGNING_KEY_FILE"
+            )
+        release_signing_key_path = Path(release_signing_key_file).expanduser()
+        if not release_signing_key_path.is_file():
+            raise ContractError(
+                "probabilistic production release signing-key file is unavailable"
+            )
+        release_signing_key = release_signing_key_path.read_bytes()
+        if len(release_signing_key) < 16:
+            raise ContractError(
+                "probabilistic production release signing key must contain at "
+                "least 16 bytes"
+            )
+        typing_model_promotion_manifest = load_typing_model_promotion_manifest(
+            cfg.typing_model_promotion_manifest,
+            model_bundle=typing_model_bundle,
+            marker_registry=registry,
+            typing_registry=typing_registry,
+            release_signing_key=release_signing_key,
+        )
+        if typing_model_bundle.input_artifact is None:
+            raise ContractError(
+                "configured typing model bundle has no captured input artifact"
+            )
+        typing_model_bundle.input_artifact.validate_current(mode="content")
+        if typing_model_promotion_manifest.input_artifact is None:
+            raise ContractError(
+                "configured typing promotion has no captured input artifact"
+            )
+        typing_model_promotion_manifest.input_artifact.validate_current(
+            mode="content"
+        )
+        typing_model_promotion_manifest.validate_for_bundle(
+            typing_model_bundle,
+            release_signing_key=release_signing_key,
+        )
+        del release_signing_key
+        if (
+            typing_model_bundle.split_manifest.cohort_content_id
+            != cohort.content_id
+        ):
+            raise ContractError(
+                "typing model bundle was developed for a different cohort "
+                f"({typing_model_bundle.split_manifest.cohort_content_id} != "
+                f"{cohort.content_id})"
+            )
+        typing_model_bundle.split_manifest.validate_cohort(donors)
     repository = Path(__file__).resolve().parents[1]
     code = CodeMetadata.capture(
         repository,
         source_paths=("phenocycler", "pyproject.toml"),
     )
-    identity = _identity_config(cfg)
+    identity = _identity_config(
+        cfg,
+        typing_model_bundle=typing_model_bundle,
+        typing_model_promotion_manifest=typing_model_promotion_manifest,
+    )
     run_id = sha256_json(
         {
             "cohort": cohort.content_id,
@@ -254,6 +366,8 @@ def resolve_run_context(cfg: PipelineConfig) -> RunContext:
         cohort=cohort,
         registry=registry,
         typing_registry=typing_registry,
+        typing_model_bundle=typing_model_bundle,
+        typing_model_promotion_manifest=typing_model_promotion_manifest,
         donors=donors,
         repository=repository,
         code=code,
@@ -278,6 +392,38 @@ def _stage_code(context: RunContext, stage: str) -> CodeMetadata:
         context.repository,
         source_paths=STAGE_SOURCE_PATHS[stage],
     )
+
+
+def _validate_typing_calibration_compatibility(
+    context: RunContext,
+) -> StageManifest | None:
+    """Require exact current marker-evidence content used by the fitted bundle."""
+
+    bundle = context.typing_model_bundle
+    if bundle is None:
+        return None
+    manifest_path = context.stage_manifest_path("calibrate")
+    if not manifest_path.exists():
+        raise PartialArtifactError(
+            "probabilistic typing requires the sealed cohort calibrate manifest"
+        )
+    manifest = StageManifest.read_json(manifest_path)
+    if manifest.stage != "calibrate":
+        raise ContractError(
+            f"calibration manifest declares stage {manifest.stage!r}"
+        )
+    manifest.validate_current(
+        config=_stage_config(context, "calibrate"),
+        validation_mode="content",
+    )
+    expected = bundle.evidence_provenance.source_artifact_content_id
+    actual = manifest.output.content_sha256
+    if actual != expected:
+        raise ContractError(
+            "current calibration dataset differs from model training evidence "
+            f"({actual} != {expected})"
+        )
+    return manifest
 
 
 def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
@@ -316,6 +462,20 @@ def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
                 "typing_rules", context.base_config.typing_rules
             )
         )
+        if context.typing_model_bundle is not None:
+            _validate_typing_calibration_compatibility(context)
+            artifact = context.typing_model_bundle.input_artifact
+            if artifact is None:
+                raise ContractError(
+                    "configured typing model bundle has no captured input artifact"
+                )
+            inputs.append(artifact)
+            promotion = context.typing_model_promotion_manifest
+            if promotion is None or promotion.input_artifact is None:
+                raise ContractError(
+                    "configured typing model bundle requires a captured promotion manifest"
+                )
+            inputs.append(promotion.input_artifact)
     return tuple(inputs)
 
 
@@ -463,6 +623,8 @@ def _run_type(context: RunContext) -> None:
             read_single_partition(context.config.marker_evidence_dir, donor),
             marker_registry=context.registry,
             typing_registry=context.typing_registry,
+            model_bundle=context.typing_model_bundle,
+            model_promotion_manifest=context.typing_model_promotion_manifest,
         )
         write_donor_partition(
             assignments,
@@ -792,6 +954,14 @@ def main(argv=None) -> int:
         from .recovery import main as recovery_main
 
         return recovery_main(raw[1:])
+    if raw and raw[0] == "probabilistic":
+        if len(raw) > 1 and raw[1] == "evaluate":
+            from .candidate_evaluation import main as candidate_evaluation_main
+
+            return candidate_evaluation_main(raw[2:])
+        from .probabilistic_training import main as probabilistic_main
+
+        return probabilistic_main(raw[1:])
     if not raw or raw[0].startswith("-"):
         raw.insert(0, "run")
 
@@ -853,6 +1023,23 @@ def main(argv=None) -> int:
             parser.error("--pipelined supports --through, not --only")
         from .donor_pipeline import run_pipelined_pipeline
 
+        if (
+            getattr(context, "typing_model_bundle", None) is not None
+            and "type" in stages
+        ):
+            # Donor-ready typing would otherwise begin as soon as each donor's
+            # calibrate receipt exists. A promoted model is tied to the exact
+            # cohort calibration dataset, so first seal the complete calibrate
+            # manifest and verify its aggregate content before any type task.
+            through_calibrate = STAGE_ORDER[
+                : STAGE_ORDER.index("calibrate") + 1
+            ]
+            run_pipelined_pipeline(
+                context,
+                stages=through_calibrate,
+                export=False,
+            )
+            _validate_typing_calibration_compatibility(context)
         run_pipelined_pipeline(
             context,
             stages=stages,

@@ -7,11 +7,12 @@ import json
 import multiprocessing
 import os
 import tempfile
+from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -48,7 +49,6 @@ from .reference_controls import (
 )
 from .state_markers import annotate_proliferation
 from .typing_stage import type_calibrated_cells
-
 
 DONOR_RECEIPT_VERSION = 1
 DONOR_STAGES = (
@@ -367,7 +367,7 @@ class DonorStageReceipt:
         sidecar_paths: Sequence[Path | str],
         config: Any,
         code: CodeMetadata,
-    ) -> "DonorStageReceipt":
+    ) -> DonorStageReceipt:
         donor = str(donor_id)
         input_tuple = tuple(sorted(inputs, key=lambda item: item.name))
         if len({item.name for item in input_tuple}) != len(input_tuple):
@@ -470,7 +470,7 @@ class DonorStageReceipt:
         return _atomic_write_json(Path(path), self.to_dict())
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "DonorStageReceipt":
+    def from_dict(cls, value: Mapping[str, Any]) -> DonorStageReceipt:
         result = cls(
             receipt_version=int(value["receipt_version"]),
             stage=str(value["stage"]),
@@ -494,7 +494,7 @@ class DonorStageReceipt:
         return result
 
     @classmethod
-    def read_json(cls, path: Path | str) -> "DonorStageReceipt":
+    def read_json(cls, path: Path | str) -> DonorStageReceipt:
         with Path(path).open(encoding="utf-8") as handle:
             return cls.from_dict(json.load(handle))
 
@@ -579,6 +579,23 @@ def donor_stage_inputs(
                 context.base_config.typing_rules,
             )
         )
+        if context.typing_model_bundle is not None:
+            from .pipeline import _validate_typing_calibration_compatibility
+
+            _validate_typing_calibration_compatibility(context)
+            artifact = context.typing_model_bundle.input_artifact
+            if artifact is None:
+                raise ContractError(
+                    "configured typing model bundle has no captured input artifact"
+                )
+            inputs.append(artifact)
+            promotion = context.typing_model_promotion_manifest
+            if promotion is None or promotion.input_artifact is None:
+                raise ContractError(
+                    "configured typing model bundle requires a captured promotion manifest"
+                )
+            promotion.validate_for_bundle(context.typing_model_bundle)
+            inputs.append(promotion.input_artifact)
     return tuple(inputs)
 
 
@@ -719,6 +736,8 @@ def _run_donor_stage_body(context, stage: str, donor_id: str) -> tuple[Path, ...
             ),
             marker_registry=context.registry,
             typing_registry=context.typing_registry,
+            model_bundle=context.typing_model_bundle,
+            model_promotion_manifest=context.typing_model_promotion_manifest,
         )
         write_donor_partition(
             assignments,
@@ -869,7 +888,7 @@ class ResourceLimits:
         context,
         *,
         task_count: int,
-    ) -> "ResourceLimits":
+    ) -> ResourceLimits:
         total = resolve_jobs(context.config.n_jobs, task_count)
         redsea = min(context.config.pipeline_redsea_workers, total)
         if context.config.use_gpu:
@@ -952,6 +971,22 @@ def task_ready(task: DonorTask, completed: set[DonorTask]) -> bool:
     )
 
 
+def _cohort_barrier_ready(context, task: DonorTask) -> bool:
+    """Hold probabilistic typing until cohort calibration is sealed.
+
+    Donor-local calibration receipts are sufficient for rules-only typing. A
+    fitted model, however, is authorized for one exact cohort calibration
+    content hash, which cannot be checked until the aggregate stage manifest
+    exists.
+    """
+
+    return not (
+        task.stage == "type"
+        and getattr(context, "typing_model_bundle", None) is not None
+        and not context.stage_manifest_path("calibrate").is_file()
+    )
+
+
 def _task_priority(
     task: DonorTask,
     *,
@@ -998,6 +1033,7 @@ def select_ready_task(
             task
             for task in pending
             if task_ready(task, completed)
+            and _cohort_barrier_ready(context, task)
             and resources.can_start(task_resources(context, task), limits)
         ),
         key=lambda task: _task_priority(

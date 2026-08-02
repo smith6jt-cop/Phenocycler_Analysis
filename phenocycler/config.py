@@ -13,10 +13,8 @@ import os
 from configparser import ConfigParser
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Optional
 
 from .cohort import filter_eligible_donors
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INI = _REPO_ROOT / "config.ini"
@@ -69,6 +67,11 @@ class PipelineConfig:
     qupath_manifest: Path = _REPO_ROOT / "data" / "qupath_manifest.json"
     marker_registry: Path = _PACKAGE_DIR / "marker_registry.json"
     typing_rules: Path = _PACKAGE_DIR / "typing_rules.json"
+    # Optional, immutable probabilistic rescue model.  Keeping this unset is
+    # the production rules-only default. Production requires its separately
+    # configured immutable promotion manifest.
+    typing_model_bundle: Path | None = None
+    typing_model_promotion_manifest: Path | None = None
 
     # Ingest retains tiny fragments only above this structural floor. Geometry
     # QC is a later immutable flag and never deletes rows.
@@ -152,7 +155,7 @@ class PipelineConfig:
     qc_tissue_dice_min: float = 0.80
     qc_islet_rmse_max_um: float = 150.0
 
-    _config_path: Optional[Path] = field(default=None, repr=False, compare=False)
+    _config_path: Path | None = field(default=None, repr=False, compare=False)
 
     @property
     def runs_dir(self) -> Path:
@@ -214,7 +217,7 @@ class PipelineConfig:
     def inter_dir(self) -> Path:
         return self.redsea_scratch / "intermediates"
 
-    def discover_donors(self, from_dir: Optional[Path] = None) -> list[str]:
+    def discover_donors(self, from_dir: Path | None = None) -> list[str]:
         """Unique, eligible **donor ids** behind the discovered sections.
 
         Distinct from :meth:`discover_sections` on purpose. Stages that process images want
@@ -387,7 +390,7 @@ class PipelineConfig:
                     out.append(r)
         return out
 
-    def discover_sections(self, from_dir: Optional[Path] = None) -> list[str]:
+    def discover_sections(self, from_dir: Path | None = None) -> list[str]:
         """Section keys by globbing ``<dir>/donor_id=*`` (defaults to cells_dir).
 
         This is the pipeline's **work unit**: one key is one image, one GeoJSON, one
@@ -397,7 +400,7 @@ class PipelineConfig:
         base = Path(from_dir) if from_dir is not None else self.cells_dir
         return sorted(p.name.split("=", 1)[1] for p in base.glob("donor_id=*"))
 
-    def discover_section_objects(self, from_dir: Optional[Path] = None) -> list:
+    def discover_section_objects(self, from_dir: Path | None = None) -> list:
         """:class:`phenocycler.sections.Section` for every discovered partition."""
         from .sections import parse
 
@@ -409,6 +412,10 @@ _INI_SCHEMA = {
         "qupath_manifest": ("qupath_manifest", Path),
         "marker_registry": ("marker_registry", Path),
         "typing_rules": ("typing_rules", Path),
+    },
+    "typing": {
+        "model_bundle": ("typing_model_bundle", Path),
+        "promotion_manifest": ("typing_model_promotion_manifest", Path),
     },
     "cells": {
         "min_cell_area": ("cells_min_cell_area", float),
@@ -504,7 +511,7 @@ _ENV_OVERRIDES = {
 
 
 def load_config(
-    config_path: Optional[os.PathLike | str] = None,
+    config_path: os.PathLike | str | None = None,
     **overrides,
 ) -> PipelineConfig:
     """Load config.ini, environment variables and explicit overrides."""
@@ -551,6 +558,24 @@ def load_config(
         if not path.is_absolute():
             path = (base / path).resolve()
         setattr(cfg, name, path)
+
+    for name in (
+        "typing_model_bundle",
+        "typing_model_promotion_manifest",
+    ):
+        value = getattr(cfg, name)
+        if value is None:
+            continue
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = (base / path).resolve()
+        setattr(cfg, name, path)
+    if (cfg.typing_model_bundle is None) != (
+        cfg.typing_model_promotion_manifest is None
+    ):
+        raise ValueError(
+            "[typing] model_bundle and promotion_manifest must be configured together"
+        )
 
     for name in ("images_dir", "donor_metadata", "xenium_paths_csv",
                  "donor_overrides_csv", "panel_explorer"):
