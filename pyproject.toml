@@ -94,6 +94,14 @@ ignore = [
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
+# `refinement.py` is a repo-root, dependency-light helper module (used by the audit
+# notebooks and tests/test_refinement.py); it is intentionally NOT part of the installed
+# `phenocycler` package, so `pip install -e .` does not put it on sys.path. Local runs pass
+# because the documented invocation is `PYTHONPATH=. pytest`; the CI job invokes the `pytest`
+# console script, which does not add the repo root, so `import refinement` fails at collection.
+# Adding the rootdir to sys.path here makes both environments resolve top-level modules the
+# same way, without shipping `refinement` as a distributed top-level module.
+pythonpath = ["."]
 addopts = ["-ra", "--strict-markers"]
 markers = [
     "slow: tests that need real imaging data (skipped in CI)",
