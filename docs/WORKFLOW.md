@@ -591,6 +591,97 @@ python -m phenocycler.pipeline run --config config.ini \
   --only type states
 ```
 
+### Adopt compatible completed stages from an older run
+
+When workflow development changes the content-addressed run ID, do not repeat
+every expensive stage merely because an unrelated downstream feature changed.
+Create a deterministic plan against the finalized current checkout. Planning
+does not modify either run; `--out` writes only this requested immutable file:
+
+```bash
+python -m phenocycler.pipeline adopt plan \
+  --config config.ini \
+  --from-run <completed_run_id> \
+  --out adoption-plan.json
+```
+
+The planner evaluates the real DAG, not a linear prefix. Each source manifest,
+dataset, required audit sidecar, donor set, schema, UUID universe, source input,
+method, and stage-specific scientific configuration is validated without
+mistaking historical code for current code. Producing-code hashes must either
+match exactly or match a named, exact-hash transition in the checked-in
+`adoption_compatibility.json`; an arbitrary runtime override is not available.
+Review `action`, `reason_codes`, the reusable byte count, and the plan content ID.
+The unit of reuse is a sealed stage: a historical root `run.json` is informative
+but not required, so a prior run with individually complete manifests can still
+be salvaged. Unmanifested donor output is never eligible.
+
+Apply exactly that plan, then inspect `manifests/adoption/` before launching the
+missing work:
+
+```bash
+python -m phenocycler.pipeline adopt apply \
+  --config config.ini \
+  --plan adoption-plan.json
+
+python -m phenocycler.pipeline run --config config.ini --pipelined
+```
+
+Apply rebuilds the plan before writing, so source, policy, configuration, or
+checkout drift causes a fail-closed stale-plan error. Accepted files are
+hard-linked, never copied or symlinked. Each adopted stage gets a retained
+source-manifest snapshot, a content-addressed receipt, and a new target manifest
+under the current dependency, configuration, method, and code compatibility
+contract; the receipt retains the original producing code. Old donor receipts,
+assignments from an incompatible typing method, QuPath exports, `run.json`, and
+`LATEST` are not transplanted. Add `--continue` to `adopt apply` to launch the
+missing stages immediately. `--jobs N` and `--no-export` modify that continuation
+only; after `--no-export`, run the normal `export` command separately.
+Apply is idempotent and stage-incremental, not one filesystem-wide transaction:
+after interruption, rerun the same immutable plan to validate existing links
+and continue from the first unsealed stage.
+
+The ordinary mode uses cached fingerprints and rehashes files whose metadata
+changed. For a one-time archival read of every source byte, add
+`--validation-mode content` when creating the plan. Cross-filesystem adoption
+fails rather than silently allocating a second copy. Plans are immutable: after
+source, configuration, policy, or code drift, write a newly named plan rather
+than trying to replace the reviewed one.
+
+For `c8412757d12de36ca056`, the reviewed plan adopts `ingest`, `geometry`,
+`redsea`, `expression`, `controls`, `calibrate`, and `states`, preserving
+99,139,122,797 bytes (92.33 GiB). `type` must rerun because its method changed
+from `hierarchical-typing-stage-v1` to v3; the QuPath export then reruns because
+it is bound to the new type-manifest ID. `states` remains reusable because it
+depends on `expression`, not `type`. That source lives under this subrepository's
+data root: from the parent workspace, first `cd Phenocycler_Analysis` (or pass
+`--config Phenocycler_Analysis/config.ini` from the parent).
+
+`--from-run` accepts a 20-character lowercase run ID, not an arbitrary path,
+and resolves it only under the runs directory owned by the selected config.
+The target records the reviewed plan at `manifests/adoption/plan.json`, retained
+source manifests under `manifests/adoption/source/<source_run_id>/`, per-stage
+receipts under `manifests/adoption/`, and the aggregate handoff at
+`manifests/adoption.json`. `LATEST` is unchanged by adoption and advances only
+after every analytical stage validates and the target `run.json` is sealed.
+
+#### Reviewing future compatible code drift
+
+An `unreviewed_code_change` decision is intentionally not overridable at the
+command line. A maintainer must first decide whether the stage method should be
+versioned and recomputed. Only a demonstrably non-scientific transition may be
+added manually to `phenocycler/adoption_compatibility.json` in a reviewed code
+change. Each record pins the stage, old/new method and aggregate code hashes,
+source/target path contracts, exact changed-path set, old/new digest for every
+changed file, canonical diff digest, accepted output schema, and the stage
+configuration projection. Commits are recorded as provenance; compatibility
+identity comes from the pinned code trees. Its rationale must explain why
+producer values and parameter wiring are unchanged. The planner reconstructs
+the historical aggregate code from the source manifest's commit and verifies
+every pin; missing Git history or any mismatch leaves the stage at `recompute`.
+Never add a policy record to avoid a legitimate method bump, schema migration,
+or failed scientific comparison.
+
 For the narrow case where `duplicate_policy = fatal` stopped geometry at the
 first donor containing duplicated islet detections, reuse the verified ingest
 and completed duplicate-free geometry prefix in the corrected
@@ -733,6 +824,7 @@ A missing required manifest stops the selected stage.
 | required typing evidence invalid | broad absence cannot be established | retain unavailable/ambiguous; do not call `Other` |
 | cohort output exists without manifest | interrupted or foreign stage-mode partial artifact | inspect it; never bless it by fabricating a manifest |
 | donor output exists without donor receipt | interruption occurred after the atomic data write but before provenance publication | quarantine that exact donor partition and its donor audit, then rerun the pipelined command |
+| older run has completed stages but current code resolves a new run ID | compatible work may be reusable on the true stage DAG | create and review an `adopt plan`, then apply that exact plan; incompatible nodes and descendants recompute |
 | fatal duplicate policy stopped at the first duplicate-bearing donor | ingest and a duplicate-free geometry prefix may be reusable | use the verified `pipeline resume` contract with the source run and first unfinished donor |
 | stopped pre-receipt run has a complete geometry manifest and some complete REDSEA donors | the old stage-barrier process cannot attach to the donor queue | stop every old worker, then use the verified `pipeline recover` contract |
 | manifest or output stale | bytes, schema, UUID universe, config, or code differ | correct the cause and create the newly addressed run |
@@ -741,8 +833,8 @@ A missing required manifest stops the selected stage.
 Never repair a contract failure by copying a donor partition from another run,
 editing a generated manifest, reallocating alpha to available markers, or
 adding a notebook-only cutoff. Cross-run reuse is permitted only through the
-narrow verified resume command above, which creates a newly addressed run and
-fingerprinted provenance receipts.
+verified adoption, resume, or interrupted-run recovery contracts above. Each
+creates a newly addressed run and fingerprints the exact provenance handoff.
 
 For a verified transient interruption that left output before its manifest,
 quarantine the exact unmanifested stage directory and its stage-owned

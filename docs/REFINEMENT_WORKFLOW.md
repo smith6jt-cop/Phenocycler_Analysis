@@ -673,7 +673,7 @@ without turning classification into an unauditable sequence of manual edits.
 Do not optimize its `confidence` or margin thresholds. The findings below are a
 read-only record of completed pre-refinement run `c8412757d12de36ca056` and the
 typing implementation that produced it. They explain why the new safeguards
-were required; they do **not** describe the current v2 typing code:
+were required; they do **not** describe the current v3 typing code:
 
 - 31,454,041 cells;
 - broad status: 12.60% anchor, 50.20% Other, 9.14% Ambiguous, 28.06%
@@ -705,6 +705,28 @@ inference requires valid positive support, donor-bootstrap stability is supplied
 only by an immutable opt-in bundle, and score semantics and gate failures are
 stamped on every assignment. The historical run remains immutable and must not
 be reinterpreted under the new semantics.
+
+The expensive upstream values do not need to be regenerated. The general
+completed-stage adoption workflow in
+[WORKFLOW.md](WORKFLOW.md#adopt-compatible-completed-stages-from-an-older-run)
+has a checked-in compatibility review for this exact transition:
+
+```bash
+cd Phenocycler_Analysis  # omit when already in the subrepository
+python -m phenocycler.pipeline adopt plan \
+  --config config.ini \
+  --from-run c8412757d12de36ca056 \
+  --out adoption-plan.json
+python -m phenocycler.pipeline adopt apply \
+  --config config.ini \
+  --plan adoption-plan.json
+# Inspect data/runs/<target>/manifests/adoption/, then continue when ready.
+python -m phenocycler.pipeline run --config config.ini --pipelined
+```
+
+This preserves the compatible ingest-through-calibration branch and orthogonal
+states (99.14 GB), while current v3 typing and the QuPath handoff are
+deliberately regenerated.
 
 There is also a governance boundary to resolve explicitly: current repository
 policy treats existing classifications and gold-standard reviews as audit-only

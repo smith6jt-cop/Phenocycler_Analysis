@@ -152,7 +152,7 @@ def _hardlink_once(source: Path, target: Path) -> Path:
         if exc.errno == errno.EXDEV:
             raise ContractError(
                 f"{source} and {target.parent} are on different filesystems; "
-                "resume refuses to copy the ingest dataset"
+                "verified cross-run reuse refuses to copy artifact data"
             ) from exc
         raise
     if not os.path.samefile(source, target):

@@ -59,7 +59,11 @@ packages = ["phenocycler", "phenocycler.integration"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-phenocycler = ["marker_registry.json", "typing_rules.json"]
+phenocycler = [
+    "adoption_compatibility.json",
+    "marker_registry.json",
+    "typing_rules.json",
+]
 
 [tool.setuptools_scm]
 # Version comes from the nearest git tag. A tagged commit gives a clean release version

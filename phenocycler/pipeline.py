@@ -112,6 +112,16 @@ STAGE_OUTPUT_ATTRIBUTE = {
     "type": "assignments_dir",
     "states": "state_dir",
 }
+STAGE_DEPENDENCIES = {
+    "ingest": (),
+    "geometry": ("ingest",),
+    "redsea": ("ingest", "geometry"),
+    "expression": ("ingest", "geometry", "redsea"),
+    "controls": ("expression",),
+    "calibrate": ("expression", "controls"),
+    "type": ("calibrate",),
+    "states": ("expression",),
+}
 STAGE_SIDECARS = {
     "ingest": ("ingest_rejects.parquet", "panel_availability.json"),
     "expression": ("audit/expression_availability.parquet",),
@@ -426,16 +436,12 @@ def _validate_typing_calibration_compatibility(
     return manifest
 
 
-def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
-    previous = {
-        "geometry": ("ingest",),
-        "redsea": ("ingest", "geometry"),
-        "expression": ("ingest", "geometry", "redsea"),
-        "controls": ("expression",),
-        "calibrate": ("expression", "controls"),
-        "type": ("calibrate",),
-        "states": ("expression",),
-    }
+def _stage_external_inputs(
+    context: RunContext,
+    stage: str,
+) -> tuple[InputArtifact, ...]:
+    """Capture non-stage inputs without requiring completed predecessors."""
+
     inputs: list[InputArtifact] = []
     if stage in {"ingest", "geometry", "redsea"}:
         inputs.append(
@@ -443,13 +449,6 @@ def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
                 "qupath_cohort", context.base_config.qupath_manifest
             )
         )
-    for dependency in previous.get(stage, ()):
-        path = context.stage_manifest_path(dependency)
-        if not path.exists():
-            raise PartialArtifactError(
-                f"{stage} requires completed stage {dependency!r}"
-            )
-        inputs.append(InputArtifact.from_stage_manifest(dependency, path))
     if stage in {"redsea", "expression", "controls", "calibrate", "type"}:
         inputs.append(
             InputArtifact.from_path(
@@ -463,7 +462,6 @@ def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
             )
         )
         if context.typing_model_bundle is not None:
-            _validate_typing_calibration_compatibility(context)
             artifact = context.typing_model_bundle.input_artifact
             if artifact is None:
                 raise ContractError(
@@ -476,6 +474,21 @@ def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
                     "configured typing model bundle requires a captured promotion manifest"
                 )
             inputs.append(promotion.input_artifact)
+    return tuple(inputs)
+
+
+def _stage_inputs(context: RunContext, stage: str) -> tuple[InputArtifact, ...]:
+    if stage == "type" and context.typing_model_bundle is not None:
+        _validate_typing_calibration_compatibility(context)
+    inputs: list[InputArtifact] = []
+    for dependency in STAGE_DEPENDENCIES[stage]:
+        path = context.stage_manifest_path(dependency)
+        if not path.exists():
+            raise PartialArtifactError(
+                f"{stage} requires completed stage {dependency!r}"
+            )
+        inputs.append(InputArtifact.from_stage_manifest(dependency, path))
+    inputs.extend(_stage_external_inputs(context, stage))
     return tuple(inputs)
 
 
@@ -954,6 +967,10 @@ def main(argv=None) -> int:
         from .recovery import main as recovery_main
 
         return recovery_main(raw[1:])
+    if raw and raw[0] == "adopt":
+        from .adoption import main as adoption_main
+
+        return adoption_main(raw[1:])
     if raw and raw[0] == "probabilistic":
         if len(raw) > 1 and raw[1] == "evaluate":
             from .candidate_evaluation import main as candidate_evaluation_main
