@@ -1,0 +1,137 @@
+{
+  "policy_version": 1,
+  "transitions": [
+    {
+      "policy_id": "donor-pipeline-typing-wiring-16c3a00-geometry-v1",
+      "stage": "geometry",
+      "source_method": "geometry-raster-qc-v1",
+      "target_method": "geometry-raster-qc-v1",
+      "source_code_sha256": "eb1b9090978ebfd4e804e5d509db99f6a6efe832ffeb7118fc343f8eef13af53",
+      "target_code_sha256": "d910b1e6ba90a36daf1aa059abd491c4851dbe7b22baa641d85b8fb9f703f30c",
+      "source_commit": "16c3a00d6d784a506c2ee0cdf3d4f2734d301407",
+      "changed_paths": ["phenocycler/donor_pipeline.py"],
+      "changed_files": [
+        {
+          "path": "phenocycler/donor_pipeline.py",
+          "source_sha256": "492e8108e40f085719e5dbf6558dda11e6a45b2c8f5b3656d665cb2c6f6c2405",
+          "target_sha256": "cd98ace7ebfe822193e2b81a3c32ad3f471bde55c83ad9f8f00ff0097d9af546"
+        }
+      ],
+      "reviewed_diff_sha256": "4622db284e82767742795d1172b7ee1f45178c4d50819d62de85edb21ce9a88b",
+      "allowed_output_schema_sha256": ["15b224de8820469ddb424556cffeb95ef729c532112632bed8847cfb7624a073"],
+      "configuration_keys": ["run_schema_version", "geometry_qc"],
+      "rationale": "The exact donor-pipeline change adds typing-only wiring, annotations, and a cohort typing barrier; geometry producer modules and arguments are unchanged.",
+      "reviewed_on": "2026-08-03"
+    },
+    {
+      "policy_id": "donor-pipeline-typing-wiring-16c3a00-redsea-v1",
+      "stage": "redsea",
+      "source_method": "redsea-compartment-only-v1",
+      "target_method": "redsea-compartment-only-v1",
+      "source_code_sha256": "6b4749186a546c0fe15bd6eaa59d7f199836ec6852c4b2b8f83646feb1df68ed",
+      "target_code_sha256": "2e55708e2914af863195a3cbeeb6d70392fae443fb6e40b2e508b5c5968e4e06",
+      "source_commit": "16c3a00d6d784a506c2ee0cdf3d4f2734d301407",
+      "changed_paths": ["phenocycler/donor_pipeline.py"],
+      "changed_files": [
+        {
+          "path": "phenocycler/donor_pipeline.py",
+          "source_sha256": "492e8108e40f085719e5dbf6558dda11e6a45b2c8f5b3656d665cb2c6f6c2405",
+          "target_sha256": "cd98ace7ebfe822193e2b81a3c32ad3f471bde55c83ad9f8f00ff0097d9af546"
+        }
+      ],
+      "reviewed_diff_sha256": "4622db284e82767742795d1172b7ee1f45178c4d50819d62de85edb21ce9a88b",
+      "allowed_output_schema_sha256": ["9042e02b3363ab41a100d5095950f8bbf19fe3bba7e898127d8056269d099caa"],
+      "configuration_keys": ["run_schema_version", "redsea"],
+      "rationale": "The exact donor-pipeline change adds typing-only wiring, annotations, and a cohort typing barrier; REDSEA producer modules and arguments are unchanged.",
+      "reviewed_on": "2026-08-03"
+    },
+    {
+      "policy_id": "donor-pipeline-typing-wiring-16c3a00-expression-v1",
+      "stage": "expression",
+      "source_method": "selected-expression-v1",
+      "target_method": "selected-expression-v1",
+      "source_code_sha256": "9f65e9308098f4d2642287b65f2b70bf90cb0654ce960bf3ab21e3bd6b7627be",
+      "target_code_sha256": "a07eba1a6661af6cae2231609a16394048cc14d660492669c5a8bfeb5a217096",
+      "source_commit": "16c3a00d6d784a506c2ee0cdf3d4f2734d301407",
+      "changed_paths": ["phenocycler/donor_pipeline.py"],
+      "changed_files": [
+        {
+          "path": "phenocycler/donor_pipeline.py",
+          "source_sha256": "492e8108e40f085719e5dbf6558dda11e6a45b2c8f5b3656d665cb2c6f6c2405",
+          "target_sha256": "cd98ace7ebfe822193e2b81a3c32ad3f471bde55c83ad9f8f00ff0097d9af546"
+        }
+      ],
+      "reviewed_diff_sha256": "4622db284e82767742795d1172b7ee1f45178c4d50819d62de85edb21ce9a88b",
+      "allowed_output_schema_sha256": ["3f0cf76824ffedf87c7b571e2e303143000ef5c756593f9c4f15546dee881cb3"],
+      "configuration_keys": ["run_schema_version"],
+      "rationale": "The exact donor-pipeline change adds typing-only wiring, annotations, and a cohort typing barrier; expression producer modules and arguments are unchanged.",
+      "reviewed_on": "2026-08-03"
+    },
+    {
+      "policy_id": "donor-pipeline-typing-wiring-16c3a00-controls-v1",
+      "stage": "controls",
+      "source_method": "reference-control-rank-v1",
+      "target_method": "reference-control-rank-v1",
+      "source_code_sha256": "e59a09a4b9a1c7d1abdabf527b18007d90623c70bbc6afb06d4b978b19e784a0",
+      "target_code_sha256": "3d5235ff5cd6cd0a27c0330768503b5cf253bd06ab59475c085249f48c312310",
+      "source_commit": "16c3a00d6d784a506c2ee0cdf3d4f2734d301407",
+      "changed_paths": ["phenocycler/donor_pipeline.py"],
+      "changed_files": [
+        {
+          "path": "phenocycler/donor_pipeline.py",
+          "source_sha256": "492e8108e40f085719e5dbf6558dda11e6a45b2c8f5b3656d665cb2c6f6c2405",
+          "target_sha256": "cd98ace7ebfe822193e2b81a3c32ad3f471bde55c83ad9f8f00ff0097d9af546"
+        }
+      ],
+      "reviewed_diff_sha256": "4622db284e82767742795d1172b7ee1f45178c4d50819d62de85edb21ce9a88b",
+      "allowed_output_schema_sha256": ["54da627a0472fdf429dfb90caaad5d89783744e3e55290341949ea77e85c76f4"],
+      "configuration_keys": ["run_schema_version", "reference_controls"],
+      "rationale": "The exact donor-pipeline change adds typing-only wiring, annotations, and a cohort typing barrier; reference-control producer modules and arguments are unchanged.",
+      "reviewed_on": "2026-08-03"
+    },
+    {
+      "policy_id": "donor-pipeline-typing-wiring-16c3a00-calibrate-v1",
+      "stage": "calibrate",
+      "source_method": "calibration-stage-wide-v1",
+      "target_method": "calibration-stage-wide-v1",
+      "source_code_sha256": "f9f1ddeab7b7e31ba809d2f723ad410558fc5974a5e823ed722dd3dab2e17c05",
+      "target_code_sha256": "a13298cf62c4a032f5fc826809c2d74535067a1ae0f892ea4908129073182027",
+      "source_commit": "16c3a00d6d784a506c2ee0cdf3d4f2734d301407",
+      "changed_paths": ["phenocycler/donor_pipeline.py"],
+      "changed_files": [
+        {
+          "path": "phenocycler/donor_pipeline.py",
+          "source_sha256": "492e8108e40f085719e5dbf6558dda11e6a45b2c8f5b3656d665cb2c6f6c2405",
+          "target_sha256": "cd98ace7ebfe822193e2b81a3c32ad3f471bde55c83ad9f8f00ff0097d9af546"
+        }
+      ],
+      "reviewed_diff_sha256": "4622db284e82767742795d1172b7ee1f45178c4d50819d62de85edb21ce9a88b",
+      "allowed_output_schema_sha256": ["c100e2a4d42f8ed5c22c85b463ae173c6a99856d1763df6e16bf3b23ab825136"],
+      "configuration_keys": ["run_schema_version", "marker_calibration"],
+      "rationale": "The exact donor-pipeline change adds typing-only wiring, annotations, and a cohort typing barrier; calibration producer modules and arguments are unchanged.",
+      "reviewed_on": "2026-08-03"
+    },
+    {
+      "policy_id": "donor-pipeline-typing-wiring-16c3a00-states-v1",
+      "stage": "states",
+      "source_method": "orthogonal-state-v1",
+      "target_method": "orthogonal-state-v1",
+      "source_code_sha256": "bd38f3143c8e764143dcf51348496383e0819407e0d3ac7473edc42703e3daec",
+      "target_code_sha256": "984d747f9e065354c34149b378750dd2f78c79fced046f0f798005d614a8fbe4",
+      "source_commit": "16c3a00d6d784a506c2ee0cdf3d4f2734d301407",
+      "changed_paths": ["phenocycler/donor_pipeline.py"],
+      "changed_files": [
+        {
+          "path": "phenocycler/donor_pipeline.py",
+          "source_sha256": "492e8108e40f085719e5dbf6558dda11e6a45b2c8f5b3656d665cb2c6f6c2405",
+          "target_sha256": "cd98ace7ebfe822193e2b81a3c32ad3f471bde55c83ad9f8f00ff0097d9af546"
+        }
+      ],
+      "reviewed_diff_sha256": "4622db284e82767742795d1172b7ee1f45178c4d50819d62de85edb21ce9a88b",
+      "allowed_output_schema_sha256": ["60a973c7812a1fefd3076c2a513e6331274d895bcbee841f08eb0cd3b7586c4a"],
+      "configuration_keys": ["run_schema_version"],
+      "rationale": "The exact donor-pipeline change adds typing-only wiring, annotations, and a cohort typing barrier; orthogonal-state producer modules and arguments are unchanged.",
+      "reviewed_on": "2026-08-03"
+    }
+  ]
+}

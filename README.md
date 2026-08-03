@@ -194,6 +194,50 @@ python -m phenocycler.pipeline run --config config.ini \
 python -m phenocycler.pipeline export --config config.ini
 ```
 
+To carry forward the maximum compatible work from any prior run with completed
+stage manifests, first build an adoption plan and review every stage decision.
+Planning does not modify either run; `--out` writes only the requested immutable
+plan file:
+
+```bash
+python -m phenocycler.pipeline adopt plan \
+  --config config.ini \
+  --from-run <completed_run_id> \
+  --out adoption-plan.json
+
+python -m phenocycler.pipeline adopt apply \
+  --config config.ini \
+  --plan adoption-plan.json
+
+# Inspect manifests/adoption/, then launch only the missing work.
+python -m phenocycler.pipeline run --config config.ini --pipelined
+```
+
+Adoption follows the stage dependency graph. It compares the cohort and direct
+inputs, stage-specific scientific configuration, method version, schema,
+donor/UUID universe, recorded file fingerprints, and producing-code contract.
+Identical code is accepted directly; code drift is accepted only by an exact,
+checked-in compatibility record—there is no `--force` switch. Accepted Parquet
+datasets and scientific audit sidecars are verified hard links, then receive
+new target manifests under the current compatibility contract. Immutable
+receipts retain the original producer manifests and current dependency IDs.
+An incompatible node and its DAG descendants are recomputed while independent
+branches remain eligible. `type` and `states` are separate branches, so a
+typing change does not unnecessarily invalidate `states`.
+
+For source run `c8412757d12de36ca056`, the current policy adopts `ingest`,
+`geometry`, `redsea`, `expression`, `controls`, `calibrate`, and `states`
+(99.14 GB of stage output), then recomputes v3 `type` and its QuPath export.
+Run these commands from `Phenocycler_Analysis`, whose `config.ini` owns that
+source run. To launch recomputation immediately instead of inspecting first,
+add `--continue` (and optionally `--jobs N` or `--no-export`) to `adopt apply`.
+After `--no-export`, run the normal `export` command separately. If code,
+configuration, or source content changes, write a newly named plan rather than
+overwriting the immutable reviewed plan. Until v3 typing finishes, `status`
+correctly reports the adopted target as incomplete and `LATEST` is unchanged.
+Use `--validation-mode content` on `adopt plan` when an archival audit should
+rehash every source byte rather than use the normal fingerprint cache.
+
 If geometry stopped at the first duplicated-islet donor after completing a
 duplicate-free prefix under `duplicate_policy = fatal`, resume the corrected
 `deterministic_keep` run without rebuilding ingest or rerasterizing that
